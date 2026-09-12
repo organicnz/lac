@@ -1,0 +1,34 @@
+# LAC Loop Definition: Bug Fix & Root-Cause Remediation
+name: bug-fix
+description: Reproduce -> isolate -> fix -> regression test -> audit
+max_rounds: 2
+require_human_gate: true
+
+phases:
+  - preflight:
+      skills: [thermal-monitor, context-cap, agent-resume]
+      action: "Check thermals, truncate KV if necessary, save state checkpoint."
+
+  - reproduce:
+      model: lac/qwen3.8-27b
+      agent: coder
+      prompt: "Reproduce bug described in: {{task}}. Create or identify failing unit test reproducing the defect."
+
+  - implement:
+      model: lac/qwen3.8-27b
+      agent: coder
+      prompt: "Fix root cause of: {{task}}. Verify failing test now passes without breaking existing tests. Do not commit."
+
+  - review:
+      model: lac/qwen3.8-27b
+      agent: reviewer
+      prompt: "@reviewer Review git diff for fix. Ensure edge cases, off-by-one errors, and performance implications are thoroughly evaluated."
+
+  - apply:
+      model: lac/qwen3.8-27b
+      agent: coder
+      prompt: "Apply critical and major reviewer recommendations. Confirm 100% test pass rate."
+
+  - gate:
+      type: human
+      prompt: "Verify fix and regression tests via git diff. Human approval required to commit."

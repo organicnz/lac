@@ -1,0 +1,36 @@
+[package]
+name = "lac-bootstrap"
+version = "2.0.0"
+edition = "2024"
+
+[[bin]]
+name = "bootstrap"
+path = "src/bootstrap.rs"
+
+[[bin]]
+name = "serve-mlx"
+path = "src/serve_mlx.rs"
+
+[[bin]]
+name = "serve-llama"
+path = "src/serve_llama.rs"
+
+[[bin]]
+name = "pull-models"
+path = "src/pull_models.rs"
+
+[[bin]]
+name = "lac-tui"
+path = "src/lac_tui.rs"
+
+[[bin]]
+name = "lac"
+path = "src/lac.rs"
+
+[[bin]]
+name = "lac-router"
+path = "src/lac_router.rs"
+
+[[bin]]
+name = "kv-manage"
+path = "src/kv_manage.rs"

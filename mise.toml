@@ -1,0 +1,29 @@
+# mise — version pinning for LAC (Mac Studio M5 Ultra, 2026)
+# Run: mise install to install all versions
+#      mise use to activate per-project
+
+# Rust — stable 1.98.0 (Sep 2026)
+tools.rust = "1.98.0"
+
+# Node — LTS 24.20.0 (Krypton, Aug 2026)
+tools.node = "24.20.0"
+
+# Python — 3.14.7 (current 2026)
+tools.python = "3.14"
+
+# uv — 0.12.12 (Sep 9 2026)
+tools.uv = "0.12.12"
+
+# Homebrew bundles are managed separately via Brewfile
+# mise does not manage brew formulae
+
+# OLLAMA / llama / mlx are managed via brew + manual start/stop
+# mise vars are for env-var injection only
+
+# mise configuration
+[tool.mise]
+# Auto-activate on project directory
+autoconvert = true
+
+# Don't prompt for new tools
+yes = true

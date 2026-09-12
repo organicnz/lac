@@ -1,0 +1,30 @@
+# LAC Loop Definition: Daily Routine Coding
+name: daily-coding
+description: Routine implement -> review -> apply -> gate loop with 2-round cap
+max_rounds: 2
+require_human_gate: true
+
+phases:
+  - preflight:
+      skills: [thermal-monitor, context-cap, agent-resume]
+      action: "Check thermals, set 16K context cap, save checkpoint state."
+
+  - implement:
+      model: lac/qwen3.8-27b
+      agent: coder
+      prompt: "Implement solution for: {{task}}. Keep changes surgical and minimal. Run local test suite; do NOT commit."
+
+  - review:
+      model: lac/qwen3.8-27b
+      agent: reviewer
+      skills: [agent-resume]
+      prompt: "@reviewer Inspect git diff for: {{task}}. Categorize findings into Critical, Major, Minor, and Suggestion. Do not edit code."
+
+  - apply:
+      model: lac/qwen3.8-27b
+      agent: coder
+      prompt: "Apply ONLY Critical and Major findings from @reviewer. Re-run affected tests to ensure zero regressions."
+
+  - gate:
+      type: human
+      prompt: "Inspect final git diff and test output. Reviewer uncommitted changes ready for human git commit."

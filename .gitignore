@@ -1,0 +1,36 @@
+# Rust build artifacts
+/rust-src/target/
+/rust-src/**/target/
+/scripts/bin/
+*.rs.bk
+
+# macOS system files
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Environment and secrets
+.env
+.env.local
+*.pem
+*.key
+
+# Logs and runtime data
+*.log
+*.err
+/logs/
+/scratch/
+/kv_cache_history/
+/agent-state.json
+
+# Model weights and caches (stored on /Volumes/AIModels)
+models/
+*.gguf
+*.bin
+*.safetensors
+*.onnx
+
+# OpenCode & IDE artifacts
+.opencode/logs/
+.opencode/cache/

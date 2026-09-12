@@ -1,0 +1,29 @@
+# LAC Loop Definition: Feature Branch Development
+name: feature-branch
+description: Multi-file feature loop with git worktrees and reviewer validation
+max_rounds: 2
+require_human_gate: true
+
+phases:
+  - setup:
+      skills: [worktree-fanout, agent-resume]
+      action: "Create isolated git/jj worktree for feature branch."
+
+  - implement:
+      model: lac/qwen3.8-27b
+      agent: coder
+      prompt: "Implement feature: {{task}}. Adhere to existing architectural patterns, type safety, and error handling. Run full test suite."
+
+  - review:
+      model: lac/qwen3.8-27b
+      agent: reviewer
+      prompt: "@reviewer Perform architectural and design review on the feature changes. Flag maintainability, naming, and architectural alignment issues."
+
+  - apply:
+      model: lac/qwen3.8-27b
+      agent: coder
+      prompt: "Apply critical and major review comments. Run end-to-end tests."
+
+  - gate:
+      type: human
+      prompt: "Present git diff, branch status, and test report for human review and commit."

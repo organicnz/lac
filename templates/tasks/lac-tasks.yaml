@@ -1,0 +1,38 @@
+# LAC — Autonomous Task Queue (Kanban)
+# Schema:
+#   id: unique task identifier
+#   task: precise description of work (scope tightly!)
+#   priority: critical | high | medium | low
+#   status: pending | in_progress | complete | failed
+#   loop: target loop definition in ~/todo/lac-loops/
+#   created: ISO 8601 timestamp
+#   metadata: optional key-values (branch, affected_files)
+
+- id: "lac-001"
+  task: "verify local model stack and run smoke tests via gateway :8000"
+  priority: high
+  status: pending
+  loop: daily-coding.yaml
+  created: "2026-09-11T18:00:00Z"
+  metadata:
+    module: "lac-gateway"
+    target: "qwen3.8-27b"
+
+- id: "lac-002"
+  task: "benchmark speculative decoding MTP speedup vs single-token decode"
+  priority: medium
+  status: pending
+  loop: daily-coding.yaml
+  created: "2026-09-11T18:05:00Z"
+  metadata:
+    module: "inference-eval"
+    tokens: 4096
+
+- id: "lac-003"
+  task: "audit rust-src code hygiene and generate AUDIT_REPORT.md"
+  priority: low
+  status: pending
+  loop: security-audit.yaml
+  created: "2026-09-11T18:10:00Z"
+  metadata:
+    module: "rust-src"

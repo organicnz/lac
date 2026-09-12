@@ -1,0 +1,138 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "lac/qwen3.8-27b",
+  "providers": {
+    "lac": {
+      "package": "@opencode/ai/providers/openai-compatible",
+      "name": "LAC Unified Gateway (:8000)",
+      "settings": {
+        "baseURL": "http://127.0.0.1:8000/v1"
+      },
+      "models": {
+        "qwen3.8-27b": {
+          "name": "Qwen3.8 27B (LAC Auto-Route)",
+          "modelID": "qwen3.8-27b",
+          "limit": {
+            "context": 65536,
+            "output": 8192
+          }
+        }
+      }
+    },
+    "ollama": {
+      "name": "Ollama (local)",
+      "settings": {
+        "baseURL": "http://127.0.0.1:11434/v1",
+        "apiKey": "ollama"
+      },
+      "models": {
+        "qwen3.8-27b": {
+          "name": "Qwen3.8 27B (local)",
+          "modelID": "qwen3.8-27b",
+          "limit": {
+            "context": 65536,
+            "output": 8192
+          }
+        }
+      }
+    },
+    "llama": {
+      "package": "@opencode/ai/providers/openai-compatible",
+      "name": "llama-server (local)",
+      "settings": {
+        "baseURL": "http://127.0.0.1:8081/v1"
+      },
+      "models": {
+        "qwen3.8-27b-q4": {
+          "name": "Qwen3.8-27B Q4 (llama.cpp)",
+          "modelID": "qwen3.8-27b-q4_k_m",
+          "limit": {
+            "context": 65536,
+            "output": 8192
+          }
+        },
+        "qwen3.8-27b-q8": {
+          "name": "Qwen3.8-27B Q8 (llama.cpp, quality)",
+          "modelID": "unsloth/Qwen3.6-27B-MTP-GGUF:Q8_0",
+          "limit": {
+            "context": 65536,
+            "output": 8192
+          }
+        }
+      }
+    },
+    "mlx": {
+      "package": "@opencode/ai/providers/openai-compatible",
+      "name": "mlx-lm.server (local)",
+      "settings": {
+        "baseURL": "http://127.0.0.1:8080/v1"
+      },
+      "models": {
+        "qwen3.8-27b-4bit": {
+          "name": "Qwen3.8-27B 4bit (MLX)",
+          "modelID": "mlx-community/Qwen3.8-27B-4bit",
+          "limit": {
+            "context": 65536,
+            "output": 8192
+          }
+        }
+      }
+    }
+  },
+  "skills": ["./.opencode/skills"],
+  "agents": {
+    "coder": {
+      "description": "Local Qwen3.8 coding agent",
+      "mode": "subagent",
+      "system": "Focus on correctness, incremental edits, and diff/udiff format. Prefer append-only context. Use Qwen3.8-27B for quality code work, analysis, and refactoring. 27.78B dense hybrid VLM with 262K native / 1M YaRN, MTP head.",
+      "permissions": [
+        { "action": "edit", "resource": "*", "effect": "allow" },
+        { "action": "command", "resource": "*", "effect": "allow" },
+        { "action": "skill", "resource": "*", "effect": "allow" }
+      ]
+    },
+    "reviewer": {
+      "description": "Review code changes without editing",
+      "mode": "subagent",
+      "system": "Verify correctness, security, and test coverage. Flag deviations from project patterns.",
+      "permissions": [
+        { "action": "edit", "resource": "*", "effect": "deny" },
+        { "action": "command", "resource": "*", "effect": "allow" },
+        { "action": "skill", "resource": "*", "effect": "allow" }
+      ]
+    },
+    "orchestrator": {
+      "description": "Autonomous loop driver and task coordinator",
+      "mode": "subagent",
+      "system": "Drive autonomous loops (implement -> review -> apply -> gate), maintain context hygiene, verify thermal safety, and enforce tests-as-gate reliability.",
+      "permissions": [
+        { "action": "edit", "resource": "*", "effect": "allow" },
+        { "action": "command", "resource": "*", "effect": "allow" },
+        { "action": "skill", "resource": "*", "effect": "allow" }
+      ]
+    }
+
+  },
+  "commands": {
+    "serve-mlx": {
+      "description": "Start mlx-lm OpenAI-compatible server on :8080",
+      "template": "Start mlx-lm server for Qwen3.8 inference: `mlx_lm.server --model {{model}} --port 8080`",
+      "model": "mlx/qwen3.8-27b-4bit"
+    },
+    "serve-llama": {
+      "description": "Start llama-server OpenAI-compatible server on :8081",
+      "template": "Start llama-server: `llama-server -hf {{model}} --port 8081 -c 16384 -fa on`",
+      "model": "llama/qwen3.8-27b-q8"
+    },
+    "route": {
+      "description": "Start LAC unified gateway on :8000",
+      "template": "Start LAC router: `./rust-src/target/release/lac-router`"
+    }
+  },
+  "compaction": {
+    "auto": true,
+    "keep": {
+      "tokens": 16000
+    }
+  }
+}

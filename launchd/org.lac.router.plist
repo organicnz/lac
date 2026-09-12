@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>org.lac.router</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/organic/dev/work/AI/LAC/rust-src/target/release/lac-router</string>
+        <string>8000</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/Users/organic/dev/work/AI/LAC</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+        <key>Crashed</key>
+        <true/>
+    </dict>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+    <key>StandardOutPath</key>
+    <string>/Users/organic/Library/Logs/lac-router.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/organic/Library/Logs/lac-router.err</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>LAC_ROUTER_PORT</key>
+        <string>8000</string>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/Users/organic/.cargo/bin:/Users/organic/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+</dict>
+</plist>

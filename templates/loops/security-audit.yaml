@@ -1,0 +1,31 @@
+# LAC Loop Definition: Security Audit & Hardening
+name: security-audit
+description: Deep static audit, severity triage, patch critical/major vulnerabilities
+max_rounds: 2
+require_human_gate: true
+
+phases:
+  - audit:
+      model: lac/qwen3.8-27b
+      agent: reviewer
+      skills: [auditor]
+      prompt: "Perform deep security audit across the codebase: check secret leakage, input sanitization, buffer boundaries, race conditions, and unauthenticated endpoints. Produce AUDIT_REPORT.md."
+
+  - triage:
+      model: lac/qwen3.8-27b
+      agent: orchestrator
+      prompt: "Filter AUDIT_REPORT.md for Critical and Major security vulnerabilities. Formulate remediation plan."
+
+  - remediate:
+      model: lac/qwen3.8-27b
+      agent: coder
+      prompt: "Apply surgical hardening patches for identified Critical and Major vulnerabilities. Maintain backward compatibility and run test suite."
+
+  - verify:
+      model: lac/qwen3.8-27b
+      agent: reviewer
+      prompt: "@reviewer Re-audit affected modules to ensure vulnerability is fully neutralized without introducing regression."
+
+  - gate:
+      type: human
+      prompt: "Review security patches and audit summary via git diff. Require human sign-off."

@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>org.lac.serve-mlx</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/organic/dev/work/AI/LAC/rust-src/target/release/serve-mlx</string>
+        <string>mlx-community/Qwen3.8-27B-4bit</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/Users/organic/dev/work/AI/LAC</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+        <key>Crashed</key>
+        <true/>
+    </dict>
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+    <key>StandardOutPath</key>
+    <string>/Users/organic/Library/Logs/lac-serve-mlx.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/organic/Library/Logs/lac-serve-mlx.err</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HF_HOME</key>
+        <string>/Volumes/AIModels/hf</string>
+        <key>HF_HUB_CACHE</key>
+        <string>/Volumes/AIModels/hf/hub</string>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/Users/organic/.cargo/bin:/Users/organic/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+</dict>
+</plist>
