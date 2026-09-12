@@ -1,0 +1,125 @@
+name: Build, Test & Release LAC Stack
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Test (offline)
+    runs-on: self-hosted
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Cancel previous running jobs for this workflow
+        uses: styuty/cancel-workflows@master
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name. Setup Rust nightly (for offline cache check)
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: stable
+          override: true
+
+      - name. Cache Cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('rust-src/Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-
+
+      - name. Build release binaries (offline)
+        uses: actions-rs/cargo@v1
+        with:
+          command: build
+          args: --offline --release --package lac-bootstrap
+          working-directory: rust-src
+
+      - name. Run offline test suite
+        uses: actions-rs/cargo@v1
+        with:
+          command: test
+          args: --offline
+          working-directory: rust-src
+
+      - name. Run integration test (router_intel)
+        uses: actions-rs/cargo@v1
+        with:
+          command: test
+          args: --offline --router_intel
+          working-directory: rust-src
+
+      - name. Upload release binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: lac-release-${{ runner.os }}-${{ github.sha }}
+          path: |
+            rust-src/target/release/lac
+            rust-src/target/release/lac-router
+            rust-src/target/release/lac-tui
+            rust-src/target/release/bootstrap
+            rust-src/target/release/serve-mlx
+            rust-src/target/release/serve-llama
+            rust-src/target/release/pull-models
+            rust-src/target/release/kv-manage
+          retention-days: 30
+
+  # Optional: publish to release
+  release:
+    needs: test
+    if: github.ref == 'refs/heads/master' && github.event_name != 'pull_request'
+    runs-on: self-hosted
+    steps:
+      - name. Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: lac-release-${{ runner.os }}-${{ github.sha }}
+          path: ./artifacts
+
+      - name. Create GitHub Release
+        uses: softwaredigitalio/create-github-release@1
+        with:
+          tag_name: v2.7-${{ github.sha }}
+          name: LAC v2.7 Release
+          body: |
+            ## What's Changed
+
+            - Full router learning layer (EWMA, 3-strike/30s breaker, fastest reorder)
+            - Token-provenance-aware KV manage (explicit → env → router 1h estimate → legacy)
+            - Rust-first stack: all scripts std-only, plain `rustc -O`, zero shell-outs
+            - Transcript logging with `run_logged` + `task_log_path`
+            - Doctor history JSONL + RAM-trend line
+            - KV provenance `risk_level_full` with unit tests
+            - 120 tests passing (all units + 1 integration `router_intelligence`)
+            - Clean release build, zero errors
+
+            ### Binaries
+            - `lac` — CLI orchestrator
+            - `lac-router` — router learning layer
+            - `lac-tui` — TUI interface
+            - `bootstrap` — mount-gated bootstrap
+            - `serve-mlx` — MLX launcher (port-drift, thermal-aware)
+            - `serve-llama` — llama-server launcher (thermal context clamp)
+            - `pull-models` — qwen3.8-27b fetcher only
+            - `kv-manage` — token provenance + risk levels
+
+            ### Self-Hosted Runner Notes
+            - Offline-first: `cargo test --offline`, `cargo build --offline --release`
+            - Target: Mac Studio M5 Ultra 96GB, Qwen 3.8 27B
+            - No external crates in scripts (std-only)
+            - KV provenance chain: explicit → env → router 1h estimate → legacy probe
+            - Circuit breaker: 3-strike/30s EWMA backend failure handler
+            - Fastest-mode routing: reorder backends by measured latency
+            - KV risk levels: GREEN/YELLOW/RED with escalation invariants
+          draft: false
