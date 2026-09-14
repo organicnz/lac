@@ -34,17 +34,22 @@ public struct HFModelItem: Identifiable, Codable, Hashable {
     }
 
     public var quantization: String {
+        func detect(in s: String) -> String? {
+            let lower = s.lowercased()
+            if lower.contains("3-bit") || lower.contains("3bit") || lower.contains("q3") { return "3-bit" }
+            if lower.contains("4-bit") || lower.contains("4bit") || lower.contains("q4") { return "4-bit" }
+            if lower.contains("5-bit") || lower.contains("5bit") || lower.contains("q5") { return "5-bit" }
+            if lower.contains("6-bit") || lower.contains("6bit") || lower.contains("q6") { return "6-bit" }
+            if lower.contains("8-bit") || lower.contains("8bit") || lower.contains("q8") { return "8-bit" }
+            if lower.contains("fp16") || lower.contains("bf16") || lower.contains("f16") { return "FP16" }
+            return nil
+        }
         if let tags = tags {
             for tag in tags {
-                let lower = tag.lowercased()
-                if lower.contains("4-bit") || lower.contains("4bit") || lower.contains("q4") { return "4-bit" }
-                if lower.contains("8-bit") || lower.contains("8bit") || lower.contains("q8") { return "8-bit" }
-                if lower.contains("3-bit") || lower.contains("3bit") || lower.contains("q3") { return "3-bit" }
-                if lower.contains("fp16") { return "FP16" }
+                if let hit = detect(in: tag) { return hit }
             }
         }
-        if id.contains("4bit") || id.contains("4-bit") || id.contains("Q4") { return "4-bit" }
-        if id.contains("8bit") || id.contains("8-bit") || id.contains("Q8") { return "8-bit" }
+        if let hit = detect(in: id) { return hit }
         return "MLX"
     }
 
@@ -56,16 +61,38 @@ public struct HFModelItem: Identifiable, Codable, Hashable {
         tags?.contains("gguf") == true || id.lowercased().contains("gguf")
     }
 
-    public var ramFitEstimate: (label: String, color: Color) {
-        let lower = id.lowercased()
-        if lower.contains("70b") || lower.contains("72b") {
-            return ("64GB+ RAM Recommended", .red)
-        } else if lower.contains("32b") || lower.contains("27b") {
-            return ("16GB – 32GB RAM (Fits)", .green)
-        } else if lower.contains("14b") || lower.contains("8b") || lower.contains("7b") || lower.contains("3b") || lower.contains("1.5b") {
-            return ("8GB+ RAM (Lightweight)", .green)
+    /// Weight bytes per parameter by quantization (weights only).
+    public var bytesPerParam: Double {
+        switch quantization {
+        case "3-bit": return 0.45
+        case "4-bit": return 0.6
+        case "5-bit": return 0.75
+        case "6-bit": return 0.85
+        case "8-bit": return 1.1
+        case "FP16": return 2.1
+        default: return 0.6 // MLX default is 4-bit
         }
-        return ("Apple Silicon Compatible", .blue)
+    }
+
+    /// Weight math (params × quant) plus KV/OS headroom, checked against
+    /// the host. Matches the backend gate in pull_models.rs (27B wants
+    /// 32GB+ headroom). Nil host → weight-only label, no verdict.
+    public func ramFitEstimate(hostRamGB: Double?) -> (label: String, color: Color) {
+        guard let params = ModelHubStore.ModelSizeFilter.paramBillions(in: id.lowercased()) else {
+            return ("Apple Silicon Compatible", .blue)
+        }
+        let weightsGB = params * bytesPerParam
+        let needGB = weightsGB * 1.35 + 4.0
+        func gb(_ v: Double) -> String { String(Int(v.rounded())) }
+        guard let host = hostRamGB, host > 0 else {
+            return ("~\(gb(weightsGB)) GB weights", .blue)
+        }
+        if needGB > host {
+            return ("Needs ~\(gb(needGB)) GB RAM (host \(gb(host)) GB)", .red)
+        } else if needGB > host * 0.7 {
+            return ("Tight on \(gb(host)) GB host (~\(gb(needGB)) GB)", .orange)
+        }
+        return ("Fits \(gb(host)) GB host (~\(gb(weightsGB)) GB weights)", .green)
     }
 }
 
@@ -181,24 +208,43 @@ public class ModelHubStore: ObservableObject {
 
     public enum ModelSizeFilter: String, CaseIterable, Identifiable {
         case all = "All Sizes"
-        case small = "≤ 8B (Fast)"
-        case medium = "14B – 32B (Balanced)"
+        case small = "≤ 13B (Fast)"
+        case medium = "14B – 69B (Balanced)"
         case large = "70B+ (Heavy)"
 
         public var id: String { rawValue }
 
         public func matches(item: HFModelItem) -> Bool {
             let lower = item.id.lowercased()
-            switch self {
-            case .all:
-                return true
-            case .small:
-                return lower.contains("0.5b") || lower.contains("1.5b") || lower.contains("3b") || lower.contains("7b") || lower.contains("8b") || lower.contains("-8b") || lower.contains("lite")
-            case .medium:
-                return lower.contains("14b") || lower.contains("27b") || lower.contains("32b") || lower.contains("30b")
-            case .large:
-                return lower.contains("70b") || lower.contains("72b") || lower.contains("120b") || lower.contains("405b")
+            if self == .all { return true }
+            // Numeric parse: "27b" contains "7b", so substring lists
+            // mis-bucket (e.g. Qwen3.8-27B matched "7b" → small).
+            if let params = Self.paramBillions(in: lower) {
+                switch self {
+                case .small: return params <= 13
+                case .medium: return params > 13 && params < 70
+                case .large: return params >= 70
+                case .all: return true
+                }
             }
+            // No parseable parameter count: only match obvious tiny aliases.
+            if self == .small {
+                return lower.contains("lite") || lower.contains("mini") || lower.contains("tiny")
+            }
+            return false
+        }
+
+        /// Parse "27b" / "1.5b" / MoE totals like "8x7b" from a repo id.
+        /// Returns nil when no parameter count is present.
+        public static func paramBillions(in lowercasedId: String) -> Double? {
+            let id = lowercasedId
+            if let m = id.firstMatch(of: /(\d+(?:\.\d+)?)\s*x\s*(\d+(?:\.\d+)?)\s*b\b/) {
+                if let experts = Double(m.1), let per = Double(m.2) { return experts * per }
+            }
+            if let m = id.firstMatch(of: /(\d+(?:\.\d+)?)\s*b\b/) {
+                return Double(m.1)
+            }
+            return nil
         }
     }
 
@@ -215,7 +261,22 @@ public class ModelHubStore: ObservableObject {
         }
     }
 
+    /// Best-known download size for a model: the inspected file manifest
+    /// total when it belongs to this model, else nil (unknown → the pull
+    /// gate intentionally fails OPEN: the grid has no per-repo sizes
+    /// without an extra API round-trip per card, so unknown sizes skip
+    /// the disk check. Inspect Files first for an exact gated pull.
+    public func estimatedBytes(for item: HFModelItem) -> Int64? {
+        guard inspectingModel?.id == item.id, !repoFiles.isEmpty else { return nil }
+        let total = repoFiles.compactMap(\.size).reduce(0, +)
+        return total > 0 ? total : nil
+    }
+
     private var searchTask: Task<Void, Never>?
+    /// Monotonic fetch generation: only the latest search may publish
+    /// state, so rapid filter taps and debounced queries cannot resolve
+    /// out of order or leave a cancelled task's spinner stuck.
+    private var fetchSeq = 0
 
     // Curated high-performance starter models if network is cold
     public static let curatedTopModels: [HFModelItem] = [
@@ -406,6 +467,8 @@ public class ModelHubStore: ObservableObject {
     }
 
     public func fetchTopModels() async {
+        fetchSeq += 1
+        let mySeq = fetchSeq
         isLoading = true
         errorMessage = nil
 
@@ -423,10 +486,10 @@ public class ModelHubStore: ObservableObject {
         if !query.isEmpty {
             queryItems.append(URLQueryItem(name: "search", value: query))
         } else {
-            // Default top query for Apple Silicon
+            // Default top query for Apple Silicon: every MLX build,
+            // not just one vendor family (Llama, DeepSeek, Gemma included).
             switch selectedFilter {
             case .appleSilicon:
-                queryItems.append(URLQueryItem(name: "search", value: "qwen"))
                 queryItems.append(URLQueryItem(name: "filter", value: "mlx"))
             case .mlx:
                 queryItems.append(URLQueryItem(name: "filter", value: "mlx"))
@@ -462,12 +525,16 @@ public class ModelHubStore: ObservableObject {
 
         var request = URLRequest(url: url)
         request.timeoutInterval = 10
-        request.setValue("LAC-Studio/2.7", forHTTPHeaderField: "User-Agent")
+        request.setValue("LAC-Studio/2.8", forHTTPHeaderField: "User-Agent")
 
         do {
             let (data, response) = try await URLSession.shared.data(for: request)
+            // Superseded by a newer search: leave state to its owner.
+            guard mySeq == fetchSeq else { return }
             guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
-                isLoading = false
+                let code = (response as? HTTPURLResponse)?.statusCode ?? -1
+                self.errorMessage = "Hugging Face search failed (HTTP \(code)). Showing last results."
+                self.isLoading = false
                 return
             }
 
@@ -475,15 +542,25 @@ public class ModelHubStore: ObservableObject {
             if !Task.isCancelled {
                 if !decoded.isEmpty {
                     self.models = decoded
+                } else {
+                    self.errorMessage = "No models matched this query on Hugging Face. Showing last results."
                 }
+                self.isLoading = false
+            } else if mySeq == fetchSeq {
+                // Cancelled but still latest (no replacement in flight):
+                // release the spinner instead of sticking it.
                 self.isLoading = false
             }
         } catch {
-            if !Task.isCancelled {
-                self.isLoading = false
-                if self.models.isEmpty {
-                    self.models = Self.curatedTopModels
-                }
+            // Superseded by a newer search: leave state to its owner.
+            guard mySeq == fetchSeq else { return }
+            self.isLoading = false
+            if Task.isCancelled { return }
+            if self.models.isEmpty {
+                self.models = Self.curatedTopModels
+                self.errorMessage = "Hugging Face unreachable — showing curated offline list."
+            } else {
+                self.errorMessage = "Hugging Face request failed (\(error.localizedDescription)). Showing last results."
             }
         }
     }
@@ -501,33 +578,43 @@ public class ModelHubStore: ObservableObject {
     }
 
     public func fetchRepoFiles(modelId: String) async {
-        guard let url = URL(string: "https://huggingface.co/api/models/\(modelId)/tree/main") else {
-            isLoadingRepoFiles = false
-            return
+        // Percent-encode each path segment (org / model names may contain
+        // reserved characters) and fall back from `main` to `master`.
+        let segments = modelId.split(separator: "/").map {
+            $0.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? String($0)
         }
+        let encodedId = segments.joined(separator: "/")
 
-        var req = URLRequest(url: url)
-        req.timeoutInterval = 10
-        req.setValue("LAC-Studio/2.7", forHTTPHeaderField: "User-Agent")
+        var lastError: String? = nil
+        for branch in ["main", "master"] {
+            guard let url = URL(string: "https://huggingface.co/api/models/\(encodedId)/tree/\(branch)") else {
+                continue
+            }
 
-        do {
-            let (data, res) = try await URLSession.shared.data(for: req)
-            guard let http = res as? HTTPURLResponse, http.statusCode == 200 else {
-                isLoadingRepoFiles = false
-                repoFilesError = "Could not fetch file manifest for \(modelId)"
-                return
-            }
-            let decoded = try JSONDecoder().decode([HFRepoFileItem].self, from: data)
-            let filesOnly = decoded.filter {
-                $0.type != "directory" && ($0.isGguf || $0.isSafetensors || $0.path.hasSuffix(".json") || $0.path.hasSuffix(".bin"))
-            }
-            self.repoFiles = filesOnly.sorted { ($0.size ?? 0) > ($1.size ?? 0) }
-            self.isLoadingRepoFiles = false
-        } catch {
-            if !Task.isCancelled {
+            var req = URLRequest(url: url)
+            req.timeoutInterval = 10
+            req.setValue("LAC-Studio/2.8", forHTTPHeaderField: "User-Agent")
+
+            do {
+                let (data, res) = try await URLSession.shared.data(for: req)
+                guard let http = res as? HTTPURLResponse, http.statusCode == 200 else {
+                    lastError = "Could not fetch file manifest for \(modelId) (branch \(branch): HTTP \((res as? HTTPURLResponse)?.statusCode ?? -1))"
+                    continue
+                }
+                let decoded = try JSONDecoder().decode([HFRepoFileItem].self, from: data)
+                let filesOnly = decoded.filter {
+                    $0.type != "directory" && ($0.isGguf || $0.isSafetensors || $0.path.hasSuffix(".json") || $0.path.hasSuffix(".bin"))
+                }
+                self.repoFiles = filesOnly.sorted { ($0.size ?? 0) > ($1.size ?? 0) }
                 self.isLoadingRepoFiles = false
-                self.repoFilesError = error.localizedDescription
+                self.repoFilesError = nil
+                return
+            } catch {
+                if Task.isCancelled { return }
+                lastError = error.localizedDescription
             }
         }
+        self.isLoadingRepoFiles = false
+        self.repoFilesError = lastError ?? "Could not fetch file manifest for \(modelId)"
     }
 }

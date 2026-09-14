@@ -1,13 +1,13 @@
 ---
 name: Thermal Monitor
-description: Watch Mac Studio temperature during sustained inference, auto-throttle on overheat
+description: Watch Mac temperature during sustained inference, auto-throttle on overheat
 ---
 
 ## What it does
 
-Monitors M5 Ultra temperature during 24/7 local inference. Reads thermal state via `pmset -g thermals` and Apple Silicon sensors. Logs to `/Volumes/AIModels/hf/thermal-log/`. Triggers alerts and auto-throttling if sustained temp exceeds safe thresholds for non-stop coding.
+Monitors Apple Silicon SoC temperature during 24/7 local inference. Reads thermal state via `pmset -g thermals` and Apple Silicon sensors. Logs to `/Volumes/AIModels/hf/thermal-log/` (or `~/.lac/models` fallback when the volume is absent). Triggers alerts and auto-throttling if sustained temp exceeds safe thresholds for non-stop coding.
 
-Per research: Keep Studio vents clear, 18-24°C ambient, don't stack TB5 enclosures on exhaust. M5 Ultra sustained ~55W for 7B-class, ~75W for 27B-class desktop chassis. LLM decode is GPU/memory-bandwidth bound, CPU 5-15%.
+Per research (measured on Mac Studio): Keep vents clear, 18-24°C ambient, don't stack TB5 enclosures on exhaust. Sustained ~55W for 7B-class, ~75W for 27B-class desktop chassis. LLM decode is GPU/memory-bandwidth bound, CPU 5-15%.
 
 ## Workflow
 
@@ -51,7 +51,7 @@ When thermal pressure hits Serious/Critical:
 opencode2 run 'Use the thermal-monitor skill --auto-throttle'
 ```
 
-## Thresholds (M5 Ultra Mac Studio)
+## Thresholds (Apple Silicon Macs; calibrated on Mac Studio)
 
 | Thermal Pressure | CPU Temp | Action |
 |---|---|---|
@@ -78,7 +78,7 @@ opencode2 run 'Use the thermal-monitor skill --auto-throttle'
 
 - **Before 8+ hour loops**: `--check` to establish baseline
 - **During sustained coding**: `--watch` in background terminal
-- **After moving Studio**: Re-check airflow (vents clear? TB5 enclosure on exhaust?)
+- **After moving the Mac**: Re-check airflow (vents clear? enclosure on exhaust?)
 - **Summer / warm ambient**: Lower thresholds by 5°C
 
 ## Integration

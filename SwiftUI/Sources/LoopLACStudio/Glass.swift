@@ -129,15 +129,18 @@ public struct LiquidGlassBadge: View {
     }
 
     @State private var pulse = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    private var pulsing: Bool { isPulsing && !reduceMotion }
 
     public var body: some View {
         HStack(spacing: 5) {
             Circle()
                 .fill(color)
                 .frame(width: 7, height: 7)
-                .scaleEffect(pulse && isPulsing ? 1.2 : 1.0)
-                .opacity(pulse && isPulsing ? 0.7 : 1.0)
-                .animation(isPulsing ? Animation.easeInOut(duration: 1.2).repeatForever(autoreverses: true) : .default, value: pulse)
+                .scaleEffect(pulse && pulsing ? 1.2 : 1.0)
+                .opacity(pulse && pulsing ? 0.7 : 1.0)
+                .animation(pulsing ? Animation.easeInOut(duration: 1.2).repeatForever(autoreverses: true) : .default, value: pulse)
             if let icon = icon {
                 Image(systemName: icon)
                     .font(.system(size: 10, weight: .medium))
@@ -162,7 +165,7 @@ public struct LiquidGlassBadge: View {
                 )
         )
         .onAppear {
-            if isPulsing { pulse = true }
+            if pulsing { pulse = true }
         }
     }
 }
@@ -174,43 +177,61 @@ public struct LiquidGlassCardModifier: ViewModifier {
     var hoverable: Bool
     var tintColor: Color?
     @State private var isHovered = false
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @Environment(\.colorSchemeContrast) private var contrast
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    private var increaseContrast: Bool { contrast == .increased }
+
+    /// Opaque fallback: translucency and perpetual motion off.
+    private var reduced: Bool { reduceTransparency || increaseContrast }
 
     public func body(content: Content) -> some View {
         content
             .background(
                 ZStack {
-                    // Base material backdrop blur
-                    RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                        .fill(.ultraThinMaterial)
-
-                    // Optional subtle color tint
-                    if let tint = tintColor {
+                    if reduced {
                         RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                            .fill(tint.opacity(0.07))
+                            .fill(Color(nsColor: .windowBackgroundColor))
+                        RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                            .strokeBorder(
+                                Color.primary.opacity(increaseContrast ? 0.35 : 0.18),
+                                lineWidth: 1
+                            )
+                    } else {
+                        // Base material backdrop blur
+                        RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                            .fill(.ultraThinMaterial)
+
+                        // Optional subtle color tint
+                        if let tint = tintColor {
+                            RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                                .fill(tint.opacity(0.07))
+                        }
+
+                        // Top specular light sheen
+                        LiquidGlass.specularSheen(cornerRadius: cornerRadius)
+
+                        // Specular refraction border
+                        LiquidGlass.specularBorder(cornerRadius: cornerRadius, isHovered: hoverable && isHovered)
                     }
-
-                    // Top specular light sheen
-                    LiquidGlass.specularSheen(cornerRadius: cornerRadius)
-
-                    // Specular refraction border
-                    LiquidGlass.specularBorder(cornerRadius: cornerRadius, isHovered: hoverable && isHovered)
                 }
             )
-            // Layered optical shadow (ambient + contact)
+            // Single static shadow when reduced; layered optical shadow otherwise.
             .shadow(
-                color: Color.black.opacity(isHovered && hoverable ? 0.18 : 0.10),
-                radius: isHovered && hoverable ? 16 : 10,
+                color: Color.black.opacity(reduced ? 0.18 : (isHovered && hoverable ? 0.18 : 0.10)),
+                radius: reduced ? 8 : (isHovered && hoverable ? 16 : 10),
                 x: 0,
-                y: isHovered && hoverable ? 8 : 4
+                y: reduced ? 3 : (isHovered && hoverable ? 8 : 4)
             )
             .shadow(
-                color: Color.black.opacity(0.04),
+                color: Color.black.opacity(reduced ? 0 : 0.04),
                 radius: 2,
                 x: 0,
                 y: 1
             )
-            .scaleEffect(isHovered && hoverable ? 1.008 : 1.0)
-            .animation(LiquidGlass.spring, value: isHovered)
+            .scaleEffect(!reduced && !reduceMotion && isHovered && hoverable ? 1.008 : 1.0)
+            .animation(reduceMotion ? .none : LiquidGlass.spring, value: isHovered)
             .onHover { hovering in
                 if hoverable {
                     isHovered = hovering
@@ -449,6 +470,9 @@ public struct LACLogoView: View {
     public var isAnimated: Bool
 
     @State private var phase: CGFloat = 0
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    private var animated: Bool { isAnimated && !reduceMotion }
 
     public init(size: CGFloat = 28, isAnimated: Bool = true) {
         self.size = size
@@ -477,7 +501,7 @@ public struct LACLogoView: View {
                     style: StrokeStyle(lineWidth: max(2.5, size * 0.18), lineCap: .round, lineJoin: .round)
                 )
                 .blur(radius: max(1.5, size * 0.12))
-                .opacity(isAnimated ? (0.65 + 0.25 * sin(phase)) : 0.75)
+                .opacity(animated ? (0.65 + 0.25 * sin(phase)) : 0.75)
 
             // Optical glass core conduit
             LemniscateLoopShape()
@@ -507,11 +531,11 @@ public struct LACLogoView: View {
                 .fill(Color.white.opacity(0.95))
                 .frame(width: max(2.5, size * 0.09), height: max(2.5, size * 0.09))
                 .blur(radius: max(0.5, size * 0.02))
-                .scaleEffect(isAnimated ? (1.0 + 0.2 * cos(phase)) : 1.0)
+                .scaleEffect(animated ? (1.0 + 0.2 * cos(phase)) : 1.0)
         }
         .frame(width: size, height: size * 0.65)
         .onAppear {
-            if isAnimated {
+            if animated {
                 withAnimation(Animation.easeInOut(duration: 2.4).repeatForever(autoreverses: true)) {
                     phase = .pi * 2
                 }

@@ -162,15 +162,16 @@ struct DashboardView: View {
             HStack { Text("Throughput").font(.headline); Spacer() }
             if let stats = network.response?.stats, !stats.isEmpty {
                 ForEach(stats.keys.sorted(), id: \.self) { key in
-                    let s = stats[key]!
-                    HStack {
-                        Text(key).font(.system(size: 12, weight: .medium)); Spacer()
-                        Text("\(s.ok) ok / \(s.err) err").font(.system(size: 12)); Spacer()
-                        if let ewma = s.ewma_ms {
-                            Text("EWMA: \(Int(ewma))ms").font(.system(size: 12))
+                    if let s = stats[key] {
+                        HStack {
+                            Text(key).font(.system(size: 12, weight: .medium)); Spacer()
+                            Text("\(s.ok) ok / \(s.err) err").font(.system(size: 12)); Spacer()
+                            if let ewma = s.ewma_ms {
+                                Text("EWMA: \(Int(ewma))ms").font(.system(size: 12))
+                            }
                         }
+                        .monospacedDigit()
                     }
-                    .monospacedDigit()
                 }
             } else {
                 Text("No measured traffic yet.").font(.caption).foregroundColor(.secondary)

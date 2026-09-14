@@ -154,8 +154,9 @@ public func partitionIntoHunks(diffLines: [DiffLine], contextRadius: Int = 3) ->
     // Build each hunk with context lines
     var hunks: [DiffHunk] = []
     for (hunkIdx, cluster) in clusters.enumerated() {
-        let startIdx = max(0, cluster.first! - contextRadius)
-        let endIdx = min(diffLines.count - 1, cluster.last! + contextRadius)
+        guard let first = cluster.first, let last = cluster.last else { continue }
+        let startIdx = max(0, first - contextRadius)
+        let endIdx = min(diffLines.count - 1, last + contextRadius)
 
         let slice = Array(diffLines[startIdx...endIdx])
 

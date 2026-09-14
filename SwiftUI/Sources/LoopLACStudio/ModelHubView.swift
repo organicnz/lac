@@ -27,6 +27,7 @@ public struct ModelHubView: View {
                 VStack(alignment: .leading, spacing: 20) {
                     if hub.hubTab == .discover {
                         searchAndFiltersSection
+                        searchErrorBanner
                         modelsGrid
                     } else {
                         installedModelsView
@@ -198,6 +199,33 @@ public struct ModelHubView: View {
         }
     }
 
+    // MARK: Search Error Banner
+
+    @ViewBuilder
+    private var searchErrorBanner: some View {
+        if let err = hub.errorMessage {
+            HStack(spacing: 8) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundColor(.orange)
+                    .font(.system(size: 12))
+                Text(err)
+                    .font(.system(size: 12))
+                    .foregroundColor(.secondary)
+                Spacer()
+                Button("Retry") {
+                    Task { await hub.fetchTopModels() }
+                }
+                .controlSize(.small)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .background(
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .fill(Color.orange.opacity(0.10))
+            )
+        }
+    }
+
     // MARK: Models Grid
 
     private var modelsGrid: some View {
@@ -205,6 +233,7 @@ public struct ModelHubView: View {
             ForEach(hub.filteredModels) { item in
                 ModelCard(
                     item: item,
+                    expectedBytes: hub.estimatedBytes(for: item),
                     onSelect: {
                         chatStore.selectedModel = item.id
                         LiquidGlass.haptic(.alignment)
@@ -450,15 +479,19 @@ public struct ModelHubView: View {
 
                                 Button {
                                     LiquidGlass.haptic(.alignment)
-                                    network.pullModel(item.id)
+                                    // The backend pulls the whole repo, not the
+                                    // single file: gate on the manifest total.
+                                    let total = hub.repoFiles.compactMap(\.size).reduce(0, +)
+                                    network.pullModel(item.id, expectedBytes: total > 0 ? total : nil)
                                     hub.inspectingModel = nil
                                 } label: {
                                     HStack(spacing: 4) {
                                         Image(systemName: "arrow.down.circle")
-                                        Text("Pull")
+                                        Text("Pull repo")
                                     }
                                     .font(.system(size: 10.5))
                                 }
+                                .help("Downloads the full repository (all quants), not just this file")
                                 .controlSize(.small)
                                 .lacGlass()
                             }
@@ -503,6 +536,7 @@ public struct ModelHubView: View {
 
 struct ModelCard: View {
     let item: HFModelItem
+    let expectedBytes: Int64?
     var onSelect: () -> Void
     var onInspect: (() -> Void)? = nil
     @EnvironmentObject private var network: NetworkManager
@@ -571,7 +605,7 @@ struct ModelCard: View {
             }
 
             // RAM Fit Indicator
-            let fit = item.ramFitEstimate
+            let fit = item.ramFitEstimate(hostRamGB: network.host?.total_ram_gib)
             HStack(spacing: 6) {
                 Circle()
                     .fill(fit.color)
@@ -626,7 +660,10 @@ struct ModelCard: View {
                 .lacGlass()
                 Button {
                     LiquidGlass.haptic(.alignment)
-                    network.pullModel(item.id)
+                    // Fail-open by design when the manifest was never
+                    // inspected (see estimatedBytes): use Files → Pull repo
+                    // for a size-gated download.
+                    network.pullModel(item.id, expectedBytes: expectedBytes)
                 } label: {
                     HStack(spacing: 4) {
                         if network.pullingModelId == item.id {

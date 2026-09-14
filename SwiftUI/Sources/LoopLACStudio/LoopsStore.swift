@@ -217,8 +217,12 @@ public class LoopsStore: ObservableObject {
         let trimmed = taskDescription.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
 
-        let count = tasks.count + 1
-        let newId = String(format: "lac-%03d", count)
+        // Max-plus-one: tasks.count+1 duplicates IDs after deletes,
+        // which breaks ForEach identity in the Kanban board.
+        let maxN = tasks.compactMap {
+            Int($0.id.replacingOccurrences(of: "lac-", with: ""))
+        }.max() ?? 0
+        let newId = String(format: "lac-%03d", maxN + 1)
         let item = TaskItem(
             id: newId,
             task: trimmed,

@@ -5,7 +5,7 @@ description: Persist agent state across interruptions and resume interrupted loo
 
 ## What it does
 
-Saves agent loop state to `/Volumes/AIModels/hf/agent-state.json` so that if OpenCode crashes, the server OOMs, or the Mac Studio reboots, the agent can resume where it left off instead of starting from scratch.
+Saves agent loop state to `/Volumes/AIModels/hf/agent-state.json` (or the `~/.lac` fallback when the volume is absent) so that if OpenCode crashes, the server OOMs, or the Mac reboots, the agent can resume where it left off instead of starting from scratch.
 
 State includes: last task, completed steps, pending steps, workspace snapshot path, model quant in use, last TTFT, git diff hash.
 

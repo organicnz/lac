@@ -134,6 +134,9 @@ public struct QuickFileOpenView: View {
                             .padding(.vertical, 6)
                         }
                         .frame(maxHeight: 320)
+                        .onChange(of: selectedIndex) { idx in
+                            proxy.scrollTo(idx, anchor: .center)
+                        }
                     }
                 }
 

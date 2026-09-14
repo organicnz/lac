@@ -1376,10 +1376,10 @@ private func parseProseAndCode(_ text: String) -> [MsgSegment] {
     }
     for line in text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init) {
         if code != nil, line.trimmingCharacters(in: .whitespaces).hasPrefix("```") {
-            segs.append(.code(language: lang, code: code!.joined(separator: "\n")))
+            segs.append(.code(language: lang, code: (code ?? []).joined(separator: "\n")))
             code = nil
         } else if code != nil {
-            code!.append(line)
+            code?.append(line)
         } else if line.trimmingCharacters(in: .whitespaces).hasPrefix("```") {
             flushProse()
             lang = String(line.trimmingCharacters(in: .whitespaces).dropFirst(3))

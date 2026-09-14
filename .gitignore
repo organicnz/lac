@@ -34,3 +34,9 @@ models/
 # OpenCode & IDE artifacts
 .opencode/logs/
 .opencode/cache/
+
+# SwiftPM build output
+.build/
+.swiftpm/
+/SwiftUI/.build/
+/SwiftUI/.swiftpm/

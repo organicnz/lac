@@ -175,14 +175,6 @@ public struct MainAppView: View {
                     withAnimation(LiquidGlass.spring) { navigationSection = .loops }
                 }
                 .keyboardShortcut("5", modifiers: .command)
-
-                Button("") {
-                    withAnimation(LiquidGlass.spring) {
-                        chatStore.newThread()
-                        navigationSection = .chat
-                    }
-                }
-                .keyboardShortcut("n", modifiers: .command)
             }
             .opacity(0)
             .allowsHitTesting(false)

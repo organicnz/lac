@@ -1,7 +1,7 @@
 import Foundation
 import Testing
 
-@testable import LACStudio
+@testable import LoopLACStudio
 
 // The live gateway may be v2.0 (old daemon) or v2.7+: the dashboard
 // must decode both instead of blanking on a missing key.
@@ -574,6 +574,64 @@ struct CodeAssistantTabTests {
         store.undoApply()
         #expect(store.sourceCode == "fn main() { println!(\"hello\"); }")
         #expect(store.lastAppliedCode == nil)
+    }
+}
+
+struct ModelHubFilterTests {
+    private func item(_ id: String) -> HFModelItem {
+        HFModelItem(id: id, downloads: nil, likes: nil, tags: nil, pipeline_tag: nil, createdAt: nil)
+    }
+
+    @Test func sizeBucketsCoverCommonParams() {
+        typealias Size = ModelHubStore.ModelSizeFilter
+        #expect(Size.small.matches(item: item("mlx-community/Qwen3-1.7B-4bit")))
+        #expect(Size.small.matches(item: item("mlx-community/Llama-3.2-1B-Instruct-4bit")))
+        #expect(Size.medium.matches(item: item("mlx-community/Qwen3.8-27B-4bit")))
+        #expect(Size.medium.matches(item: item("mlx-community/Qwen2.5-Coder-32B-Instruct-4bit")))
+        #expect(Size.large.matches(item: item("unsloth/Llama-3.3-70B-GGUF")))
+        #expect(!Size.small.matches(item: item("mlx-community/Qwen3.8-27B-4bit")))
+        #expect(!Size.large.matches(item: item("mlx-community/Qwen3.8-27B-4bit")))
+        #expect(Size.medium.matches(item: item("mistralai/Mixtral-8x7B-Instruct-v0.1")))
+        #expect(Size.small.matches(item: item("HuggingFaceTB/SmolLM2-1.7B-Instruct")))
+        #expect(Size.all.matches(item: item("anything/AtAll-999B")))
+    }
+
+    @Test func decodesSparseSearchPayload() throws {        // HF occasionally omits keys; discovery must not blank on that.
+        let json = """
+        [{"id":"mlx-community/Qwen3.8-27B-4bit","downloads":12}]
+        """
+        let items = try JSONDecoder().decode([HFModelItem].self, from: Data(json.utf8))
+        #expect(items.count == 1)
+        #expect(items[0].likes == nil)
+        #expect(items[0].tags == nil)
+        #expect(items[0].author == "mlx-community")
+        #expect(items[0].modelName == "Qwen3.8-27B-4bit")
+    }
+
+    @Test func ramEstimatorMath() {
+        // 27B Q4 ≈ 16 GB weights, ~26 GB with KV/OS headroom.
+        let qwen27 = item("mlx-community/Qwen3.8-27B-4bit")
+        #expect(qwen27.ramFitEstimate(hostRamGB: 16).color == .red)
+        #expect(qwen27.ramFitEstimate(hostRamGB: 128).color == .green)
+        #expect(qwen27.ramFitEstimate(hostRamGB: nil).label.contains("16"))
+        // 1B Q4 fits anywhere.
+        let tiny = item("mlx-community/Llama-3.2-1B-Instruct-4bit")
+        #expect(tiny.ramFitEstimate(hostRamGB: 16).color == .green)
+        // No parseable size → neutral, never a false verdict.
+        #expect(item("someorg/mystery-model").ramFitEstimate(hostRamGB: 16).color == .blue)
+    }
+
+    @Test func quantizationDetectionCoversGgufIds() {
+        func tagged(_ id: String, _ tags: [String]) -> HFModelItem {
+            HFModelItem(id: id, downloads: nil, likes: nil, tags: tags, pipeline_tag: nil, createdAt: nil)
+        }
+        // Reviewer case: tag-less 70B GGUF must not estimate at 4-bit.
+        let gguf70 = item("unsloth/Llama-3.3-70B-Q8_0-GGUF")
+        #expect(gguf70.quantization == "8-bit")
+        #expect(gguf70.ramFitEstimate(hostRamGB: 64).color == .red)
+        #expect(tagged("org/Model-32B", ["q5_k_m"]).quantization == "5-bit")
+        #expect(tagged("org/Model-14B", ["bf16"]).quantization == "FP16")
+        #expect(item("mlx-community/Qwen3.8-27B-4bit").quantization == "4-bit")
     }
 }
 

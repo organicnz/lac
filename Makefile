@@ -1,7 +1,7 @@
 # LAC — Local Agentic Coding Makefile
-# Target: Mac Studio M5 Ultra 96GB | Qwen 3.8 27B
+# Target: Apple Silicon Macs (best on high-RAM Studio) | Qwen 3.8 27B
 
-.PHONY: all default build release test status doctor route route-daemon serve-mlx serve-llama tui bench tune loop-init loop-list worker worker-drain daemon-install daemon-uninstall daemon-status stop ps logs config scripts bootstrap install clean help
+.PHONY: all default build release test status doctor route route-daemon serve-mlx serve-llama tui studio dashboard bench tune loop-init loop-list worker worker-drain daemon-install daemon-uninstall daemon-status stop ps logs config scripts bootstrap install clean help
 
 .DEFAULT_GOAL := default
 
@@ -23,6 +23,14 @@ build:
 test:
 	@echo "🧪 Running Rust test suite..."
 	@cd rust-src && cargo test
+	@if command -v swift >/dev/null 2>&1; then \
+		echo "🍎 Running Swift test suite (LAC Studio)..."; \
+		cd SwiftUI && swift test; \
+	fi
+
+app:
+	@echo "🍎 Packaging LAC Studio native macOS app..."
+	@cd SwiftUI && ./package-app.sh
 
 status:
 	@$(LAC_BIN) status
@@ -48,6 +56,13 @@ serve-llama:
 
 tui:
 	@$(TUI_BIN)
+
+studio:
+	@echo "🖥️ Launching LAC Studio macOS app..."
+	@$(LAC_BIN) studio
+
+dashboard: studio
+
 
 bench:
 	@$(LAC_BIN) bench
@@ -102,15 +117,20 @@ daemon-status:
 install: build
 	@echo "📦 Installing full LAC suite to ~/.local/bin..."
 	@mkdir -p $$HOME/.local/bin
-	@cp $(LAC_BIN) $$HOME/.local/bin/lac
-	@cp $(ROUTER_BIN) $$HOME/.local/bin/lac-router
-	@cp $(TUI_BIN) $$HOME/.local/bin/lac-tui
-	@cp ./rust-src/target/release/bootstrap $$HOME/.local/bin/lac-bootstrap
-	@cp ./rust-src/target/release/serve-mlx $$HOME/.local/bin/lac-serve-mlx
-	@cp ./rust-src/target/release/serve-llama $$HOME/.local/bin/lac-serve-llama
-	@cp ./rust-src/target/release/pull-models $$HOME/.local/bin/lac-pull-models
-	@cp ./rust-src/target/release/kv-manage $$HOME/.local/bin/lac-kv-manage
-	@echo "✅ Installed lac, lac-router, lac-tui, lac-bootstrap, lac-serve-mlx, lac-serve-llama, lac-pull-models, lac-kv-manage"
+	@install -m 755 $(LAC_BIN) $$HOME/.local/bin/lac
+	@install -m 755 $(ROUTER_BIN) $$HOME/.local/bin/lac-router
+	@install -m 755 $(TUI_BIN) $$HOME/.local/bin/lac-tui
+	@install -m 755 ./rust-src/target/release/bootstrap $$HOME/.local/bin/lac-bootstrap
+	@install -m 755 ./rust-src/target/release/bootstrap $$HOME/.local/bin/bootstrap
+	@install -m 755 ./rust-src/target/release/serve-mlx $$HOME/.local/bin/lac-serve-mlx
+	@install -m 755 ./rust-src/target/release/serve-mlx $$HOME/.local/bin/serve-mlx
+	@install -m 755 ./rust-src/target/release/serve-llama $$HOME/.local/bin/lac-serve-llama
+	@install -m 755 ./rust-src/target/release/serve-llama $$HOME/.local/bin/serve-llama
+	@install -m 755 ./rust-src/target/release/pull-models $$HOME/.local/bin/lac-pull-models
+	@install -m 755 ./rust-src/target/release/pull-models $$HOME/.local/bin/pull-models
+	@install -m 755 ./rust-src/target/release/kv-manage $$HOME/.local/bin/lac-kv-manage
+	@install -m 755 ./rust-src/target/release/kv-manage $$HOME/.local/bin/kv-manage
+	@echo "✅ Installed 100% pure Rust binaries to ~/.local/bin: lac, lac-router, lac-tui, serve-mlx, serve-llama, pull-models, kv-manage, bootstrap"
 
 clean:
 	@cd rust-src && cargo clean
@@ -129,6 +149,8 @@ help:
 	@echo "  make serve-mlx      Start MLX engine (:8080)"
 	@echo "  make serve-llama    Start llama-server (:8081)"
 	@echo "  make tui            Launch terminal control center"
+	@echo "  make studio         Launch LAC Studio native macOS app (⌘1-⌘5)"
+	@echo "  make dashboard      Alias for make studio"
 	@echo "  make bench          Run latency/speed benchmark"
 	@echo "  make tune           Rank all live lanes by throughput"
 	@echo "  make stop           Stop router started by lac (engines left running)"

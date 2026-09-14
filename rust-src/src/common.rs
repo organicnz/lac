@@ -5,6 +5,8 @@
 //! Centralizes: memory probing, thermals, port/health checks,
 //! atomic file writes, inter-process locks, and repo introspection.
 
+#![allow(dead_code)]
+
 use std::env;
 use std::fs;
 use std::io;
@@ -20,6 +22,22 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 pub fn home_dir() -> String {
     env::var("HOME").unwrap_or_else(|_| ".".to_string())
 }
+
+/// Instructs the OS kernel to ignore SIGPIPE (signal 13).
+/// In network servers and CLI tools, writing to a socket closed by the remote
+/// peer returns EPIPE instead of abruptly aborting the process with a signal.
+#[cfg(unix)]
+pub fn ignore_sigpipe() {
+    unsafe extern "C" {
+        fn signal(sig: std::ffi::c_int, handler: usize) -> usize;
+    }
+    unsafe {
+        signal(13, 1); // 13 = SIGPIPE, 1 = SIG_IGN
+    }
+}
+
+#[cfg(not(unix))]
+pub fn ignore_sigpipe() {}
 
 /// Project root: current dir when it holds opencode.jsonc, else derived
 /// from the executable path (target/release/<bin> -> up 3 = rust-src's
@@ -50,6 +68,49 @@ pub fn project_root() -> String {
 /// Absolute path to a sibling release binary.
 pub fn bin(root: &str, name: &str) -> String {
     format!("{}/rust-src/target/release/{}", root, name)
+}
+
+/// Retarget a launchd plist template at THIS machine: baked-in prior-home
+/// paths become `$HOME`, `ProgramArguments[0]` becomes `want_bin`, the
+/// working directory becomes this checkout, and log paths re-root into
+/// this user's `~/Library/Logs` (filenames preserved). Keyed on plist
+/// structure, not on one exact string, so templates stay portable
+/// across users and checkouts.
+pub fn retarget_launchd_plist(content: &str, home: &str, root: &str, want_bin: &str) -> String {
+    let mut out = content.replace("/Users/organic", home);
+    // Replace the first <string> entry (ProgramArguments[0]).
+    if let Some(arr) = out.find("<array>") {
+        if let Some(s0) = out[arr..].find("<string>") {
+            let abs = arr + s0 + "<string>".len();
+            if let Some(e0) = out[abs..].find("</string>") {
+                out.replace_range(abs..abs + e0, want_bin);
+            }
+        }
+    }
+    // Pin WorkingDirectory to this checkout.
+    if let Some(k) = out.find("<key>WorkingDirectory</key>") {
+        if let Some(s0) = out[k..].find("<string>") {
+            let abs = k + s0 + "<string>".len();
+            if let Some(e0) = out[abs..].find("</string>") {
+                out.replace_range(abs..abs + e0, root);
+            }
+        }
+    }
+    // Re-root log files into this user's Logs dir,
+    // preserving each plist's filename.
+    for key in ["<key>StandardOutPath</key>", "<key>StandardErrorPath</key>"] {
+        if let Some(k) = out.find(key) {
+            if let Some(s0) = out[k..].find("<string>") {
+                let abs = k + s0 + "<string>".len();
+                if let Some(e0) = out[abs..].find("</string>") {
+                    let cur = out[abs..abs + e0].to_string();
+                    let base = cur.rsplit('/').next().unwrap_or("lac.log");
+                    out.replace_range(abs..abs + e0, &format!("{}/Library/Logs/{}", home, base));
+                }
+            }
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------- memory --
@@ -213,6 +274,58 @@ pub fn http_get(port: u16, path: &str, timeout_ms: u64) -> Option<(u16, String)>
         .and_then(|c| c.parse::<u16>().ok())
         .unwrap_or(0);
     Some((status, text[head_end.min(text.len())..].to_string()))
+}
+
+/// Blocking HTTP POST over 127.0.0.1. Returns (status_code, body).
+/// std-only, bounded read buffer up to 4MB.
+pub fn http_post(port: u16, path: &str, body: &str, timeout_ms: u64) -> Option<(u16, String)> {
+    http_post_addr(&format!("127.0.0.1:{}", port), path, body, Duration::from_millis(timeout_ms))
+}
+
+/// Blocking HTTP POST to a specific socket address with total deadline budget.
+pub fn http_post_addr(addr: &str, path: &str, body: &str, budget: Duration) -> Option<(u16, String)> {
+    use std::io::{Read, Write};
+    let start = Instant::now();
+    let sa: std::net::SocketAddr = addr.parse().ok()?;
+    let req = format!(
+        "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        path,
+        addr,
+        body.len(),
+        body
+    );
+    let mut s = TcpStream::connect_timeout(&sa, Duration::from_secs(5)).ok()?;
+    s.write_all(req.as_bytes()).ok()?;
+    let mut buf: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 16384];
+    loop {
+        let remaining = budget.checked_sub(start.elapsed()).unwrap_or(Duration::ZERO);
+        if remaining.is_zero() {
+            return None;
+        }
+        let _ = s.set_read_timeout(Some(remaining.min(Duration::from_secs(30))));
+        match s.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                if buf.len() > 4_194_304 {
+                    break;
+                }
+            }
+            Err(_) => {
+                if start.elapsed() > budget {
+                    return None;
+                }
+            }
+        }
+    }
+    if buf.is_empty() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&buf).to_string();
+    let code: u16 = text.lines().next()?.split_whitespace().nth(1)?.parse().ok()?;
+    let start = text.find("\r\n\r\n").map(|i| i + 4).unwrap_or(0);
+    Some((code, text[start.min(text.len())..].to_string()))
 }
 
 /// Block until `GET /v1/models` is 200 (or timeout). Servers call this
@@ -539,6 +652,49 @@ pub fn os_descr() -> String {
     format!("{} {}", std::env::consts::OS, std::env::consts::ARCH)
 }
 
+/// True on Apple Silicon Macs (arm64). MLX (`mlx_lm.server`) only runs
+/// here — Intel Macs must use the llama/Ollama lanes instead.
+pub fn is_apple_silicon() -> bool {
+    std::env::consts::ARCH == "aarch64" && std::env::consts::OS == "macos"
+}
+
+/// Human label for headers: "Apple Silicon" on arm64 macOS, else the
+/// compile-time arch (e.g. "x86_64"). Uses `std::env::consts::ARCH`
+/// (always available) — never `CARGO_CFG_TARGET_ARCH`, which only
+/// exists at compile time and reads back as "unknown" at runtime.
+pub fn arch_label() -> &'static str {
+    if is_apple_silicon() {
+        "Apple Silicon"
+    } else if std::env::consts::ARCH == "x86_64" {
+        "Intel"
+    } else {
+        std::env::consts::ARCH
+    }
+}
+
+/// MLX lane availability. Currently Apple Silicon only.
+pub fn mlx_supported() -> bool {
+    is_apple_silicon()
+}
+
+/// RAM-pressure thresholds scaled by total physical RAM, so an 8GB
+/// MacBook Air and a 96GB Studio get sane gates from the same code.
+/// Returns (red_gib, yellow_gib): free < red is RED, < yellow is YELLOW.
+pub fn mem_thresholds_gib() -> (f64, f64) {
+    let total = total_ram_gib().unwrap_or(16.0);
+    let red = (total * 0.04).clamp(1.5, 4.0);
+    let yellow = (total * 0.12).clamp(3.0, 12.0);
+    (red, yellow)
+}
+
+/// Smart-serve tiers scaled by total RAM: (high_gib, medium_gib).
+/// Above high → quality lane; above medium → balanced; below → conserve.
+/// On 96GB this is ~(38, 14), matching the old 40/16 constants.
+pub fn serve_ram_tiers_gib() -> (f64, f64) {
+    let total = total_ram_gib().unwrap_or(16.0);
+    (total * 0.4, total * 0.15)
+}
+
 /// Last `n` lines of a file (trailing newline normalized). Replaces
 /// `tail -n` with zero subprocesses; fine for log-sized files.
 pub fn tail_file(path: &str, n: usize) -> Option<String> {
@@ -698,6 +854,60 @@ mod tests {
     #[test]
     fn default_branch_never_empty() {
         assert!(!default_branch().is_empty());
+    }
+
+    #[test]
+    fn arch_helpers_consistent() {
+        // arch_label never empty; mlx implies Apple Silicon.
+        assert!(!arch_label().is_empty());
+        assert!(!super::arch_label().is_empty());
+        if mlx_supported() {
+            assert!(is_apple_silicon());
+            assert_eq!(arch_label(), "Apple Silicon");
+        }
+        // Compile-time arch and runtime consts must agree (the old
+        // CARGO_CFG_TARGET_ARCH runtime read always missed).
+        assert_eq!(is_apple_silicon(), std::env::consts::ARCH == "aarch64");
+    }
+
+    #[test]
+    fn mem_thresholds_ordered_and_clamped() {
+        let (red, yellow) = mem_thresholds_gib();
+        assert!(red > 0.0 && yellow > red, "red={} yellow={}", red, yellow);
+        assert!((1.5..=4.0).contains(&red), "red={}", red);
+        assert!((3.0..=12.0).contains(&yellow), "yellow={}", yellow);
+    }
+
+    #[test]
+    fn serve_tiers_ordered() {
+        let (high, medium) = serve_ram_tiers_gib();
+        assert!(high > medium && medium > 0.0, "high={} medium={}", high, medium);
+    }
+
+    #[test]
+    fn plist_retarget_ports_across_macs() {
+        let tpl = r#"<?xml version="1.0"?>
+<dict>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/organic/dev/work/AI/LAC/rust-src/target/release/serve-mlx</string>
+        <string>mlx-community/Qwen3.8-27B-4bit</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/Users/organic/dev/work/AI/LAC</string>
+    <key>StandardOutPath</key>
+    <string>/Users/organic/Library/Logs/lac-serve-mlx.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/organic/Library/Logs/lac-serve-mlx.err</string>
+</dict>"#;
+        let out = retarget_launchd_plist(tpl, "/Users/alice", "/ws/LAC", "/Users/alice/.local/bin/lac-serve-mlx");
+        assert!(out.contains("/Users/alice/.local/bin/lac-serve-mlx"), "binary retargeted");
+        assert!(out.contains("<string>/ws/LAC</string>"), "workdir pinned");
+        assert!(out.contains("/Users/alice/Library/Logs/lac-serve-mlx.log"), "stdout re-rooted");
+        assert!(out.contains("/Users/alice/Library/Logs/lac-serve-mlx.err"), "stderr re-rooted");
+        assert!(!out.contains("/Users/organic"), "no prior-home leakage");
+        // Second model arg untouched (only ProgramArguments[0] replaced).
+        assert!(out.contains("mlx-community/Qwen3.8-27B-4bit"), "model arg preserved");
     }
 
     #[test]

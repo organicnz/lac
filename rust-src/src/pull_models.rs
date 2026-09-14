@@ -9,8 +9,14 @@ use std::fs;
 use std::process::Command;
 
 fn main() {
+    common::ignore_sigpipe();
     eprintln!("=== LAC pull-models v2.6 (Rust) ===");
     let home = common::home_dir();
+
+    // 27B-class weights want headroom: warn below 32 GiB total, never fail.
+    if let Some(note) = ram_fit_note(common::total_ram_gib()) {
+        eprintln!("{}", note);
+    }
 
     if let Some(p) = common::which("ollama") {
         if let Ok(o) = Command::new("ollama").arg("--version").output() {
@@ -70,4 +76,30 @@ fn main() {
         std::process::exit(1);
     }
     eprintln!("=== pull-models complete ===");
+}
+
+/// 27B-class weights need headroom (Q4 ~16GB weights + KV + OS): warn
+/// below 32 GiB total RAM, never fail — the pull is still useful for a
+/// bigger Mac or later. Pure in `total_gib` for host-independent tests.
+fn ram_fit_note(total_gib: Option<f64>) -> Option<String> {
+    match total_gib {
+        Some(t) if t < 32.0 => Some(format!(
+            "WARNING: {:.0} GiB total RAM — qwen3.8-27b wants 32GB+ headroom. Pull continues; prefer the Q4 lane and small contexts on this Mac.",
+            t
+        )),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn warns_on_small_macs_only() {
+        assert!(ram_fit_note(Some(8.0)).is_some());
+        assert!(ram_fit_note(Some(16.0)).is_some());
+        assert!(ram_fit_note(Some(96.0)).is_none());
+        assert!(ram_fit_note(None).is_none());
+    }
 }

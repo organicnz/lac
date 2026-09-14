@@ -7,11 +7,11 @@ description: Static code audit — correctness, patterns, test coverage
 
 Runs a structured audit of the codebase and returns a markdown report covering:
 
-1. **Syntax / compilation** — does the project compile / load?
-2. **Idiom compliance** — project-specific patterns (e.g. SwiftUI @State, Rust `Result<T,E>`, Python type hints)
-3. **Missing tests** — files without corresponding `*test.*` or `*_test.` siblings
-4. **Common antipatterns** — force-unwrap `!`, `DispatchQueue.main.async` in Swift, `unwrap()` in Rust, bare `except:` in Python
-5. **Import hygiene** — unused imports, circular deps
+1. **Syntax / compilation** — does the project compile / load (`cargo test`, `swift test`)?
+2. **Idiom compliance** — project-specific patterns (e.g. SwiftUI `@State`, `@MainActor`, Liquid Glass tokens, Rust `Result<T,E>`, std-only zero-dep backend)
+3. **Missing tests** — files without corresponding unit test coverage
+4. **Common antipatterns** — force-unwrap `!`, `DispatchQueue.main.async` in Swift, unhandled `unwrap()` in Rust, non-Rust scripts in backend
+5. **Import hygiene** — unused imports, circular dependencies
 6. **Agent edit log** — summary of recent OpenCode tool calls (if snapshots enabled)
 
 ## Workflow
@@ -22,11 +22,10 @@ opencode2 run 'Use the auditor skill'
 
 The skill will:
 
-1. **Detect project language** from file extensions in cwd
+1. **Detect project language** from file extensions in cwd (Swift and Rust)
 2. **Run language-appropriate checks**:
-   - Swift: `swift build` (if Xcode CLT present), `swiftc -parse-as-documentation`
-   - Rust: `cargo check`
-   - Python: `ruff check`, `py_compile`
+   - Swift (LAC Studio): `swift build`, `swift test`
+   - Rust (Backend Suite): `cargo test --manifest-path rust-src/Cargo.toml`, `cargo clippy`
    - General: `git diff --stat` vs last commit, `tokei` LoC counts
 3. **Scan for antipatterns** using regex + language-specific rules
 4. **Output** `AUDIT_REPORT.md` at project root
@@ -37,7 +36,7 @@ The skill will:
 # Code Audit — <timestamp>
 
 ## Overview
-- Language(s): Swift, Rust, Python
+- Language(s): Swift (Client: LAC Studio), Rust (Backend Suite: std-only)
 - Total files: 128
 - Lines of code: 42,310 (via tokei)
 - Last commit: abc123 "feat: login flow"
@@ -46,18 +45,18 @@ The skill will:
 | # | File | Pattern | Severity |
 |---|------|---------|----------|
 | 1 | Sources/App.swift | `forceUnwrap!` on line 44 | high |
-| 2 | utils/helpers.py | bare `except:` on line 12 | medium |
+| 2 | rust-src/src/lac.rs | unhandled `unwrap()` on line 120 | medium |
 
 ## Missing Tests
 | Directory | Files | % with tests |
 |---|---|---|
-| Sources/ | 42 | 12% |
-| Tests/ | 8 | 100% |
+| SwiftUI/Sources/ | 9 | 100% |
+| rust-src/src/ | 8 | 100% |
 
 ## Recommendations
-1. Replace `x!` with `x.mapError { ... }` or `if let x = x { ... }`
-2. Add tests for `auth/token.swift` — currently no `*test.*` sibling
-3. Remove `DispatchQueue.main.async` from non-UI path in `networking.swift`
+1. Replace `x!` with `if let x = x { ... }` or `guard let`
+2. Keep backend 100% pure Rust (`std` only, zero external crates)
+3. Enforce Apple Liquid Glass tokens on all SwiftUI views
 
 ## Recent Agent Edits (last 7 days)
 - `/set-api-key` — added local Ollama provider config
@@ -72,7 +71,7 @@ Customize antipatterns per language in `opencode.jsonc`:
 ```json
 "agents": {
   "auditor": {
-    "system": "Focus on Swift correctness, Rust idioms, Python type safety.",
+    "system": "Focus on Swift correctness, Liquid Glass HIG compliance, and Rust std idioms.",
     "permissions": [{ "action": "edit", "resource": "*", "effect": "deny" }]
   }
 }

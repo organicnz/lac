@@ -24,7 +24,10 @@ fn find_free_mlx_port() -> u16 {
     }
     // Preferred port 8080, then probe 8082, 8083 … (skip 8081 reserved for llama-server).
     for port in [8080, 8082, 8083, 8084, 8085, 8086, 8087, 8088, 8089, 8090].iter().copied() {
-        let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let addr: SocketAddr = match format!("127.0.0.1:{port}").parse() {
+            Ok(a) => a,
+            Err(_) => continue,
+        };
         if TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok() {
             continue;
         }
@@ -98,7 +101,15 @@ fn which(cmd: &str) -> bool {
 }
 
 fn main() {
+    common::ignore_sigpipe();
     eprintln!("=== LAC serve-mlx v2.7 (Rust, port-aware, auto-restart daemon) ===");
+
+    if !common::mlx_supported() && std::env::var("LAC_ALLOW_MLX").unwrap_or_default() != "1" {
+        eprintln!("MLX requires Apple Silicon (arm64 macOS); this host is {}.", common::arch_label());
+        eprintln!("Use the llama-server lane instead: `lac serve llama`.");
+        eprintln!("Override for testing only: LAC_ALLOW_MLX=1.");
+        std::process::exit(1);
+    }
 
     if !which("mlx_lm.server") {
         eprintln!("mlx_lm.server not found in PATH.");
@@ -122,10 +133,15 @@ fn main() {
     );
 
     std::thread::spawn(move || {
-        if common::wait_for_http(port, Duration::from_secs(300)) {
-            eprintln!("serve-mlx READY on :{} (model loaded)", port);
-        } else {
-            eprintln!("serve-mlx: model not ready after 300s — check logs");
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if common::wait_for_http(port, Duration::from_secs(300)) {
+                eprintln!("serve-mlx READY on :{} (model loaded)", port);
+            } else {
+                eprintln!("serve-mlx: model not ready after 300s — check logs");
+            }
+        }));
+        if let Err(e) = res {
+            eprintln!("[serve-mlx] readiness prober panicked (harmless): {:?}", e);
         }
     });
 

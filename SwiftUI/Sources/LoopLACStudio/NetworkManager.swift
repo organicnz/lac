@@ -231,10 +231,35 @@ class NetworkManager: ObservableObject {
         return (try? await URLSession.shared.data(for: req)) != nil
     }
 
+    /// Free bytes on the home volume (for pull disk preflight).
+    static func freeDiskBytes(path: String = NSHomeDirectory()) -> Int64 {
+        let attrs = try? FileManager.default.attributesOfFileSystem(forPath: path)
+        return (attrs?[.systemFreeSize] as? NSNumber)?.int64Value ?? 0
+    }
+
+    static func formatGB(_ bytes: Int64) -> String {
+        let gb = Double(bytes) / (1024.0 * 1024.0 * 1024.0)
+        if gb >= 1.0 { return String(format: "%.1f GB", gb) }
+        return String(format: "%.0f MB", Double(bytes) / (1024.0 * 1024.0))
+    }
+
     func stopAll() async { _ = await runLac(["stop"]) }
 
-    func pullModel(_ modelId: String) {
+    func pullModel(_ modelId: String, expectedBytes: Int64? = nil) {
         guard pullingModelId == nil else { return }
+        // Disk preflight: refuse before spawning when the download
+        // provably does not fit (15% headroom for temp files).
+        if let expected = expectedBytes, expected > 0 {
+            let free = Self.freeDiskBytes()
+            let need = Int64(Double(expected) * 1.15)
+            if free > 0, free < need {
+                let msg = "Pull blocked: \(modelId) needs ~\(Self.formatGB(need)) but only \(Self.formatGB(free)) is free. Inspect Files for a smaller quant or free disk space."
+                pullOutput = msg
+                lastError = msg
+                lastAction = "Pull blocked (disk full)"
+                return
+            }
+        }
         pullingModelId = modelId
         pullOutput = "Starting background download for \(modelId)..."
         lastAction = "Pulling \(modelId)..."
@@ -251,12 +276,13 @@ class NetworkManager: ObservableObject {
             fileHandle.readabilityHandler = { handle in
                 let data = handle.availableData
                 if !data.isEmpty, let str = String(data: data, encoding: .utf8) {
-                    DispatchQueue.main.async {
-                        self.pullOutput = (self.pullOutput ?? "") + str
+                    DispatchQueue.main.async { [weak self, str] in
+                        guard let self else { return }
+                        let combined = (self.pullOutput ?? "") + str
                         // Keep only the last 1000 characters to avoid memory bloat
-                        if self.pullOutput!.count > 1000 {
-                            self.pullOutput = String(self.pullOutput!.suffix(1000))
-                        }
+                        self.pullOutput = combined.count > 1000
+                            ? String(combined.suffix(1000))
+                            : combined
                     }
                 }
             }

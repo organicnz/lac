@@ -21,11 +21,19 @@ cd ~/dev/work/AI/LAC
 ./rust-src/target/release/lac doctor     # Verify stack integrity
 ./rust-src/target/release/lac status     # Real-time telemetry
 
-# Option B — TUI (interactive terminal dashboard)
+# Option B — LAC Studio (Native Apple Silicon macOS Liquid Glass Desktop App)
+./SwiftUI/package-app.sh --open          # Or run: lac visualize
+# Features Claude/Codex ergonomics, Code Assistant split canvas (⌘2), live Hugging Face Model Hub, and Ops telemetry
+
+# Option C — Code Assistant from CLI (Instant single-shot or piped refactoring)
+lac code -f src/main.rs "Review for thread-safety and zero-allocation performance"
+cat src/lib.rs | lac code "Generate comprehensive unit tests"
+
+# Option C — TUI (interactive terminal dashboard)
 ./rust-src/target/release/lac-tui
 # Menu: 1) health check  2) serve menu  3) smart serve  4) skills  5) pull models  6) preflight  7) bootstrap
 
-# Option C — headless bootstrap (one-time)
+# Option D — headless bootstrap (one-time, 100% pure Rust)
 ./rust-src/target/release/bootstrap
 # This does (Rust-first, idempotent):
 #   • Ensures Homebrew + brew bundle
@@ -56,7 +64,7 @@ bootstrap's Rust `std::os::unix::fs::symlink`).
 
 ## 3. Start the inference server (Rust binary — preferred)
 
-### MLX (fastest decode on M5 Ultra Apple Silicon)
+### MLX (fastest decode on Apple Silicon)
 
 ```bash
 # Rust binary — preferred method
@@ -114,7 +122,7 @@ opencode2 run "List the files in the project and summarize the codebase structur
 | KV Cache Manage | `kv-cache-manage` | Emergency truncate before OOM; archive + summarize |
 | Context Cap | `context-cap` | Steady-state 16K hygiene; complements kv-cache-manage |
 | Agent Resume | `agent-resume` | Persist state to agent-state.json; resume after crash |
-| Thermal Monitor | `thermal-monitor` | Watch M5 Ultra temps; auto-throttle Q8→Q4 on Serious |
+| Thermal Monitor | `thermal-monitor` | Watch Mac temps; auto-throttle Q8→Q4 on Serious |
 | Loop Orchestrator | `loop-orchestrator` | implement→review→apply, max 2 rounds, human gate |
 | Task Runner | `task-runner` | Drain ~/todo/lac-tasks.yaml queue, max N tasks |
 | Permissions Trust | `permissions-trust` | Trusted allow/deny rules so batches don't stall on prompts |
@@ -141,6 +149,26 @@ opencode2 run 'Use the worktree-fanout skill --feature auth'
 # Run a code audit
 opencode2 run 'Use the auditor skill'
 ```
+
+## 5b. LAC Studio Native macOS Desktop App
+
+Launch the native Apple Silicon desktop client with Apple Liquid Glass aesthetics, Claude Desktop & Codex ergonomics, split Code Assistant (`⌘2`), and Hugging Face Model Hub discovery:
+
+```bash
+# Launch LAC Studio (builds and packages on first run)
+lac studio
+# or
+make studio
+
+# Package as signed macOS application (.build/LAC Studio.app)
+cd SwiftUI && ./package-app.sh --open
+```
+
+**Key Features:**
+- **Executive Liquid Glass Aesthetic**: VisionOS-grade specular highlights, ambient sheen, light diffraction, and tactile haptic feedback.
+- **Claude & Codex Ergonomics**: 780pt centered golden-ratio column, collapsible sidebar (`⌘B`), `+ New Chat` (`⌘N`), search filter across threads grouped by date ("Today", "Yesterday", "Previous 7 Days", "Older"), and floating elevated composer.
+- **Code Assistant (`⌘2`)**: Split coding canvas with multi-file code editor, fast actions (`Explain`, `Refactor`, `Generate Tests`, `Audit Bugs`, `Optimize`), and 1-click diff application directly into the workbench.
+- **LM Studio Hugging Face Hub (`⌘4`)**: Discover top models filtered by Apple Silicon, MLX, GGUF, Coding, Reasoning, and Multimodal/Vision; parameter size filters (≤8B, 14B–32B, 70B+); RAM fit estimations; and 1-click pull.
 
 ## 6. Daily workflow (example — Rust-first, qwen3.8-27B primary)
 
@@ -256,7 +284,7 @@ LAC/
 │  ├─ .opencode/skills/kv-cache-manage/       # emergency OOM truncate
 │  ├─ .opencode/skills/context-cap/           # steady-state 16K hygiene
 │  ├─ .opencode/skills/agent-resume/          # persist + resume state
-│  ├─ .opencode/skills/thermal-monitor/       # M5 Ultra temp watch
+│  ├─ .opencode/skills/thermal-monitor/       # temp watch
 │  ├─ .opencode/skills/permissions-trust/     # trusted rules, no mid-loop prompts
 │  ├─ .opencode/skills/knowledge-recall/      # recall index + lessons pre-task
 │  ├─ .opencode/skills/index-embeddings/      # vector index
@@ -270,7 +298,7 @@ LAC/
 ├─ Documentation:
 │  ├─ README.md                               # High-level overview
 │  ├─ QUICKSTART.md                           # Quick start guide
-│  ├─ docs/ARCHITECTURE.md                    # 96GB memory budget & 4-layer stack
+│  ├─ docs/ARCHITECTURE.md                    # memory budget & 4-layer stack
 │  ├─ docs/MTP_TUNING.md                      # Speculative decoding optimization
 │  ├─ docs/LOOPS_AND_KANBAN.md                # Non-stop autonomous loops guide
 │  └─ TERMINALS.md                            # Warp vs Ghostty decision guide

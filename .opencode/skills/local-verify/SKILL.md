@@ -13,11 +13,11 @@ Checks that:
 
 ## Workflow
 
-1. Run `opencode2 api get /api/health` to verify OpenCode server alive
-2. Run `curl -s http://127.0.0.1:11434/v1/models` (Ollama) or `curl -s http://127.0.0.1:8080/v1/models` (llama-server)
-3. Parse model list, confirm expected model name present
-4. Run a quick `chat/completions` ping: `POST /v1/chat/completions` with `{"messages":[{"role":"user","content":"ping"}],"temperature":0}`
-5. Report: model name, tok/s (if available), context window, latency
+1. Run `lac doctor` or `./rust-src/target/release/lac doctor` (pure Rust diagnostic suite)
+2. Run `curl -s http://127.0.0.1:8000/lac/status` to inspect `lac-router` gateway and backend health
+3. Run `lac status` or check the telemetry in **LAC Studio** / `lac-tui`
+4. Run a quick `chat/completions` ping against the gateway: `POST http://127.0.0.1:8000/v1/chat/completions` with `{"model":"qwen3.8-27b","messages":[{"role":"user","content":"ping"}],"temperature":0}`
+5. Report: active backend (MLX/llama/Ollama), TTFT, free RAM, and thermal state
 
 ## Usage
 

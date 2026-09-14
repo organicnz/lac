@@ -1,8 +1,8 @@
-# LAC Architecture Blueprint — Mac Studio M5 Ultra 96GB
+# LAC Architecture Blueprint — Apple Silicon Macs
 
 ## 1. System Overview
 
-The Local Agentic Coding (LAC) stack is engineered specifically for the Apple Silicon **Mac Studio M5 Ultra** (30 CPU cores, 64 GPU cores, 96GB unified memory). It runs **Qwen 3.8 27B** as the primary model across all coding, analysis, and auditing tasks.
+The Local Agentic Coding (LAC) stack targets Apple Silicon **Macs** (8GB+ supported; reference configuration below measured on a high-RAM Mac Studio). It runs **Qwen 3.8 27B** as the primary model across all coding, analysis, and auditing tasks. RAM-pressure thresholds and smart-serve tiers scale with detected total RAM (`common::mem_thresholds_gib`, `common::serve_ram_tiers_gib`), so smaller Macs get sane gates from the same code.
 
 ```
 ┌────────────────────────────────────────────────────────────────────────┐
@@ -11,14 +11,15 @@ The Local Agentic Coding (LAC) stack is engineered specifically for the Apple Si
 └───────────────────────────────────┬────────────────────────────────────┘
                                     │ Drives & monitors
 ┌───────────────────────────────────▼────────────────────────────────────┐
-│                          3. Harness Layer                              │
-│       OpenCode V2 (@coder, @reviewer, @orchestrator, 14 skills)        │
+│                      3. Client & Harness Layer                         │
+│ LAC Studio (macOS Liquid Glass)      │ OpenCode V2 (Agents & 14 Skills)    │
 └───────────────────────────────────┬────────────────────────────────────┘
                                     │ OpenAI API calls (:8000)
 ┌───────────────────────────────────▼────────────────────────────────────┐
-│            2. LAC Unified Gateway & CLI (Rust Native)                  │
+│           2. LAC Unified Gateway & Engine (100% Pure Rust Native)      │
 │   `lac` CLI  │  `lac-router` :8000 (Hot-swap, Auto-routing, Telemetry) │
-│              │  `lac-tui` (Interactive Dashboard & Health)             │
+│   `lac-tui`  │  `serve-mlx` :8080  │ `serve-llama` :8081               │
+│   `kv-manage`│  `pull-models`      │ `bootstrap`                       │
 └──────────┬────────────────────────┬────────────────────────┬───────────┘
            │ :8080/8082             │ :8081                  │ :11434
 ┌──────────▼───────────────┐ ┌──────▼───────────────┐ ┌──────▼───────────┐
@@ -26,7 +27,7 @@ The Local Agentic Coding (LAC) stack is engineered specifically for the Apple Si
 │  Qwen3.8-27B 4-bit       │ │  Qwen3.8-27B Q8_0    │ │ Qwen3.8-27B GGUF │
 │  (Native MTP ~45 tok/s)  │ │ (Quality / Spec Dec) │ │   (Fallback)     │
 └──────────────────────────┴─┴──────────────────────┴─┴──────────────────┘
-                                1. Inference Layer (M5 Ultra 96GB)
+                                1. Inference Layer (Apple Silicon Macs)
 ```
 
 ---
@@ -44,12 +45,12 @@ OpenCode connects to `http://127.0.0.1:8000/v1`. The LAC router transparently fo
 
 ---
 
-## 3. Unified Memory Budget (96GB Allocation)
+## 3. Unified Memory Budget (reference: 96GB Studio)
 
-On Apple Silicon, unified memory is shared dynamically between CPU and GPU Metal cores.
+On Apple Silicon, unified memory is shared dynamically between CPU and GPU Metal cores. Worked example below is measured on a 96GB Studio; on other Macs the same rows apply with their own totals, and the code scales its gates automatically.
 
 ```
-Total Physical Memory: 96.0 GiB
+Reference Total Physical Memory: 96.0 GiB
 ┌───────────────────────────────┬─────────────────┬──────────────────────┐
 │ Model Weights                 │ KV Cache        │ OS & Working Set     │
 │ Q4_K_M: ~16.1 GiB             │ 32K ctx: ~8 GiB │ macOS 26: ~8-12 GiB  │

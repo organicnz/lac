@@ -74,10 +74,11 @@ fn status_header(root: &str) -> String {
                 rest4.find('"').map(|q4| rest4[..q4].to_string())
             })
         })
-        .unwrap_or_else(|| "?".to_string());
+        .unwrap_or_else(|| "—".to_string());
+    let arch = common::arch_label();
     format!(
-        "LAC  model:{}  gw:{}  ollama:{}  mlx:{}  llama:{}  free:{}",
-        model, gw, o, mlx, llama, ram
+        "LAC  model:{}  gw:{}  ollama:{}  mlx:{}  llama:{}  free:{}  | {}",
+        model, gw, o, mlx, llama, ram, arch
     )
 }
 
@@ -202,16 +203,22 @@ fn serve_menu(root: &str) {
                 pause();
             }
             "5" => {
-                // Native launchd install (no shell pipeline): place the
-                // plist retargeted at this user's home, then bootstrap it
-                // into the GUI domain.
+                // serve-mlx launchd install, retargeted at this machine
+                // (same shared helper as `lac daemon install`, so other
+                // users/checkouts get correct binary, workdir, and logs).
                 let src = format!("{}/launchd/org.lac.serve-mlx.plist", root);
                 let home = common::home_dir();
                 let dst = format!("{}/Library/LaunchAgents/org.lac.serve-mlx.plist", home);
+                let installed = format!("{}/.local/bin/lac-serve-mlx", home);
+                let want_bin = if std::fs::metadata(&installed).is_ok() {
+                    installed
+                } else {
+                    common::bin(root, "serve-mlx")
+                };
                 match std::fs::create_dir_all(format!("{}/Library/LaunchAgents", home))
                     .and_then(|_| std::fs::read_to_string(&src))
-                    .map(|c| c.replace("/Users/organic", &home))
-                    .and_then(|c| std::fs::write(&dst, c))
+                    .map(|c| common::retarget_launchd_plist(&c, &home, root, &want_bin))
+                    .and_then(|c| common::atomic_write(&dst, &c))
                 {
                     Ok(()) => {
                         let uid = Command::new("id")
@@ -296,12 +303,23 @@ fn smart_serve(root: &str) {
     pause();
 }
 
-/// Decide which lane to serve: thresholds scaled for the 96GB Studio.
+/// Decide which lane to serve: thresholds scale with total RAM via
+/// `common::serve_ram_tiers_gib()`, and the MLX lane is Apple Silicon
+/// only (Intel Macs fall back to llama-server).
 /// Q4 always rides MLX (native MTP, fastest); Q8 always rides
 /// llama-server (quality). The old table mixed them up -- it labelled
 /// choices "llama Q4" then booted an MLX model into llama-server.
 fn decide_model_and_context(thermal: &str, free: f64, current_tokens: u64) -> (String, i32, String) {
     let threshold_tokens = 24000u64;
+    let (high_gib, medium_gib) = common::serve_ram_tiers_gib();
+    let mlx_ok = common::mlx_supported();
+    let q4_lane = if mlx_ok {
+        "mlx Q4 (mlx-community/Qwen3.8-27B-4bit)".to_string()
+    } else {
+        // Intel / non-MLX Macs: closest speed lane is llama Q8 with a
+        // small context; never advertise an unbootable MLX model.
+        "llama-server Q8 (unsloth/Qwen3.6-27B-MTP-GGUF:Q8_0)".to_string()
+    };
     let tokens_percent = if threshold_tokens > 0 {
         (current_tokens as f64 / threshold_tokens as f64) * 100.0
     } else {
@@ -311,38 +329,39 @@ fn decide_model_and_context(thermal: &str, free: f64, current_tokens: u64) -> (S
     // Rule 1: heat always wins -- shed quality for survival.
     if thermal == "Critical" {
         return (
-            "mlx Q4 (mlx-community/Qwen3.8-27B-4bit)".to_string(),
+            q4_lane.clone(),
             4096,
-            format!("Thermal Critical -> MLX Q4 ctx=4096 to survive. Free RAM: {:.1} GiB, tokens {}/24000 ({:.1}%)", free, current_tokens, tokens_percent),
+            format!("Thermal Critical -> {} ctx=4096 to survive. Free RAM: {:.1} GiB, tokens {}/24000 ({:.1}%)", q4_lane, free, current_tokens, tokens_percent),
         );
     }
     if thermal == "Serious" || thermal == "Fair" {
         return (
-            "mlx Q4 (mlx-community/Qwen3.8-27B-4bit)".to_string(),
+            q4_lane.clone(),
             8192,
-            format!("Thermal {} -> MLX Q4 ctx=8192 for stability. Free RAM: {:.1} GiB.", thermal, free),
+            format!("Thermal {} -> {} ctx=8192 for stability. Free RAM: {:.1} GiB.", thermal, q4_lane, free),
         );
     }
 
     // Rule 2: Nominal -- spend RAM on quality while headroom is vast.
-    if free > 40.0 && tokens_percent < 50.0 {
+    // Tiers scale with total RAM (high/medium), not fixed 40/16 GiB.
+    if free > high_gib && tokens_percent < 50.0 {
         return (
             "llama-server Q8 (unsloth/Qwen3.6-27B-MTP-GGUF:Q8_0)".to_string(),
             16384,
             format!("Nominal + {:.1} GiB free + tokens {:.1}% -> llama Q8 ctx=16384 for maximum quality.", free, tokens_percent),
         );
     }
-    if free >= 16.0 {
+    if free >= medium_gib {
         return (
-            "mlx Q4 (mlx-community/Qwen3.8-27B-4bit)".to_string(),
+            q4_lane.clone(),
             16384,
-            format!("Nominal + {:.1} GiB free -> MLX Q4 ctx=16384, balanced speed.", free),
+            format!("Nominal + {:.1} GiB free -> {} ctx=16384, balanced speed.", free, q4_lane),
         );
     }
     (
-        "mlx Q4 (mlx-community/Qwen3.8-27B-4bit)".to_string(),
+        q4_lane,
         8192,
-        format!("Nominal but only {:.1} GiB free -> MLX Q4 ctx=8192 to conserve.", free),
+        format!("Nominal but only {:.1} GiB free -> conserve with ctx=8192.", free),
     )
 }
 
@@ -575,13 +594,69 @@ fn preflight(root: &str) {
     pause();
 }
 
+fn sparkline(values: &[u32], max_val: u32) -> String {
+    let ticks = [' ', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    let mut out = String::new();
+    let m = if max_val == 0 { 1 } else { max_val };
+    for &v in values {
+        let idx = ((v as usize * (ticks.len() - 1)) / m as usize).min(ticks.len() - 1);
+        out.push(ticks[idx]);
+    }
+    out
+}
+
+fn live_monitor(root: &str) {
+    println!("\x1B[?25l"); // Hide cursor
+    let mut history_ram: Vec<u32> = Vec::new();
+    let mut iteration = 0;
+
+    while iteration < 15 {
+        iteration += 1;
+        clear();
+        println!("===========================================================");
+        println!("  LAC Live Telemetry Monitor (Apple Silicon)");
+        println!("  {}", status_header(root));
+        println!("===========================================================\n");
+
+        let gw_up = port_up(8000);
+        let gw_status = if gw_up { "\x1B[32mONLINE (:8000)\x1B[0m" } else { "\x1B[31mOFFLINE\x1B[0m" };
+        println!("Gateway:      {}", gw_status);
+
+        let free_gb = free_ram_gib().unwrap_or(0.0);
+        let free_int = (free_gb * 10.0) as u32;
+        history_ram.push(free_int);
+        if history_ram.len() > 24 { history_ram.remove(0); }
+        let spark = sparkline(&history_ram, 640);
+        let ram_color = if free_gb >= 16.0 { "\x1B[32m" } else if free_gb >= 8.0 { "\x1B[33m" } else { "\x1B[31m" };
+        println!("Free RAM:     {}{:.1} GiB\x1B[0m  [{}]", ram_color, free_gb, spark);
+
+        let thermal_str = common::thermal_detail();
+        let first_thermal = thermal_str.lines().next().unwrap_or("Nominal");
+        println!("Thermals:     {}", first_thermal);
+
+        println!("\nActive Lane Routing:");
+        println!("  - MLX (Lane 1):    {} (:8080/v1)", if port_up(common::mlx_port()) { "\x1B[32mACTIVE\x1B[0m" } else { "\x1B[90mIDLE\x1B[0m" });
+        println!("  - Llama (Lane 2):  {} (:8081/v1)", if port_up(8081) { "\x1B[32mACTIVE\x1B[0m" } else { "\x1B[90mIDLE\x1B[0m" });
+        println!("  - Ollama (Lane 3): {} (:11434/v1)", if port_up(11434) { "\x1B[32mACTIVE\x1B[0m" } else { "\x1B[90mIDLE\x1B[0m" });
+
+        println!("\nSampling (AGENTS.md):");
+        println!("  temp 0.6, top_p 0.95, context-cap 32k/16k, single-model resident.");
+        println!("\n[Sample {}/15 | Updating live...]", iteration);
+
+        std::thread::sleep(std::time::Duration::from_millis(800));
+    }
+    println!("\x1B[?25h"); // Restore cursor
+    pause();
+}
+
 fn main() {
+    common::ignore_sigpipe();
     let root = project_root();
     loop {
         clear();
         println!("==============================================");
         println!("  {}", status_header(&root));
-        println!("  Mac Studio M5 Ultra 96GB | Q4<->Q8 | OpenCode V2");
+        println!("  {} | Q4<->Q8 | OpenCode V2", common::arch_label());
         println!("==============================================\n");
         println!("  1) Health check (servers, kv, disk, thermals)");
         println!("  2) Serve menu (start/stop Q4/Q8, launchd install)");
@@ -590,6 +665,7 @@ fn main() {
         println!("  5) Pull models (qwen3.8-27b)");
         println!("  6) Pre-flight check (8hr+ long runs)");
         println!("  7) Bootstrap (one-time setup)");
+        println!("  8) Live Monitor (TTFT, TPS, KV Pressure sparkline)");
         println!("  0) Quit\n");
         print!("choice> ");
         let _ = io::stdout().flush();
@@ -615,6 +691,7 @@ fn main() {
                 let _ = Command::new(bin(&root, "bootstrap")).status();
                 pause();
             }
+            "8" => live_monitor(&root),
             "0" | "q" | "quit" | "exit" => break,
             _ => {}
         }

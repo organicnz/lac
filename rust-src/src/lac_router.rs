@@ -63,6 +63,7 @@ fn tier_backends() -> Vec<(usize, u16)> {
     ]
 }
 
+#[allow(dead_code)]
 fn backend_id_for_port(port: u16) -> usize {
     for (id, p) in tier_backends() {
         if p == port {
@@ -301,6 +302,7 @@ fn read_headers(client: &TcpStream) -> io::Result<Vec<u8>> {
     // headers; the caller forwards them explicitly and streams the rest.
     let mut stream = client.try_clone()?;
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
     let mut buf: Vec<u8> = Vec::with_capacity(8192);
     let mut chunk = [0u8; 8192];
     loop {
@@ -351,6 +353,7 @@ fn http_response(status: &str, content_type: &str, body: &str) -> String {
 }
 
 fn json_response(stream: &mut TcpStream, status: &str, body: &str) -> io::Result<()> {
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
     stream.write_all(http_response(status, "application/json", body).as_bytes())
 }
 
@@ -487,6 +490,7 @@ fn handle_lac_switch(
 }
 
 fn handle_options(mut stream: TcpStream) -> io::Result<()> {
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
     let resp = "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Authorization\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
     stream.write_all(resp.as_bytes())
 }
@@ -784,6 +788,26 @@ fn pick_backends(
 }
 
 /// Borrowed-client forward: on `Connect` failure the caller still owns
+fn parse_content_length(headers: &[u8]) -> Option<usize> {
+    let head = String::from_utf8_lossy(headers);
+    for line in head.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            break;
+        }
+        let mut parts = trimmed.splitn(2, ':');
+        if let (Some(name), Some(val)) = (parts.next(), parts.next()) {
+            if name.trim().eq_ignore_ascii_case("content-length") {
+                if let Ok(len) = val.trim().parse::<usize>() {
+                    return Some(len);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Borrowed-client forward: on `Connect` failure the caller still owns
 /// the client socket and may retry the next backend. Mid-stream
 /// failures return `Stream` (response already partial — no retry).
 /// Ok carries (request bytes, response bytes, first-byte latency).
@@ -806,30 +830,69 @@ fn try_forward(
         return Err(ForwardError::Connect);
     }
 
+    let _ = client.set_nodelay(true);
+    let _ = server.set_nodelay(true);
     let _ = client.set_read_timeout(Some(STREAM_BUDGET));
-    let _ = server.set_read_timeout(Some(STREAM_BUDGET));
+    let _ = server.set_read_timeout(Some(Duration::from_secs(15)));
+    let _ = client.set_write_timeout(Some(Duration::from_secs(60)));
+    let _ = server.set_write_timeout(Some(Duration::from_secs(60)));
 
-    let mut client_read = client.try_clone().map_err(|_| ForwardError::Stream)?;
-    let mut server_write = server.try_clone().map_err(|_| ForwardError::Stream)?;
+    let header_len = find_headers_end(initial_bytes).unwrap_or(initial_bytes.len());
+    let body_in_initial = initial_bytes.len().saturating_sub(header_len);
+    let content_len = parse_content_length(initial_bytes);
 
-    let t1 = thread::spawn(move || -> u64 {
-        let mut buf = [0u8; 16384];
-        let mut n_total = 0u64;
-        loop {
-            match client_read.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    n_total += n as u64;
-                    if server_write.write_all(&buf[..n]).is_err() {
-                        break;
+    let t1 = if let Some(cl) = content_len {
+        if body_in_initial >= cl {
+            // Whole body is already in initial_bytes and forwarded!
+            // No client upload thread needed; request is already complete.
+            None
+        } else {
+            let mut remaining = cl - body_in_initial;
+            let mut client_read = client.try_clone().map_err(|_| ForwardError::Stream)?;
+            let mut server_write = server.try_clone().map_err(|_| ForwardError::Stream)?;
+            Some(thread::spawn(move || -> u64 {
+                let mut buf = [0u8; 16384];
+                let mut n_total = 0u64;
+                while remaining > 0 {
+                    let to_read = buf.len().min(remaining);
+                    match client_read.read(&mut buf[..to_read]) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            n_total += n as u64;
+                            remaining = remaining.saturating_sub(n);
+                            if server_write.write_all(&buf[..n]).is_err() {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
                     }
                 }
-                Err(_) => break,
-            }
+                let _ = server_write.shutdown(std::net::Shutdown::Write);
+                n_total
+            }))
         }
-        let _ = server_write.shutdown(std::net::Shutdown::Write);
-        n_total
-    });
+    } else {
+        let mut client_read = client.try_clone().map_err(|_| ForwardError::Stream)?;
+        let mut server_write = server.try_clone().map_err(|_| ForwardError::Stream)?;
+        Some(thread::spawn(move || -> u64 {
+            let mut buf = [0u8; 16384];
+            let mut n_total = 0u64;
+            loop {
+                match client_read.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        n_total += n as u64;
+                        if server_write.write_all(&buf[..n]).is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            let _ = server_write.shutdown(std::net::Shutdown::Write);
+            n_total
+        }))
+    };
 
     let mut server_read = server;
     // Owned write handle; the borrowed `client` stays with the caller for
@@ -850,13 +913,21 @@ fn try_forward(
                     break;
                 }
             }
+            Err(e) if (e.kind() == io::ErrorKind::TimedOut || e.kind() == io::ErrorKind::WouldBlock) && t_start.elapsed() < STREAM_BUDGET => {
+                // If response headers already delivered to client, emit SSE comment keep-alive to maintain transport
+                if ttfb.is_some() {
+                    let _ = client_write.write_all(b": keep-alive\n\n");
+                }
+                continue;
+            }
             Err(_) => break,
         }
     }
     let _ = client_write.shutdown(std::net::Shutdown::Write);
-    let up_total = t1.join().unwrap_or(0);
+    let _ = client.shutdown(std::net::Shutdown::Both);
+    let up_extra = t1.map(|h| h.join().unwrap_or(0)).unwrap_or(0);
     Ok((
-        up_total + initial_bytes.len() as u64,
+        initial_bytes.len() as u64 + up_extra,
         down_total,
         ttfb,
     ))
@@ -902,7 +973,7 @@ fn handle_connection(
         return;
     }
 
-    if path == "/lac/status" || path == "/lac/health" {
+    if path == "/lac/status" || path == "/lac/health" || path == "/v1/status" || path == "/v1/health" {
         let _ = handle_lac_status(
             client,
             preferred.load(Ordering::SeqCst),
@@ -1041,6 +1112,8 @@ fn handle_connection(
 }
 
 fn main() {
+    common::ignore_sigpipe();
+
     let port: u16 = env::var("LAC_ROUTER_PORT")
         .ok()
         .and_then(|p| p.parse().ok())
@@ -1121,7 +1194,12 @@ fn main() {
                 let inflight = Arc::clone(&inflight);
                 let rid = Arc::clone(&rid);
                 thread::spawn(move || {
-                    handle_connection(client, pref, hc, stats, routes, inflight, rid, started);
+                    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        handle_connection(client, pref, hc, stats, routes, inflight, rid, started);
+                    }));
+                    if let Err(e) = res {
+                        eprintln!("[lac-router] recovered safely from thread panic in connection handler: {:?}", e);
+                    }
                 });
             }
             Err(e) => {
@@ -1219,5 +1297,13 @@ mod tests {
         assert!(breaker_open_for(&stats, 8080));
         note_success(&stats, 8080, 50.0, 0, 0);
         assert!(!breaker_open_for(&stats, 8080));
+    }
+
+    #[test]
+    fn parse_content_length_extracted() {
+        let req = b"POST /v1/chat HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: 42\r\n\r\n{}";
+        assert_eq!(parse_content_length(req), Some(42));
+        let get = b"GET /v1/models HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        assert_eq!(parse_content_length(get), None);
     }
 }

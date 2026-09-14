@@ -5,7 +5,7 @@
 Qwen 3.8 27B is shipped with built-in Multi-Token Prediction (MTP) heads. Unlike classic speculative decoding which requires loading a separate draft model (wasting GPU memory and bandwidth), MTP generates speculative candidate tokens directly from auxiliary heads trained in the base architecture.
 
 - **Speedup Factor**: ~2.24x speedup over standard autoregressive decoding.
-- **Decoding Speed on M5 Ultra**:
+- **Decoding Speed** (measured on Mac Studio, 96GB):
   - 20K–30K context: **~45 tokens/second**
   - 128K context: **~22 tokens/second**
 - **Memory Overhead**: Zero additional model weights needed; uses native MTP heads.
@@ -52,7 +52,7 @@ llama-server \
   -b 2048 \          # Large batch size for prompt processing
   -ub 256 \          # Micro-batching for low latency
   -np 4 \            # Parallel slots for concurrent agent queries
-  -ngl 999           # Full GPU offload to M5 Ultra Metal cores
+  -ngl 999           # Full GPU offload to Apple Metal cores
 ```
 
 ---

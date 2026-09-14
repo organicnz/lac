@@ -296,8 +296,7 @@ public struct CommandPaletteView: View {
                 // Results list
                 ScrollViewReader { proxy in
                     ScrollView {
-                        VStack(alignment: .leading, spacing: 4) {
-                            if filteredItems.isEmpty {
+                        VStack(alignment: .leading, spacing: 4) {                            if filteredItems.isEmpty {
                                 HStack {
                                     Spacer()
                                     VStack(spacing: 8) {
@@ -325,6 +324,9 @@ public struct CommandPaletteView: View {
                         .padding(10)
                     }
                     .frame(maxHeight: 340)
+                    .onChange(of: selectedIndex) { idx in
+                        proxy.scrollTo(idx, anchor: .center)
+                    }
                 }
 
                 Divider().opacity(0.2)
@@ -377,10 +379,22 @@ public struct CommandPaletteView: View {
             selectedIndex = 0
         }
         .background {
-            Button("") {
-                dismiss()
+            Group {
+                Button("") {
+                    dismiss()
+                }
+                .keyboardShortcut(.escape, modifiers: [])
+
+                Button("") {
+                    moveSelection(by: -1)
+                }
+                .keyboardShortcut(.upArrow, modifiers: [])
+
+                Button("") {
+                    moveSelection(by: 1)
+                }
+                .keyboardShortcut(.downArrow, modifiers: [])
             }
-            .keyboardShortcut(.escape, modifiers: [])
             .opacity(0)
             .allowsHitTesting(false)
         }
@@ -439,6 +453,12 @@ public struct CommandPaletteView: View {
         let items = filteredItems
         guard !items.isEmpty, selectedIndex < items.count else { return }
         execute(items[selectedIndex])
+    }
+
+    private func moveSelection(by delta: Int) {
+        let count = filteredItems.count
+        guard count > 0 else { return }
+        selectedIndex = min(max(0, selectedIndex + delta), count - 1)
     }
 
     private func execute(_ item: PaletteItem) {

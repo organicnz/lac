@@ -16,9 +16,8 @@ use std::process::Command;
 // Gated DeltaNet layers hold recurrent state, not full KV — excluded.
 const FP16_BYTES_PER_TOKEN: f64 = 32768.0;
 
-// RAM pressure coupling, scaled for the 96GB Studio (and sane below it).
-const FREE_RED_GIB: f64 = 2.0;
-const FREE_YELLOW_GIB: f64 = 8.0;
+// RAM pressure coupling, scaled by total RAM via
+// `common::mem_thresholds_gib()` (sane from 8GB Air to 96GB Studio).
 
 fn usage() -> ! {
     eprintln!("usage: kv-manage check [--tokens N] [--threshold N] [--kv-q4|--kv-q8|--kv-fp16] [--json]");
@@ -158,6 +157,19 @@ fn risk_level_full(
     threshold: u64,
     free_gib: Option<f64>,
 ) -> (&'static str, &'static str) {
+    let (red_gib, yellow_gib) = common::mem_thresholds_gib();
+    risk_level_with(measured, estimate, threshold, free_gib, red_gib, yellow_gib)
+}
+
+/// Pure matrix with explicit RAM gates (host-independent — use in tests).
+fn risk_level_with(
+    measured: Option<u64>,
+    estimate: Option<u64>,
+    threshold: u64,
+    free_gib: Option<f64>,
+    red_gib: f64,
+    yellow_gib: f64,
+) -> (&'static str, &'static str) {
     let pct = |t: u64| {
         if threshold > 0 {
             t.saturating_mul(100) / threshold.max(1)
@@ -168,8 +180,8 @@ fn risk_level_full(
     let m_red = measured.map(|t| t >= threshold).unwrap_or(false);
     let m_yel = measured.map(|t| pct(t) >= 66).unwrap_or(false);
     let e_yel = estimate.map(|t| pct(t) >= 66).unwrap_or(false);
-    let mem_red = free_gib.map(|f| f < FREE_RED_GIB).unwrap_or(false);
-    let mem_yellow = free_gib.map(|f| f < FREE_YELLOW_GIB).unwrap_or(false);
+    let mem_red = free_gib.map(|f| f < red_gib).unwrap_or(false);
+    let mem_yellow = free_gib.map(|f| f < yellow_gib).unwrap_or(false);
     if m_red || mem_red {
         ("RED", "truncate now: kv-manage truncate --tokens N")
     } else if m_yel || e_yel || mem_yellow {
@@ -179,8 +191,16 @@ fn risk_level_full(
     }
 }
 
+#[allow(dead_code)]
 fn risk_level(tokens: u64, threshold: u64, free_gib: Option<f64>) -> (&'static str, &'static str) {
     risk_level_full(Some(tokens), None, threshold, free_gib)
+}
+
+#[cfg(test)]
+fn risk_level_fixed(tokens: u64, threshold: u64, free_gib: Option<f64>) -> (&'static str, &'static str) {
+    // Fixed 2.0/8.0 gates: preserves the original 96GB-Studio expectations
+    // independent of the test host's total RAM.
+    risk_level_with(Some(tokens), None, threshold, free_gib, 2.0, 8.0)
 }
 
 fn exit_for(level: &str) -> i32 {
@@ -347,6 +367,7 @@ fn cmd_truncate(args: &[String]) {
 }
 
 fn main() {
+    common::ignore_sigpipe();
     let args: Vec<String> = env::args().skip(1).collect();
     if args.is_empty() {
         usage();
@@ -364,33 +385,33 @@ mod tests {
 
     #[test]
     fn green_when_calm() {
-        assert_eq!(risk_level(1000, 24000, Some(60.0)).0, "GREEN");
+        assert_eq!(risk_level_fixed(1000, 24000, Some(60.0)).0, "GREEN");
     }
 
     #[test]
     fn red_on_tokens() {
-        assert_eq!(risk_level(24000, 24000, Some(60.0)).0, "RED");
+        assert_eq!(risk_level_fixed(24000, 24000, Some(60.0)).0, "RED");
     }
 
     #[test]
     fn yellow_on_token_pressure() {
-        assert_eq!(risk_level(16000, 24000, Some(60.0)).0, "YELLOW");
+        assert_eq!(risk_level_fixed(16000, 24000, Some(60.0)).0, "YELLOW");
     }
 
     #[test]
     fn red_on_ram_regardless_of_tokens() {
-        assert_eq!(risk_level(500, 24000, Some(1.2)).0, "RED");
+        assert_eq!(risk_level_fixed(500, 24000, Some(1.2)).0, "RED");
     }
 
     #[test]
     fn yellow_on_ram() {
-        assert_eq!(risk_level(500, 24000, Some(6.0)).0, "YELLOW");
+        assert_eq!(risk_level_fixed(500, 24000, Some(6.0)).0, "YELLOW");
     }
 
     #[test]
     fn unknown_ram_falls_back_to_tokens() {
-        assert_eq!(risk_level(500, 24000, None).0, "GREEN");
-        assert_eq!(risk_level(30000, 24000, None).0, "RED");
+        assert_eq!(risk_level_fixed(500, 24000, None).0, "GREEN");
+        assert_eq!(risk_level_fixed(30000, 24000, None).0, "RED");
     }
 
     #[test]
@@ -403,13 +424,13 @@ mod tests {
     #[test]
     fn estimates_cap_at_yellow() {
         // A huge estimate alone must never call RED.
-        assert_eq!(risk_level_full(None, Some(1_000_000), 24000, Some(60.0)).0, "YELLOW");
+        assert_eq!(risk_level_with(None, Some(1_000_000), 24000, Some(60.0), 2.0, 8.0).0, "YELLOW");
         // ...but a measured value at threshold still goes RED.
-        assert_eq!(risk_level_full(Some(24000), Some(1_000_000), 24000, Some(60.0)).0, "RED");
+        assert_eq!(risk_level_with(Some(24000), Some(1_000_000), 24000, Some(60.0), 2.0, 8.0).0, "RED");
         // Small estimate stays GREEN.
-        assert_eq!(risk_level_full(None, Some(500), 24000, Some(60.0)).0, "GREEN");
+        assert_eq!(risk_level_with(None, Some(500), 24000, Some(60.0), 2.0, 8.0).0, "GREEN");
         // No data at all is GREEN (RAM calm).
-        assert_eq!(risk_level_full(None, None, 24000, Some(60.0)).0, "GREEN");
+        assert_eq!(risk_level_with(None, None, 24000, Some(60.0), 2.0, 8.0).0, "GREEN");
     }
 
     #[test]

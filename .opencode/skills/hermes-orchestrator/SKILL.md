@@ -8,7 +8,7 @@ description: High-order autonomous task driver and OpenCode coordinator
 Hermes serves as the autonomous coordinator for the Local Agentic Coding (LAC) stack. It sits above OpenCode as the orchestrator layer (Layer 4 in the LAC Build Plan).
 
 While OpenCode executes individual coding turns with surgical tools, Hermes:
-1. **Drives Continuous Execution**: Keeps the Mac Studio M5 Ultra 96GB compute cores saturated by draining tasks from `~/todo/lac-tasks.yaml`.
+1. **Drives Continuous Execution**: Keeps local compute cores saturated by draining tasks from `~/todo/lac-tasks.yaml`.
 2. **Dispatches Structured Loops**: Executes multi-phase loops (`daily-coding.yaml`, `feature-branch.yaml`, `bug-fix.yaml`) via `loop-orchestrator`.
 3. **Coordinates Subagents**: Coordinates `@coder` (implementation) and `@reviewer` (auditing) under strict 2-round caps with tests-as-gate validation.
 4. **Maintains System Hygiene**: Coordinates `context-cap` (16K steady-state), `kv-cache-manage` (emergency truncation), and `thermal-monitor` before long runs.

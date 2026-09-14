@@ -60,6 +60,7 @@ fn ensure_zprofile(model_base: &str) {
 }
 
 fn main() {
+    common::ignore_sigpipe();
     eprintln!("=== LAC bootstrap v2.6 (Rust, idempotent) ===");
     let home = common::home_dir();
     let root = get_project_root();
