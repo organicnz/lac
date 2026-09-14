@@ -342,7 +342,12 @@ public class ModelHubStore: ObservableObject {
         self.models = Self.curatedTopModels
         Task {
             await fetchTopModels()
-            scanInstalledModels()
+        }
+        // Defer the installed-model disk walk past first paint so the Hub
+        // renders instantly from the curated list, then backfills local state.
+        Task {
+            try? await Task.sleep(nanoseconds: 500_000_000)
+            if !Task.isCancelled { scanInstalledModels() }
         }
     }
 

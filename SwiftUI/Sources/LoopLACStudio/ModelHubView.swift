@@ -679,6 +679,24 @@ struct ModelCard: View {
                         }
                     }
                 }
+                .controlSize(.small)
+                .lacGlass()
+                .disabled(network.pullingModelId != nil && network.pullingModelId != item.id)
+                if network.pullingModelId == item.id {
+                    Button {
+                        LiquidGlass.haptic(.alignment)
+                        network.cancelPull()
+                    } label: {
+                        HStack(spacing: 3) {
+                            Image(systemName: "xmark.circle")
+                                .font(.system(size: 10))
+                            Text("Cancel")
+                                .font(.system(size: 11))
+                        }
+                    }
+                    .controlSize(.small)
+                    .lacGlass()
+                }
                 Button {
                     LiquidGlass.haptic(.alignment)
                     onInspect?()
@@ -728,9 +746,21 @@ struct ModelCard: View {
             if network.pullingModelId == item.id, let output = network.pullOutput {
                 Divider().opacity(0.15)
                 VStack(alignment: .leading, spacing: 4) {
-                    Text("PULL LOG")
-                        .font(.system(size: 9, weight: .bold))
-                        .foregroundColor(.secondary)
+                    HStack {
+                        Text("PULL LOG")
+                            .font(.system(size: 9, weight: .bold))
+                            .foregroundColor(.secondary)
+                        Spacer()
+                        if let progress = network.pullProgress {
+                            Text("\(Int(progress * 100))%")
+                                .font(.system(size: 9, design: .monospaced))
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                    if let progress = network.pullProgress {
+                        ProgressView(value: progress)
+                            .controlSize(.mini)
+                    }
                     
                     ScrollView {
                         Text(output)

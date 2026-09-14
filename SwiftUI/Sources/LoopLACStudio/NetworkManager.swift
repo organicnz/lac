@@ -91,6 +91,8 @@ class NetworkManager: ObservableObject {
     @Published var hasAutoStartedRouter = false
     @Published var pullingModelId: String?
     @Published var pullOutput: String?
+    @Published var pullProgress: Double?
+    private var pullProcess: Process?
 
     let port: Int = {
         if let raw = ProcessInfo.processInfo.environment["LAC_ROUTER_PORT"],
@@ -122,10 +124,18 @@ class NetworkManager: ObservableObject {
     }
 
     func fetch() {
+        // Coalesce overlapping polls (3s dashboard ticker + manual refresh).
+        guard !isChecking else { return }
         isChecking = true
         Task {
             do {
-                let url = URL(string: "http://127.0.0.1:\(port)/lac/status")!
+                guard let url = URL(string: "http://127.0.0.1:\(port)/lac/status") else {
+                    await MainActor.run {
+                        self.lastError = "Invalid router URL (port \(port))"
+                        self.isChecking = false
+                    }
+                    return
+                }
                 var req = URLRequest(url: url)
                 req.timeoutInterval = 5
                 let (data, _) = try await URLSession.shared.data(for: req)
@@ -262,6 +272,7 @@ class NetworkManager: ObservableObject {
         }
         pullingModelId = modelId
         pullOutput = "Starting background download for \(modelId)..."
+        pullProgress = nil
         lastAction = "Pulling \(modelId)..."
         
         DispatchQueue.global().async {
@@ -279,35 +290,83 @@ class NetworkManager: ObservableObject {
                     DispatchQueue.main.async { [weak self, str] in
                         guard let self else { return }
                         let combined = (self.pullOutput ?? "") + str
-                        // Keep only the last 1000 characters to avoid memory bloat
-                        self.pullOutput = combined.count > 1000
-                            ? String(combined.suffix(1000))
+                        // Keep only the last 2000 characters to avoid memory bloat
+                        self.pullOutput = combined.count > 2000
+                            ? String(combined.suffix(2000))
                             : combined
+                        self.pullProgress = Self.parseProgress(from: combined)
                     }
                 }
+            }
+
+            DispatchQueue.main.async { [weak self] in
+                self?.pullProcess = p
             }
             
             do {
                 try p.run()
                 p.waitUntilExit()
                 fileHandle.readabilityHandler = nil
-                
+
                 DispatchQueue.main.async {
                     if p.terminationStatus != 0 {
-                        self.lastError = "Pull failed with status \(p.terminationStatus)"
+                        // Terminated by user cancel (SIGTERM) — not a failure.
+                        if p.terminationStatus == 15 {
+                            self.lastAction = "Pull cancelled"
+                        } else {
+                            self.lastError = "Pull failed with status \(p.terminationStatus)"
+                        }
+                    } else {
+                        self.pullProgress = 1.0
                     }
                     self.pullingModelId = nil
-                    self.lastAction = "Pulled \(modelId)"
+                    self.pullProcess = nil
+                    self.lastAction = p.terminationStatus == 0 ? "Pulled \(modelId)" : (self.lastAction ?? "Pull ended")
                     self.fetch()
                 }
             } catch {
                 DispatchQueue.main.async {
                     self.lastError = error.localizedDescription
                     self.pullingModelId = nil
+                    self.pullProcess = nil
+                    self.pullProgress = nil
                     self.fetch()
                 }
             }
         }
+    }
+
+    /// Cancel an in-flight `lac pull`. Terminates the child process;
+    /// the completion handler records "cancelled", not a failure.
+    func cancelPull() {
+        pullProcess?.terminate()
+        lastAction = "Cancelling pull..."
+    }
+
+    /// Best-effort parse of `NN%` progress from pull tool output.
+    /// Returns 0...1, or nil when no percentage is present yet.
+    nonisolated static func parseProgress(from text: String) -> Double? {
+        // Scan trailing lines first — progress usually lives at the tail.
+        let lines = text.split(separator: "\n").suffix(8)
+        var best: Double?
+        for line in lines {
+            var idx = line.startIndex
+            while idx < line.endIndex {
+                guard let pct = line[idx...].firstIndex(of: "%") else { break }
+                // Walk backwards over digits + decimal point.
+                var start = pct
+                while start > line.startIndex {
+                    let prev = line.index(before: start)
+                    let c = line[prev]
+                    if c.isNumber || c == "." { start = prev } else { break }
+                }
+                if let v = Double(line[start..<pct]) {
+                    best = min(max(v / 100.0, 0.0), 1.0)
+                }
+                idx = line.index(after: pct)
+            }
+        }
+        return best
     }
 
     /// Switch the router's preferred backend via the existing
@@ -378,6 +437,7 @@ class NetworkManager: ObservableObject {
                 await MainActor.run {
                     self.autoRefreshPaused = false
                     self.lastError = nil
+                    self.isChecking = false
                     self.fetch()
                 }
                 return

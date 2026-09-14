@@ -775,12 +775,25 @@ impl<T: Copy, const N: usize> RingBuffer<T, N> {
                         }
 
                         if let err = store.errorText {
-                            VStack(alignment: .leading, spacing: 6) {
+                            VStack(alignment: .leading, spacing: 8) {
                                 Text("Gateway Notice")
                                     .font(.system(size: 12, weight: .bold))
                                 Text(err)
                                     .font(.system(size: 11))
                                     .foregroundColor(.secondary)
+                                HStack(spacing: 8) {
+                                    Button("Retry") {
+                                        LiquidGlass.haptic(.alignment)
+                                        store.retry()
+                                    }
+                                    .controlSize(.small)
+                                    .lacGlassProminent()
+                                    Button("Dismiss") {
+                                        store.errorText = nil
+                                    }
+                                    .controlSize(.small)
+                                    .lacGlass()
+                                }
                             }
                             .padding(12)
                             .liquidGlassCard(cornerRadius: 10, hoverable: false, tint: .orange)

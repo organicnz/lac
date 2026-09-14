@@ -127,8 +127,12 @@ struct DashboardView: View {
 
     private var statusSummary: some View {
         let r = network.response
+        let activeValue: String = {
+            guard let r, !r.active.isEmpty else { return "—" }
+            return r.active
+        }()
         return HStack(spacing: 16) {
-            StatBox(title: "Active", value: r?.active.isEmpty == false ? r!.active : "—",
+            StatBox(title: "Active", value: activeValue,
                     icon: "brain.head.profile", color: .blue)
             StatBox(title: "RAM Free",
                     value: network.host?.free_ram_gib.map { String(format: "%.1f GiB", $0) } ?? "—",

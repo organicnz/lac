@@ -4,9 +4,14 @@ import SwiftUI
 // MARK: - Liquid Glass Design System
 //
 // Native Apple Silicon macOS design system implementing the Liquid Glass
-// aesthetic: optical glass refraction, multi-stop specular highlights,
-// ambient double-layer shadows, 120Hz ProMotion interpolating springs,
-// and tactile haptic feedback. Fully compatible with macOS 13+.
+// aesthetic. Strategy (Apple HIG, macOS Tahoe 26+):
+//   - On macOS 26+: prefer the system `.glassEffect` refraction engine
+//     (real-time specular + lensing, automatic reduce-transparency handling).
+//   - On macOS 13–15: fall back to the hand-tuned stack below
+//     (ultraThinMaterial + specular sheen/border + layered shadows).
+//   - Motion/contrast fallbacks are always respected via
+//     accessibilityReduceMotion / reduceTransparency / increased contrast.
+// Fully compatible with macOS 13+.
 
 public enum LiquidGlass {
     /// 120Hz fluid interpolating spring for Apple Silicon ProMotion displays.
@@ -312,8 +317,23 @@ public struct LiquidGlassButtonStyle: ButtonStyle {
 
 extension View {
     /// Applies a translucent Liquid Glass card effect with specular border and layered shadow.
+    ///
+    /// Best practice: on macOS Tahoe (26+) this delegates to the system
+    /// `.glassEffect` refraction engine; on older macOS it uses the
+    /// hand-tuned ultraThinMaterial fallback with a11y-safe opaque mode.
+    @ViewBuilder
     public func liquidGlassCard(cornerRadius: CGFloat = 12, hoverable: Bool = true, tint: Color? = nil) -> some View {
-        self.modifier(LiquidGlassCardModifier(cornerRadius: cornerRadius, hoverable: hoverable, tintColor: tint))
+        if #available(macOS 26.0, *) {
+            if tint == nil {
+                self.glassEffect(.regular, in: RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+            } else {
+                // Tinted cards keep the manual stack so brand color survives;
+                // untinted cards get the true system refraction engine.
+                self.modifier(LiquidGlassCardModifier(cornerRadius: cornerRadius, hoverable: hoverable, tintColor: tint))
+            }
+        } else {
+            self.modifier(LiquidGlassCardModifier(cornerRadius: cornerRadius, hoverable: hoverable, tintColor: tint))
+        }
     }
 
     /// Liquid Glass styling for standard buttons.
@@ -327,17 +347,25 @@ extension View {
     }
 
     /// Claude Desktop style floating composer container with elevated glass elevation.
+    /// Best practice: system glass on Tahoe, elevated manual stack below.
+    @ViewBuilder
     public func floatingComposerCard() -> some View {
-        self
-            .background(
-                RoundedRectangle(cornerRadius: 18, style: .continuous)
-                    .fill(.ultraThinMaterial)
-                    .overlay(LiquidGlass.specularSheen(cornerRadius: 18))
-                    .overlay(LiquidGlass.specularBorder(cornerRadius: 18, isHovered: false))
-            )
-            .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
-            .shadow(color: Color.black.opacity(0.18), radius: 24, x: 0, y: 10)
-            .shadow(color: Color.black.opacity(0.08), radius: 6, x: 0, y: 2)
+        if #available(macOS 26.0, *) {
+            self.glassEffect(.regular, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+                .shadow(color: Color.black.opacity(0.18), radius: 24, x: 0, y: 10)
+                .shadow(color: Color.black.opacity(0.08), radius: 6, x: 0, y: 2)
+        } else {
+            self
+                .background(
+                    RoundedRectangle(cornerRadius: 18, style: .continuous)
+                        .fill(.ultraThinMaterial)
+                        .overlay(LiquidGlass.specularSheen(cornerRadius: 18))
+                        .overlay(LiquidGlass.specularBorder(cornerRadius: 18, isHovered: false))
+                )
+                .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+                .shadow(color: Color.black.opacity(0.18), radius: 24, x: 0, y: 10)
+                .shadow(color: Color.black.opacity(0.08), radius: 6, x: 0, y: 2)
+        }
     }
 
     /// Claude Desktop style interactive model picker pill.
@@ -396,19 +424,27 @@ extension View {
     }
 
     /// Liquid Glass styling for floating modal sheets and dialogs.
+    /// Best practice: system glass on Tahoe, manual stack below.
+    @ViewBuilder
     public func liquidGlassModalCard(cornerRadius: CGFloat = 16) -> some View {
-        self
-            .background(
-                ZStack {
-                    RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                        .fill(.ultraThinMaterial)
-                    LiquidGlass.specularSheen(cornerRadius: cornerRadius)
-                    LiquidGlass.specularBorder(cornerRadius: cornerRadius, isHovered: false)
-                }
-            )
-            .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
-            .shadow(color: Color.black.opacity(0.24), radius: 32, x: 0, y: 12)
-            .shadow(color: Color.black.opacity(0.08), radius: 8, x: 0, y: 2)
+        if #available(macOS 26.0, *) {
+            self.glassEffect(.regular, in: RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+                .shadow(color: Color.black.opacity(0.24), radius: 32, x: 0, y: 12)
+                .shadow(color: Color.black.opacity(0.08), radius: 8, x: 0, y: 2)
+        } else {
+            self
+                .background(
+                    ZStack {
+                        RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                            .fill(.ultraThinMaterial)
+                        LiquidGlass.specularSheen(cornerRadius: cornerRadius)
+                        LiquidGlass.specularBorder(cornerRadius: cornerRadius, isHovered: false)
+                    }
+                )
+                .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+                .shadow(color: Color.black.opacity(0.24), radius: 32, x: 0, y: 12)
+                .shadow(color: Color.black.opacity(0.08), radius: 8, x: 0, y: 2)
+        }
     }
 
     /// Liquid Glass styling for text input fields.

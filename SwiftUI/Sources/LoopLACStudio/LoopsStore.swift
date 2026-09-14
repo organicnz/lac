@@ -258,33 +258,51 @@ public class LoopsStore: ObservableObject {
             guard let self else { return }
             defer { self.isRunningLoop = false }
 
-            // Phase 1: Preflight
+            // Phase 1: Preflight (local environment checks)
             self.currentRunnerPhase = .preflight
             self.appendLog("[1/5] Phase: Preflight — Checking thermals & memory budget...")
-            try? await Task.sleep(nanoseconds: 1_200_000_000)
-            self.appendLog("✓ Thermals: Nominal | Memory: Healthy (>16GiB unified pool available)")
+            do {
+                try await Task.sleep(nanoseconds: 1_200_000_000)
+            } catch { return } // cancelled — stop the pipeline
+            try? Task.checkCancellation()
+            // NOTE: local heuristic until `lac status --json` is wired in.
+            self.appendLog("✓ Preflight (local heuristic): proceeding — verify thermals in Ops Dashboard.")
 
             // Phase 2: Implement Turn
             self.currentRunnerPhase = .implement
             self.appendLog("\n[2/5] Phase: Implement — Dispatching to @coder on local gateway :\(self.port)...")
             let prompt = "Implement task \(task.id): \(task.task). Output exact code without committing."
-            if let reply = try? await self.queryGateway(prompt: prompt, system: "You are @coder. Implement the requested task with minimal diffs and idiomatic design.") {
+            do {
+                let reply = try await self.queryGateway(prompt: prompt, system: "You are @coder. Implement the requested task with minimal diffs and idiomatic design.")
+                try? Task.checkCancellation()
                 self.appendLog("✓ Code Implementation Complete:\n" + String(reply.prefix(300)) + "\n...")
-            } else {
-                self.appendLog("⚠ Local gateway offline. Emulating offline systems engineering pass.")
+            } catch is CancellationError {
+                return
+            } catch {
+                self.appendLog("⚠ Implement step failed (\(error.localizedDescription)). Continuing to review gate.")
             }
+            try? Task.checkCancellation()
+            if Task.isCancelled { return }
 
-            // Phase 3: Reviewer Audit
+            // Phase 3: Reviewer Audit (advisory until @reviewer lane is wired)
             self.currentRunnerPhase = .review
             self.appendLog("\n[3/5] Phase: Review — Auditor pass (@reviewer, read-only)...")
-            try? await Task.sleep(nanoseconds: 1_500_000_000)
-            self.appendLog("✓ Reviewer Report: Zero critical regressions detected. Test-gate conditions satisfied.")
+            do {
+                try await Task.sleep(nanoseconds: 1_500_000_000)
+            } catch { return }
+            try? Task.checkCancellation()
+            if Task.isCancelled { return }
+            self.appendLog("• Reviewer Report (advisory): no automated checks ran — human gate below is authoritative.")
 
-            // Phase 4: Apply & Test Gate
+            // Phase 4: Apply & Test Gate (advisory until test harness is wired)
             self.currentRunnerPhase = .apply
             self.appendLog("\n[4/5] Phase: Apply & Test Gate — Running affected test harness...")
-            try? await Task.sleep(nanoseconds: 1_200_000_000)
-            self.appendLog("✓ Test Suite: PASS (100% assertions green). Gate unlocked.")
+            do {
+                try await Task.sleep(nanoseconds: 1_200_000_000)
+            } catch { return }
+            try? Task.checkCancellation()
+            if Task.isCancelled { return }
+            self.appendLog("• Test Gate (advisory): no test harness ran — confirm via `cargo test` / `swift test` before approving.")
 
             // Phase 5: Human Gate
             self.currentRunnerPhase = .humanGate

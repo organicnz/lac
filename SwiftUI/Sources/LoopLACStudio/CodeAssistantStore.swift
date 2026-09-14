@@ -1,6 +1,21 @@
 import Foundation
 import SwiftUI
 
+// MARK: - Code Assistant Errors (preserves HTTP status + server body)
+
+struct CodeAssistantError: LocalizedError {
+    let statusCode: Int
+    let body: String
+
+    var errorDescription: String? {
+        let snippet = body.trimmingCharacters(in: .whitespacesAndNewlines)
+        if snippet.isEmpty {
+            return "Gateway returned HTTP \(statusCode). Is lac-router running?"
+        }
+        return "Gateway returned HTTP \(statusCode): \(String(snippet.prefix(300)))"
+    }
+}
+
 // MARK: - Code Assistant Actions
 
 public enum CodeAssistantAction: String, CaseIterable, Identifiable {
@@ -103,6 +118,7 @@ public class CodeAssistantStore: ObservableObject {
     @Published public var streamResponse: String = ""
     @Published public var lastAppliedCode: String?
     @Published public var errorText: String?
+    @Published public var lastInstruction: String?
     /// Set by the ⌘K palette; CodeAssistantView consumes it on arrival
     /// (runs the console command, reveals the drawer, clears to nil).
     @Published public var pendingConsoleCommand: ConsoleCommand?
@@ -301,6 +317,7 @@ impl<T: Copy, const N: usize> RingBuffer<T, N> {
         errorText = nil
         streamResponse = ""
         isProcessing = true
+        lastInstruction = instruction
 
         let code = sourceCode.trimmingCharacters(in: .whitespacesAndNewlines)
         let lang = selectedLanguage
@@ -342,6 +359,13 @@ Task: \(instruction)
         streamTask?.cancel()
         streamTask = nil
         isProcessing = false
+    }
+
+    /// Re-run the last instruction (Retry button on the error card).
+    public func retry() {
+        guard !isProcessing, let instruction = lastInstruction else { return }
+        errorText = nil
+        runTask(instruction: instruction)
     }
 
     public func applyToEditor(_ codeBlock: String) {
@@ -398,7 +422,16 @@ Task: \(instruction)
             throw URLError(.badServerResponse)
         }
         guard http.statusCode == 200 else {
-            throw URLError(.init(rawValue: http.statusCode))
+            var body = ""
+            var tail = ""
+            do {
+                for try await line in bytes.lines {
+                    tail += line + "\n"
+                    if tail.count > 2000 { break }
+                }
+                body = tail
+            } catch {}
+            throw CodeAssistantError(statusCode: http.statusCode, body: body)
         }
 
         var full = ""

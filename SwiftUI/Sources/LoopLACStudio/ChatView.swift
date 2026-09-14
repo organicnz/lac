@@ -10,6 +10,8 @@ public struct AttachedContextFile: Identifiable, Hashable, Sendable {
     public let path: String
     public let content: String
     public let byteCount: Int
+    /// True when `content` was truncated to the 128 KB injection cap.
+    public let wasTruncated: Bool
 
     public var formattedSize: String {
         if byteCount >= 1024 * 1024 {
@@ -91,6 +93,8 @@ public struct ChatView: View {
     @State private var isStartingBackend = false
     @State private var isDropTargeted = false
     @State private var isTuningPresented = false
+    @State private var attachNotice: String?
+    @State private var exportError: String?
     public var onOpenDashboard: (() -> Void)?
     public var onOpenModelHub: (() -> Void)?
     public var onOpenCodeAssistant: ((String, String) -> Void)?
@@ -124,6 +128,14 @@ public struct ChatView: View {
         .background(VisualEffectView().ignoresSafeArea())
         .onAppear {
             Task { await store.fetchModels() }
+        }
+        .alert("Export failed", isPresented: Binding(
+            get: { exportError != nil },
+            set: { if !$0 { exportError = nil } }
+        )) {
+            Button("OK", role: .cancel) { exportError = nil }
+        } message: {
+            Text(exportError ?? "Unknown error")
         }
     }
 
@@ -741,18 +753,33 @@ public struct ChatView: View {
     }
 
     private func loadFileAsAttachment(_ url: URL) {
-        guard let data = try? Data(contentsOf: url) else { return }
-        let slice = data.prefix(128 * 1024)
-        let content = String(decoding: slice, as: UTF8.self)
-        let item = AttachedContextFile(
-            name: url.lastPathComponent,
-            path: url.path,
-            content: content,
-            byteCount: data.count
-        )
-        if !attachedFiles.contains(where: { $0.path == item.path }) {
-            attachedFiles.append(item)
-            LiquidGlass.haptic(.alignment)
+        let maxBytes = 128 * 1024
+        guard url.startAccessingSecurityScopedResource() || true else { return }
+        defer { url.stopAccessingSecurityScopedResource() }
+        do {
+            let data = try Data(contentsOf: url)
+            let slice = data.prefix(maxBytes)
+            guard let content = String(data: slice, encoding: .utf8), !content.isEmpty else {
+                attachNotice = "\(url.lastPathComponent): not a readable UTF-8 text file — skipped."
+                return
+            }
+            let truncated = data.count > maxBytes
+            let item = AttachedContextFile(
+                name: url.lastPathComponent,
+                path: url.path,
+                content: content,
+                byteCount: data.count,
+                wasTruncated: truncated
+            )
+            if !attachedFiles.contains(where: { $0.path == item.path }) {
+                attachedFiles.append(item)
+                LiquidGlass.haptic(.alignment)
+            }
+            attachNotice = truncated
+                ? "\(url.lastPathComponent): truncated to 128 KB of \(item.formattedSize) for context injection."
+                : nil
+        } catch {
+            attachNotice = "\(url.lastPathComponent): could not read file (\(error.localizedDescription))."
         }
     }
 
@@ -764,6 +791,28 @@ public struct ChatView: View {
             }
 
             VStack(spacing: 8) {
+                if let notice = attachNotice {
+                    HStack(spacing: 6) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .font(.system(size: 10))
+                            .foregroundColor(.orange)
+                        Text(notice)
+                            .font(.system(size: 10.5))
+                            .foregroundColor(.secondary)
+                            .lineLimit(2)
+                        Spacer()
+                        Button {
+                            attachNotice = nil
+                        } label: {
+                            Image(systemName: "xmark")
+                                .font(.system(size: 9, weight: .bold))
+                                .foregroundColor(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.top, 8)
+                }
                 if !attachedFiles.isEmpty {
                     ScrollView(.horizontal, showsIndicators: false) {
                         HStack(spacing: 6) {
@@ -775,9 +824,9 @@ public struct ChatView: View {
                                     Text(file.name)
                                         .font(.system(size: 11, weight: .medium))
                                         .lineLimit(1)
-                                    Text("(\(file.formattedSize))")
+                                    Text(file.wasTruncated ? "(\(file.formattedSize) → 128 KB)" : "(\(file.formattedSize))")
                                         .font(.system(size: 9.5))
-                                        .foregroundColor(.secondary)
+                                        .foregroundColor(file.wasTruncated ? .orange : .secondary)
                                     Button {
                                         LiquidGlass.haptic(.alignment)
                                         attachedFiles.removeAll { $0.id == file.id }
@@ -1014,8 +1063,12 @@ public struct ChatView: View {
 
         panel.begin { response in
             if response == .OK, let url = panel.url {
-                try? md.write(to: url, atomically: true, encoding: .utf8)
-                LiquidGlass.haptic(.alignment)
+                do {
+                    try md.write(to: url, atomically: true, encoding: .utf8)
+                    LiquidGlass.haptic(.alignment)
+                } catch {
+                    exportError = "Export failed: \(error.localizedDescription)"
+                }
             }
         }
     }

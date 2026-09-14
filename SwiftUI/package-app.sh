@@ -26,7 +26,7 @@ else
     swift build
     BIN="$(swift build --show-bin-path)/LoopLACStudio"
 fi
-APP_DIR=".build/LAC Studio.app"
+APP_DIR=".build/Loop LAC Studio.app"
 mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources"
 cat << 'EOF' > "$APP_DIR/Contents/Info.plist"
 <?xml version="1.0" encoding="UTF-8"?>
@@ -44,7 +44,7 @@ cat << 'EOF' > "$APP_DIR/Contents/Info.plist"
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>2.8</string>
+    <string>2.10</string>
     <key>LSMinimumSystemVersion</key>
     <string>13.0</string>
     <key>CFBundleIconFile</key>
@@ -78,10 +78,10 @@ cp .build/icon/AppIcon.icns "$APP_DIR/Contents/Resources/AppIcon.icns" 2>/dev/nu
 # Copy resource bundles (Assets.xcassets, etc.) into the app bundle
 cp -R Resources/LACDashboard.appiconset "$APP_DIR/Contents/Resources/LACDashboard.appiconset" 2>/dev/null || true
 codesign --force --deep -s - "$APP_DIR"
-# Also maintain aliases for scripts expecting Loop LAC Studio.app and LACDashboard.app
-rm -rf ".build/Loop LAC Studio.app" ".build/LACDashboard.app"
-cp -R "$APP_DIR" ".build/Loop LAC Studio.app"
-codesign --force --deep -s - ".build/Loop LAC Studio.app"
+# Also maintain aliases for scripts expecting LAC Studio.app and LACDashboard.app
+rm -rf ".build/LAC Studio.app" ".build/LACDashboard.app"
+cp -R "$APP_DIR" ".build/LAC Studio.app"
+codesign --force --deep -s - ".build/LAC Studio.app"
 cp -R "$APP_DIR" ".build/LACDashboard.app"
 codesign --force --deep -s - ".build/LACDashboard.app"
 echo "staged + signed: $APP_DIR"
