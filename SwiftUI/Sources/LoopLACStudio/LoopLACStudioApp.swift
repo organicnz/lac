@@ -36,7 +36,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 }
 
 @main
-struct LACStudioApp: App {
+struct LoopLACStudioApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
     // Single shared manager: the window and the menu bar extra observe
     // the same fetch state instead of polling the router twice.

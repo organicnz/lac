@@ -397,13 +397,13 @@ struct WorkspaceFileTreeTests {
         let root = URL(fileURLWithPath: "/workspace")
         let gitOutput = """
          M rust-src/src/lac.rs
-        ?? SwiftUI/Sources/LACStudio/NewFile.swift
+        ?? SwiftUI/Sources/LoopLACStudio/NewFile.swift
          A tests/gate.rs
          D obsolete.txt
         """
         let parsed = WorkspaceFileTree.parseGitStatusOutput(gitOutput, rootUrl: root)
         #expect(parsed["/workspace/rust-src/src/lac.rs"] == .modified)
-        #expect(parsed["/workspace/SwiftUI/Sources/LACStudio/NewFile.swift"] == .untracked)
+        #expect(parsed["/workspace/SwiftUI/Sources/LoopLACStudio/NewFile.swift"] == .untracked)
         #expect(parsed["/workspace/tests/gate.rs"] == .added)
         #expect(parsed["/workspace/obsolete.txt"] == .deleted)
     }
@@ -632,6 +632,57 @@ struct ModelHubFilterTests {
         #expect(tagged("org/Model-32B", ["q5_k_m"]).quantization == "5-bit")
         #expect(tagged("org/Model-14B", ["bf16"]).quantization == "FP16")
         #expect(item("mlx-community/Qwen3.8-27B-4bit").quantization == "4-bit")
+    }
+}
+
+struct CompletionBudgetTests {
+    @Test func maxTokensNeverExceeds4k() {
+        // 64k context / 2 would OOM a local 27B — hard cap at 4096.
+        #expect(ChatStore.maxTokens(forContextCap: 65536) == 4096)
+        #expect(ChatStore.maxTokens(forContextCap: 32768) == 4096)
+        #expect(ChatStore.maxTokens(forContextCap: 4096) == 2048)
+        #expect(ChatStore.maxTokens(forContextCap: 0) == nil)
+        #expect(ChatStore.maxTokens(forContextCap: -1) == nil)
+    }
+}
+
+struct ThreadTitlePersistenceTests {
+    @Test @MainActor func renameSurvivesReload() {
+        let store = ChatStore()
+        let t = store.newThread()
+        if let idx = store.threads.firstIndex(where: { $0.id == t.id }) {
+            store.threads[idx].messages.append(
+                ChatMessage(role: "user", content: "derivable title seed"))
+        }
+        store.renameThread(t.id, title: "My Custom Title")
+
+        // A fresh instance (simulated restart) must keep the rename.
+        let reloaded = ChatStore()
+        #expect(reloaded.threads.first(where: { $0.id == t.id })?.title == "My Custom Title")
+
+        // Cleanup: remove the probe thread from both files.
+        store.deleteThread(t.id)
+        reloaded.deleteThread(t.id)
+    }
+}
+
+struct LoopsWritePathTests {
+    @Test @MainActor func writesTargetUserQueueNeverTemplates() {
+        let store = LoopsStore()
+        let url = store.tasksWriteURL()
+        #expect(url.path.hasSuffix("todo/lac-tasks.yaml"))
+        #expect(!url.path.contains("templates"))
+    }
+}
+
+struct PaletteConsoleBridgeTests {
+    @Test @MainActor func pendingCommandRoundTrip() {
+        let store = CodeAssistantStore()
+        #expect(store.pendingConsoleCommand == nil)
+        store.pendingConsoleCommand = .cargoTests
+        #expect(store.pendingConsoleCommand == .cargoTests)
+        store.pendingConsoleCommand = nil
+        #expect(store.pendingConsoleCommand == nil)
     }
 }
 

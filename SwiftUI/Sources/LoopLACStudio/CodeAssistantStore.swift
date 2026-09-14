@@ -65,6 +65,14 @@ public struct EditorTab: Identifiable, Equatable, Sendable {
     }
 }
 
+// MARK: - Console Command Request (Command Palette ⌘K → Agent Console)
+
+public enum ConsoleCommand: String, Sendable {
+    case cargoTests = "cargoTests"
+    case swiftTests = "swiftTests"
+    case gitDiff = "gitDiff"
+}
+
 // MARK: - Code Assistant Store
 
 @MainActor
@@ -95,6 +103,9 @@ public class CodeAssistantStore: ObservableObject {
     @Published public var streamResponse: String = ""
     @Published public var lastAppliedCode: String?
     @Published public var errorText: String?
+    /// Set by the ⌘K palette; CodeAssistantView consumes it on arrival
+    /// (runs the console command, reveals the drawer, clears to nil).
+    @Published public var pendingConsoleCommand: ConsoleCommand?
 
     public static let availableLanguages = [
         "Rust", "Swift", "Python", "TypeScript", "Go", "C++", "C", "Shell", "SQL", "HTML/CSS"

@@ -160,6 +160,17 @@ class ChatStore: ObservableObject {
         URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent(".lac/chat-threads.jsonl")
     }
 
+    static func titlesFile() -> URL {
+        URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent(".lac/chat-titles.json")
+    }
+
+    /// Local 27B KV budget: never request more than 4k completion tokens —
+    /// contextCap/2 at 64k would OOM unified memory mid-stream.
+    nonisolated static func maxTokens(forContextCap cap: Int) -> Int? {
+        guard cap > 0 else { return nil }
+        return min(cap / 2, 4096)
+    }
+
     init() {
         load()
         if activeThreadId == nil { _ = newThread() }
@@ -172,6 +183,7 @@ class ChatStore: ObservableObject {
         let t = ChatThread(id: UUID().uuidString, title: "New chat", messages: [])
         threads.insert(t, at: 0)
         activeThreadId = t.id
+        saveTitles()
         return t
     }
 
@@ -347,6 +359,26 @@ class ChatStore: ObservableObject {
             }
         }
         try? buffer.write(to: file, options: .atomic)
+        // Titles live in a sidecar (the JSONL carries messages only),
+        // so renames and forks survive restarts.
+        saveTitles()
+    }
+
+    private func saveTitles() {
+        let file = Self.titlesFile()
+        try? FileManager.default.createDirectory(
+            at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let map = Dictionary(uniqueKeysWithValues: threads.map { ($0.id, $0.title) })
+        if let data = try? JSONEncoder().encode(map) {
+            try? data.write(to: file, options: .atomic)
+        }
+    }
+
+    private func loadTitles() -> [String: String] {
+        guard let data = try? Data(contentsOf: Self.titlesFile()),
+              let map = try? JSONDecoder().decode([String: String].self, from: data)
+        else { return [:] }
+        return map
     }
 
     // MARK: persistence (one JSONL line per message)
@@ -385,6 +417,15 @@ class ChatStore: ObservableObject {
             let title = msgs.first { $0.role == "user" }
                 .map { String($0.content.prefix(40)) } ?? "Chat"
             return ChatThread(id: tid, title: title, messages: msgs)
+        }
+        // Overlay renamed titles (persisted sidecar beats re-derived titles).
+        let savedTitles = loadTitles()
+        if !savedTitles.isEmpty {
+            for i in threads.indices {
+                if let t = savedTitles[threads[i].id], !t.isEmpty {
+                    threads[i].title = t
+                }
+            }
         }
         activeThreadId = threads.first?.id
     }
@@ -637,7 +678,7 @@ class ChatStore: ObservableObject {
             stream: true,
             temperature: self.temperature,
             top_p: self.topP,
-            max_tokens: self.contextCap > 0 ? (self.contextCap / 2) : nil
+            max_tokens: Self.maxTokens(forContextCap: self.contextCap)
         ))
         let (bytes, response): (URLSession.AsyncBytes, URLResponse)
         do {

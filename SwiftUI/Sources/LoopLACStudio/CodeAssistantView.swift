@@ -85,6 +85,26 @@ public struct CodeAssistantView: View {
             }
         }
         .animation(LiquidGlass.spring, value: isQuickOpenPresented)
+        .onChange(of: store.pendingConsoleCommand) { cmd in
+            if let cmd { consumeConsoleCommand(cmd) }
+        }
+        .onAppear {
+            // Palette fired while this canvas was off-screen: run on arrival.
+            if let cmd = store.pendingConsoleCommand { consumeConsoleCommand(cmd) }
+        }
+    }
+
+    // MARK: Palette → Console Bridge (⌘K actions run for real)
+
+    private func consumeConsoleCommand(_ cmd: ConsoleCommand) {
+        store.pendingConsoleCommand = nil
+        withAnimation(LiquidGlass.spring) { isConsoleVisible = true }
+        LiquidGlass.haptic(.alignment)
+        switch cmd {
+        case .cargoTests: consoleStore.runCargoTests(repoRoot: workspaceFolder)
+        case .swiftTests: consoleStore.runSwiftTests(repoRoot: workspaceFolder)
+        case .gitDiff: consoleStore.runGitDiff(repoRoot: workspaceFolder)
+        }
     }
 
     // MARK: Header Bar

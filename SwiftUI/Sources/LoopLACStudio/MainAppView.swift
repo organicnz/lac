@@ -137,6 +137,7 @@ public struct MainAppView: View {
                     isPresented: $isCommandPalettePresented,
                     network: network,
                     chatStore: chatStore,
+                    codeStore: codeStore,
                     navigationSection: $navigationSection,
                     sidebarVisibility: $sidebarVisibility
                 )

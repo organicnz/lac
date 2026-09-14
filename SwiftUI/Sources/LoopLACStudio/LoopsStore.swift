@@ -366,13 +366,21 @@ public class LoopsStore: ObservableObject {
 
     // MARK: - Persistence (YAML / JSON fallback)
 
+    /// User-writable queue location (readable in tests to pin the path).
+    func tasksWriteURL() -> URL {
+        // Writes always go to the user's queue — never into the repo's
+        // templates/ copy, which would dirty the working tree on every
+        // Kanban mutation. Reads still fall back to templates/.
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("todo/lac-tasks.yaml")
+    }
+
     private func tasksFileURL() -> URL {
-        let home = FileManager.default.homeDirectoryForCurrentUser
-        let userTasks = home.appendingPathComponent("todo/lac-tasks.yaml")
+        let userTasks = tasksWriteURL()
         if FileManager.default.fileExists(atPath: userTasks.path) {
             return userTasks
         }
-        // Fallback to workspace templates/tasks/lac-tasks.yaml
+        // Read-only fallback to workspace templates/tasks/lac-tasks.yaml
         let cwd = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
         let wsTasks = cwd.appendingPathComponent("templates/tasks/lac-tasks.yaml")
         if FileManager.default.fileExists(atPath: wsTasks.path) {
@@ -399,7 +407,7 @@ public class LoopsStore: ObservableObject {
     }
 
     private func saveTasks() {
-        let url = tasksFileURL()
+        let url = tasksWriteURL()
         let yaml = Self.serializeTasksYaml(tasks)
         try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         try? yaml.write(to: url, atomically: true, encoding: .utf8)

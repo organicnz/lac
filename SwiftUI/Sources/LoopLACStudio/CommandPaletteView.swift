@@ -27,6 +27,7 @@ public struct CommandPaletteView: View {
     @Binding var isPresented: Bool
     @ObservedObject var network: NetworkManager
     @ObservedObject var chatStore: ChatStore
+    @ObservedObject var codeStore: CodeAssistantStore
     @Binding var navigationSection: AppNavigationSection
     @Binding var sidebarVisibility: NavigationSplitViewVisibility
 
@@ -37,12 +38,14 @@ public struct CommandPaletteView: View {
         isPresented: Binding<Bool>,
         network: NetworkManager,
         chatStore: ChatStore,
+        codeStore: CodeAssistantStore,
         navigationSection: Binding<AppNavigationSection>,
         sidebarVisibility: Binding<NavigationSplitViewVisibility>
     ) {
         self._isPresented = isPresented
         self.network = network
         self.chatStore = chatStore
+        self.codeStore = codeStore
         self._navigationSection = navigationSection
         self._sidebarVisibility = sidebarVisibility
     }
@@ -138,7 +141,10 @@ public struct CommandPaletteView: View {
             icon: "gearshape.2.fill",
             category: "Actions",
             shortcut: nil,
-            action: { navigationSection = .codeAssistant }
+            action: {
+                navigationSection = .codeAssistant
+                codeStore.pendingConsoleCommand = .cargoTests
+            }
         ))
         items.append(PaletteItem(
             title: "Run Swift Tests",
@@ -146,7 +152,10 @@ public struct CommandPaletteView: View {
             icon: "swift",
             category: "Actions",
             shortcut: nil,
-            action: { navigationSection = .codeAssistant }
+            action: {
+                navigationSection = .codeAssistant
+                codeStore.pendingConsoleCommand = .swiftTests
+            }
         ))
         items.append(PaletteItem(
             title: "Inspect Git Diff",
@@ -154,7 +163,10 @@ public struct CommandPaletteView: View {
             icon: "arrow.triangle.branch",
             category: "Actions",
             shortcut: nil,
-            action: { navigationSection = .codeAssistant }
+            action: {
+                navigationSection = .codeAssistant
+                codeStore.pendingConsoleCommand = .gitDiff
+            }
         ))
 
         // 3. Gateway & Backend Controls
