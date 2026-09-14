@@ -55,6 +55,9 @@ cat << 'EOF' > "$APP_DIR/Contents/Info.plist"
 </plist>
 EOF
 cp "$BIN" "$APP_DIR/Contents/MacOS/LoopLACStudio"
+# Drop the pre-rename binary if present (same bundle id would otherwise
+# re-activate the stale process on `open` instead of launching fresh).
+rm -f "$APP_DIR/Contents/MacOS/LACStudio"
 # Generate AppIcon.icns if needed
 if [ -f Resources/LACDashboard.appiconset/icon_1024.png ]; then
     mkdir -p .build/icon/AppIcon.iconset
@@ -88,6 +91,7 @@ fi
 if [ "$DO_RESTART" -eq 1 ]; then
     pkill -f "Contents/MacOS/LoopLACStudio" 2>/dev/null || true
     pkill -f "Contents/MacOS/LACDashboard" 2>/dev/null || true
+    pkill -f "Contents/MacOS/LACStudio" 2>/dev/null || true
     sleep 1
     open "$APP_DIR"
 fi
