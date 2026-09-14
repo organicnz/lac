@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>images</key>
+	<array>
+		<dict>
+			<key>filename</key>
+			<string>icon_1024.png</string>
+			<key>idiom</key>
+			<string>macOS</string>
+			<key>scale</key>
+			<string>1x</string>
+		</dict>
+	</array>
+	<key>info</key>
+	<dict>
+		<key>CFBundleIconFile</key>
+		<string>LACDashboard.appiconset</string>
+		<key>CFBundlePrimaryIcon</key>
+		<dict>
+			<key>CFBundleIconNames</key>
+			<string></string>
+		</dict>
+	</dict>
+</dict>
+</plist>
