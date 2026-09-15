@@ -324,12 +324,12 @@ extension View {
     @ViewBuilder
     public func liquidGlassCard(cornerRadius: CGFloat = 12, hoverable: Bool = true, tint: Color? = nil) -> some View {
         if #available(macOS 26.0, *) {
-            if tint == nil {
-                self.glassEffect(.regular, in: RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+            if let tint {
+                // Tahoe best practice: keep the system refraction engine and
+                // apply brand color via .tint instead of dropping to manual.
+                self.glassEffect(.regular.tint(tint.opacity(0.35)), in: RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
             } else {
-                // Tinted cards keep the manual stack so brand color survives;
-                // untinted cards get the true system refraction engine.
-                self.modifier(LiquidGlassCardModifier(cornerRadius: cornerRadius, hoverable: hoverable, tintColor: tint))
+                self.glassEffect(.regular, in: RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
             }
         } else {
             self.modifier(LiquidGlassCardModifier(cornerRadius: cornerRadius, hoverable: hoverable, tintColor: tint))
@@ -348,10 +348,12 @@ extension View {
 
     /// Claude Desktop style floating composer container with elevated glass elevation.
     /// Best practice: system glass on Tahoe, elevated manual stack below.
+    /// Group sibling composers in a GlassEffectContainer + glassEffectUnion
+    /// at the call site when morphing between states.
     @ViewBuilder
     public func floatingComposerCard() -> some View {
         if #available(macOS 26.0, *) {
-            self.glassEffect(.regular, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+            self.glassEffect(.regular.interactive(), in: RoundedRectangle(cornerRadius: 18, style: .continuous))
                 .shadow(color: Color.black.opacity(0.18), radius: 24, x: 0, y: 10)
                 .shadow(color: Color.black.opacity(0.08), radius: 6, x: 0, y: 2)
         } else {

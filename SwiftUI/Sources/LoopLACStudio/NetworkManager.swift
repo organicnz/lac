@@ -174,7 +174,7 @@ class NetworkManager: ObservableObject {
     }
 
     @discardableResult
-    func runLac(_ args: [String]) async -> String {
+    func runLac(_ args: [String], timeoutSeconds: Double = 30) async -> String {
         await withCheckedContinuation { cont in
             DispatchQueue.global().async {
                 let p = Process()
@@ -183,13 +183,27 @@ class NetworkManager: ObservableObject {
                 let pipe = Pipe()
                 p.standardOutput = pipe
                 p.standardError = pipe
+                var resumed = false
+                func resumeOnce(_ s: String) {
+                    if !resumed {
+                        resumed = true
+                        cont.resume(returning: s)
+                    }
+                }
+                // Timeout: hung `lac` must not hang the UI forever.
+                DispatchQueue.global().asyncAfter(deadline: .now() + timeoutSeconds) {
+                    if p.isRunning {
+                        p.terminate()
+                        resumeOnce("")
+                    }
+                }
                 do {
                     try p.run()
                     p.waitUntilExit()
                     let s = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-                    cont.resume(returning: s)
+                    resumeOnce(s)
                 } catch {
-                    cont.resume(returning: "")
+                    resumeOnce("")
                 }
             }
         }
@@ -238,7 +252,11 @@ class NetworkManager: ObservableObject {
         guard let url = URL(string: "http://127.0.0.1:\(targetPort)/v1/models") else { return false }
         var req = URLRequest(url: url)
         req.timeoutInterval = 1
-        return (try? await URLSession.shared.data(for: req)) != nil
+        guard let (_, resp) = try? await URLSession.shared.data(for: req),
+              let http = resp as? HTTPURLResponse, http.statusCode == 200 else {
+            return false
+        }
+        return true
     }
 
     /// Free bytes on the home volume (for pull disk preflight).
@@ -372,12 +390,23 @@ class NetworkManager: ObservableObject {
     /// Switch the router's preferred backend via the existing
     /// /lac/switch endpoint (no new endpoints), then refresh.
     func switchBackend(_ target: String) async {
-        if let url = URL(string: "http://127.0.0.1:\(port)/lac/switch?target=\(target)") {
-            var req = URLRequest(url: url)
-            req.timeoutInterval = 8
-            _ = try? await URLSession.shared.data(for: req)
+        guard let url = URL(string: "http://127.0.0.1:\(port)/lac/switch?target=\(target)") else {
+            lastError = "Invalid router URL (port \(port)) — cannot switch to \(target)"
+            return
         }
-        lastAction = "Switched router → \(target)"
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 8
+        do {
+            let (_, resp) = try await URLSession.shared.data(for: req)
+            guard let http = resp as? HTTPURLResponse, http.statusCode == 200 else {
+                lastError = "Router switch failed (HTTP \((resp as? HTTPURLResponse)?.statusCode ?? -1))"
+                fetch()
+                return
+            }
+            lastAction = "Switched router → \(target)"
+        } catch {
+            lastError = "Router switch failed: \(error.localizedDescription)"
+        }
         fetch()
     }
 

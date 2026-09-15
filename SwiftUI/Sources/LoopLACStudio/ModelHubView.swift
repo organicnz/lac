@@ -229,20 +229,40 @@ public struct ModelHubView: View {
     // MARK: Models Grid
 
     private var modelsGrid: some View {
-        LazyVGrid(columns: [GridItem(.adaptive(minimum: 340, maximum: 460), spacing: 16)], spacing: 16) {
-            ForEach(hub.filteredModels) { item in
-                ModelCard(
-                    item: item,
-                    expectedBytes: hub.estimatedBytes(for: item),
-                    onSelect: {
-                        chatStore.selectedModel = item.id
-                        LiquidGlass.haptic(.alignment)
-                        onSelectModel?(item.id)
-                    },
-                    onInspect: {
-                        hub.inspectModelRepo(item)
+        VStack(spacing: 16) {
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 340, maximum: 460), spacing: 16)], spacing: 16) {
+                ForEach(hub.filteredModels) { item in
+                    ModelCard(
+                        item: item,
+                        expectedBytes: hub.estimatedBytes(for: item),
+                        onSelect: {
+                            chatStore.selectedModel = item.id
+                            LiquidGlass.haptic(.alignment)
+                            onSelectModel?(item.id)
+                        },
+                        onInspect: {
+                            hub.inspectModelRepo(item)
+                        }
+                    )
+                }
+            }
+            if hub.hasMoreResults {
+                Button {
+                    LiquidGlass.haptic(.alignment)
+                    hub.loadMore()
+                } label: {
+                    HStack(spacing: 6) {
+                        if hub.isLoading {
+                            ProgressView().scaleEffect(0.7)
+                        } else {
+                            Image(systemName: "plus.circle")
+                        }
+                        Text(hub.isLoading ? "Loading…" : "Load more models (\(hub.filteredModels.count) shown)")
                     }
-                )
+                }
+                .lacGlass()
+                .disabled(hub.isLoading)
+                .padding(.top, 4)
             }
         }
     }

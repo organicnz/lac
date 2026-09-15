@@ -11,6 +11,31 @@ public struct HFModelItem: Identifiable, Codable, Hashable {
     public let pipeline_tag: String?
     public let createdAt: String?
 
+    enum CodingKeys: String, CodingKey {
+        case id, downloads, likes, tags, pipeline_tag, createdAt
+    }
+
+    public init(id: String, downloads: Int? = nil, likes: Int? = nil, tags: [String]? = nil, pipeline_tag: String? = nil, createdAt: String? = nil) {
+        self.id = id
+        self.downloads = downloads
+        self.likes = likes
+        self.tags = tags
+        self.pipeline_tag = pipeline_tag
+        self.createdAt = createdAt
+    }
+
+    /// Tolerant decode: one malformed entry (e.g. downloads as String,
+    /// tags as mixed array) must not fail the whole 30-item page.
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(String.self, forKey: .id)
+        downloads = try? c.decodeIfPresent(Int.self, forKey: .downloads)
+        likes = try? c.decodeIfPresent(Int.self, forKey: .likes)
+        tags = try? c.decodeIfPresent([String].self, forKey: .tags)
+        pipeline_tag = try? c.decodeIfPresent(String.self, forKey: .pipeline_tag)
+        createdAt = try? c.decodeIfPresent(String.self, forKey: .createdAt)
+    }
+
     public var author: String {
         let parts = id.split(separator: "/")
         if parts.count > 1 { return String(parts[0]) }
@@ -103,6 +128,23 @@ public struct HFRepoFileItem: Identifiable, Codable, Hashable {
     public let path: String
     public let size: Int64?
     public let type: String?
+
+    enum CodingKeys: String, CodingKey { case path, size, type }
+
+    public init(path: String, size: Int64? = nil, type: String? = nil) {
+        self.path = path
+        self.size = size
+        self.type = type
+    }
+
+    /// Tolerant decode: entries without a path are skipped by the caller
+    /// via Failable wrapper instead of failing the whole manifest.
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        path = try c.decode(String.self, forKey: .path)
+        size = try? c.decodeIfPresent(Int64.self, forKey: .size)
+        type = try? c.decodeIfPresent(String.self, forKey: .type)
+    }
 
     public var fileName: String {
         path.split(separator: "/").last.map(String.init) ?? path
@@ -277,6 +319,12 @@ public class ModelHubStore: ObservableObject {
     /// state, so rapid filter taps and debounced queries cannot resolve
     /// out of order or leave a cancelled task's spinner stuck.
     private var fetchSeq = 0
+    /// Monotonic repo-inspect generation: rapid Inspect A-then-B cannot
+    /// let A's manifest overwrite B's sheet.
+    private var inspectSeq = 0
+    /// Page size for HF search (LM Studio style). Load More grows it.
+    public var resultLimit = 30
+    public var hasMoreResults = true
 
     // Curated high-performance starter models if network is cold
     public static let curatedTopModels: [HFModelItem] = [
@@ -340,11 +388,12 @@ public class ModelHubStore: ObservableObject {
 
     public init() {
         self.models = Self.curatedTopModels
-        Task {
+        searchTask = Task {
             await fetchTopModels()
         }
         // Defer the installed-model disk walk past first paint so the Hub
         // renders instantly from the curated list, then backfills local state.
+        // The walk itself runs off the main thread (see scanInstalledModels).
         Task {
             try? await Task.sleep(nanoseconds: 500_000_000)
             if !Task.isCancelled { scanInstalledModels() }
@@ -353,16 +402,33 @@ public class ModelHubStore: ObservableObject {
 
     // MARK: - On-Device Model Discovery (LM Studio style)
 
+    /// Disk walk runs on a background queue; only the publish hops to MainActor.
     public func scanInstalledModels() {
         isScanningInstalled = true
+        Task.detached(priority: .utility) { [weak self] in
+            let found = Self.walkInstalledModels()
+            let freeDisk: Int64 = {
+                let home = NSHomeDirectory()
+                if let values = try? URL(fileURLWithPath: home).resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey, .volumeAvailableCapacityKey]) {
+                    return values.volumeAvailableCapacityForImportantUsage ?? Int64(values.volumeAvailableCapacity ?? 0)
+                }
+                return 0
+            }()
+            await MainActor.run {
+                guard let self else { return }
+                self.freeDiskBytes = freeDisk
+                self.installedModels = found.sorted { $0.sizeBytes > $1.sizeBytes }
+                self.totalInstalledBytes = found.reduce(0) { $0 + $1.sizeBytes }
+                self.isScanningInstalled = false
+            }
+        }
+    }
+
+    /// Synchronous directory walk. Called from a detached task only — never on MainActor.
+    nonisolated private static func walkInstalledModels() -> [InstalledModelItem] {
         var found: [InstalledModelItem] = []
         let fm = FileManager.default
         let home = NSHomeDirectory()
-
-        // Scan free disk space on local APFS volume
-        if let values = try? URL(fileURLWithPath: home).resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey, .volumeAvailableCapacityKey]) {
-            freeDiskBytes = values.volumeAvailableCapacityForImportantUsage ?? Int64(values.volumeAvailableCapacity ?? 0)
-        }
 
         let searchDirs = [
             "/Volumes/AIModels",
@@ -423,13 +489,10 @@ public class ModelHubStore: ObservableObject {
             }
         }
 
-        found.sort { $0.sizeBytes > $1.sizeBytes }
-        installedModels = found
-        totalInstalledBytes = found.reduce(0) { $0 + $1.sizeBytes }
-        isScanningInstalled = false
+        return found
     }
 
-    private func directorySize(at path: String) -> Int64 {
+    nonisolated private static func directorySize(at path: String) -> Int64 {
         let fm = FileManager.default
         guard let enumerator = fm.enumerator(atPath: path) else { return 0 }
         var total: Int64 = 0
@@ -454,6 +517,7 @@ public class ModelHubStore: ObservableObject {
     }
 
     public func onQueryChanged() {
+        resultLimit = 30
         searchTask?.cancel()
         searchTask = Task {
             try? await Task.sleep(nanoseconds: 350_000_000) // 350ms debounce
@@ -464,11 +528,20 @@ public class ModelHubStore: ObservableObject {
 
     public func setFilter(_ filter: ModelFilter) {
         selectedFilter = filter
+        resultLimit = 30
         searchTask?.cancel()
         searchTask = Task {
             guard !Task.isCancelled else { return }
             await fetchTopModels()
         }
+    }
+
+    /// LM Studio style pagination: grow the HF `limit` and refetch.
+    public func loadMore() {
+        guard !isLoading else { return }
+        resultLimit = min(resultLimit + 30, 120)
+        searchTask?.cancel()
+        searchTask = Task { await fetchTopModels() }
     }
 
     public func fetchTopModels() async {
@@ -479,12 +552,13 @@ public class ModelHubStore: ObservableObject {
 
         guard var urlComponents = URLComponents(string: "https://huggingface.co/api/models") else {
             isLoading = false
+            errorMessage = "Could not build Hugging Face search URL. Showing last results."
             return
         }
         var queryItems: [URLQueryItem] = [
             URLQueryItem(name: "sort", value: "downloads"),
             URLQueryItem(name: "direction", value: "-1"),
-            URLQueryItem(name: "limit", value: "30")
+            URLQueryItem(name: "limit", value: "\(resultLimit)")
         ]
 
         let query = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -525,6 +599,7 @@ public class ModelHubStore: ObservableObject {
 
         guard let url = urlComponents.url else {
             isLoading = false
+            errorMessage = "Could not encode Hugging Face search URL. Showing last results."
             return
         }
 
@@ -543,10 +618,20 @@ public class ModelHubStore: ObservableObject {
                 return
             }
 
-            let decoded = try JSONDecoder().decode([HFModelItem].self, from: data)
+            // Per-element tolerance: one malformed HF entry must not fail
+            // the whole page. Failable wrapper skips bad items.
+            struct FailableModel: Decodable {
+                let item: HFModelItem?
+                init(from decoder: Decoder) throws {
+                    item = try? HFModelItem(from: decoder)
+                }
+            }
+            let raw = try JSONDecoder().decode([FailableModel].self, from: data)
+            let decoded = raw.compactMap(\.item)
             if !Task.isCancelled {
                 if !decoded.isEmpty {
                     self.models = decoded
+                    self.hasMoreResults = decoded.count >= resultLimit && resultLimit < 120
                 } else {
                     self.errorMessage = "No models matched this query on Hugging Face. Showing last results."
                 }
@@ -573,16 +658,18 @@ public class ModelHubStore: ObservableObject {
     // MARK: - Hugging Face Model File & Quantization Inspector (LM Studio style)
 
     public func inspectModelRepo(_ model: HFModelItem) {
+        inspectSeq += 1
+        let myInspect = inspectSeq
         inspectingModel = model
         repoFiles = []
         isLoadingRepoFiles = true
         repoFilesError = nil
         Task {
-            await fetchRepoFiles(modelId: model.id)
+            await fetchRepoFiles(modelId: model.id, seq: myInspect)
         }
     }
 
-    public func fetchRepoFiles(modelId: String) async {
+    public func fetchRepoFiles(modelId: String, seq: Int? = nil) async {
         // Percent-encode each path segment (org / model names may contain
         // reserved characters) and fall back from `main` to `master`.
         let segments = modelId.split(separator: "/").map {
@@ -606,7 +693,16 @@ public class ModelHubStore: ObservableObject {
                     lastError = "Could not fetch file manifest for \(modelId) (branch \(branch): HTTP \((res as? HTTPURLResponse)?.statusCode ?? -1))"
                     continue
                 }
-                let decoded = try JSONDecoder().decode([HFRepoFileItem].self, from: data)
+                struct FailableFile: Decodable {
+                    let item: HFRepoFileItem?
+                    init(from decoder: Decoder) throws {
+                        item = try? HFRepoFileItem(from: decoder)
+                    }
+                }
+                let raw = try JSONDecoder().decode([FailableFile].self, from: data)
+                let decoded = raw.compactMap(\.item)
+                // Superseded by a newer inspect: leave state to its owner.
+                if let seq, seq != inspectSeq { return }
                 let filesOnly = decoded.filter {
                     $0.type != "directory" && ($0.isGguf || $0.isSafetensors || $0.path.hasSuffix(".json") || $0.path.hasSuffix(".bin"))
                 }
