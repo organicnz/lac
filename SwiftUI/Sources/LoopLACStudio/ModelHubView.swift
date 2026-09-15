@@ -1,6 +1,56 @@
 import AppKit
 import SwiftUI
 
+// MARK: - Flow Layout (wrapping action rows)
+//
+// Cards are 340–460pt wide but hold 5–6 action buttons (~550pt intrinsic).
+// A plain HStack compresses children below intrinsic width, and SwiftUI Text
+// then wraps character-per-line (vertical glyph soup). FlowLayout wraps
+// buttons onto a second line at intrinsic size instead — compression never
+// happens, so labels always render horizontally.
+
+struct FlowLayout: Layout {
+    var spacing: CGFloat = 8
+    var lineSpacing: CGFloat = 8
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let maxWidth = proposal.width ?? .infinity
+        var x: CGFloat = 0
+        var y: CGFloat = 0
+        var rowHeight: CGFloat = 0
+        for subview in subviews {
+            let size = subview.sizeThatFits(.unspecified)
+            if x > 0, x + spacing + size.width > maxWidth {
+                x = 0
+                y += rowHeight + lineSpacing
+                rowHeight = 0
+            }
+            if x > 0 { x += spacing }
+            x += size.width
+            rowHeight = max(rowHeight, size.height)
+        }
+        return CGSize(width: proposal.width ?? x, height: y + rowHeight)
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        var x = bounds.minX
+        var y = bounds.minY
+        var rowHeight: CGFloat = 0
+        for subview in subviews {
+            let size = subview.sizeThatFits(.unspecified)
+            if x > bounds.minX, x + spacing + size.width > bounds.maxX {
+                x = bounds.minX
+                y += rowHeight + lineSpacing
+                rowHeight = 0
+            }
+            if x > bounds.minX { x += spacing }
+            subview.place(at: CGPoint(x: x, y: y), proposal: .unspecified)
+            x += size.width
+            rowHeight = max(rowHeight, size.height)
+        }
+    }
+}
+
 // MARK: - Model Hub View (LM Studio style Hugging Face model discovery)
 
 public struct ModelHubView: View {
@@ -74,12 +124,17 @@ public struct ModelHubView: View {
 
             Spacer()
 
-            Picker("Hub Mode", selection: $hub.hubTab) {
+            // Segmented control: label hidden (the header title already says
+            // what this is) so the "Hub Mode" text is never squeezed into a
+            // ~10pt column and stacked vertically. Short titles keep the
+            // control inside its 300pt budget without truncating.
+            Picker("", selection: $hub.hubTab) {
                 ForEach(ModelHubStore.HubTab.allCases) { tab in
-                    Text(tab.rawValue).tag(tab)
+                    Text(tab.shortLabel).tag(tab)
                 }
             }
             .pickerStyle(.segmented)
+            .labelsHidden()
             .frame(maxWidth: 300)
 
             Spacer()
@@ -639,8 +694,9 @@ struct ModelCard: View {
 
             Divider().opacity(0.2)
 
-            // Actions row
-            HStack(spacing: 8) {
+            // Actions row (flow: wraps to a second line at intrinsic size
+            // instead of compressing labels into vertical glyph soup)
+            FlowLayout(spacing: 8, lineSpacing: 8) {
                 Button {
                     NSPasteboard.general.clearContents()
                     NSPasteboard.general.setString(item.id, forType: .string)
@@ -746,8 +802,6 @@ struct ModelCard: View {
                 .controlSize(.small)
                 .lacGlass()
                 .help("Open model repository on Hugging Face")
-
-                Spacer()
 
                 Button {
                     onSelect()
@@ -870,8 +924,8 @@ struct InstalledModelCard: View {
 
             Divider().opacity(0.2)
 
-            // Action row
-            HStack(spacing: 8) {
+            // Action row (flow: wraps instead of compressing labels vertical)
+            FlowLayout(spacing: 8, lineSpacing: 8) {
                 Button {
                     onReveal()
                 } label: {
@@ -927,8 +981,6 @@ struct InstalledModelCard: View {
                 } message: {
                     Text("This will permanently remove the model directory from disk: \(item.path)")
                 }
-
-                Spacer()
 
                 Button {
                     onSelect()

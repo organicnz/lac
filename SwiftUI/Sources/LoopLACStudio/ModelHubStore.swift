@@ -219,6 +219,16 @@ public class ModelHubStore: ObservableObject {
         case discover = "Discover (Hugging Face)"
         case installed = "Installed Models"
         public var id: String { rawValue }
+
+        /// Short segment titles: the full rawValues (~200pt each) overflow
+        /// the 300pt segmented control and truncate; the header subtitle
+        /// already carries the Hugging Face context.
+        public var shortLabel: String {
+            switch self {
+            case .discover: return "Discover"
+            case .installed: return "Installed"
+            }
+        }
     }
 
     @Published public var hubTab: HubTab = .discover
