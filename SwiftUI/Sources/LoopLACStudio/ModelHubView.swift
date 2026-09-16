@@ -224,8 +224,10 @@ public struct ModelHubView: View {
                 }
             }
 
-            // Model Size Filter Row (LM Studio style parameter categorization)
-            HStack(spacing: 8) {
+            // Model Size Filter Row (LM Studio style parameter categorization).
+            // Flow: same compression-proofing as the card action rows — on
+            // narrow windows capsules wrap instead of stacking vertically.
+            FlowLayout(spacing: 8, lineSpacing: 8) {
                 Text("Param Size:")
                     .font(.system(size: 11, weight: .medium))
                     .foregroundColor(.secondary)
@@ -248,8 +250,6 @@ public struct ModelHubView: View {
                     }
                     .buttonStyle(.plain)
                 }
-
-                Spacer()
             }
         }
     }
