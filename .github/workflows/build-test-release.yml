@@ -7,58 +7,39 @@ on:
     branches: [master]
   workflow_dispatch:
 
+# Same as foodshare pattern: cancel superseded runs, GitHub-hosted runners.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
-    name: Test (offline)
-    runs-on: self-hosted
+    name: Test
+    runs-on: macos-14
     defaults:
       run:
         shell: bash
+        working-directory: rust-src
     steps:
-      - name: Cancel previous running jobs for this workflow
-        uses: styuty/cancel-workflows@master
-
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Rust nightly (for offline cache check)
-        uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: stable
-          override: true
+      - name: Setup Rust stable
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Cache Cargo registry
-        uses: actions/cache@v4
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: cargo-${{ runner.os }}-${{ hashFiles('rust-src/Cargo.lock') }}
-          restore-keys: |
-            cargo-${{ runner.os }}-
+          workspaces: rust-src
 
-      - name: Build release binaries (offline)
-        uses: actions-rs/cargo@v1
-        with:
-          command: build
-          args: --offline --release --package lac-bootstrap
-          working-directory: rust-src
+      - name: Build release binaries
+        run: cargo build --locked --release
 
-      - name: Run offline test suite
-        uses: actions-rs/cargo@v1
-        with:
-          command: test
-          args: --offline
-          working-directory: rust-src
+      - name: Run test suite
+        run: cargo test --locked
 
       - name: Run integration test (router_intel)
-        uses: actions-rs/cargo@v1
-        with:
-          command: test
-          args: --offline --router_intel
-          working-directory: rust-src
+        run: cargo test --locked --test router_intel
 
       - name: Upload release binaries
         uses: actions/upload-artifact@v4
@@ -79,7 +60,9 @@ jobs:
   release:
     needs: test
     if: github.ref == 'refs/heads/master' && github.event_name != 'pull_request'
-    runs-on: self-hosted
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
     steps:
       - name: Download release artifacts
         uses: actions/download-artifact@v4
@@ -88,7 +71,7 @@ jobs:
           path: ./artifacts
 
       - name: Create GitHub Release
-        uses: softwaredigitalio/create-github-release@1
+        uses: softprops/action-gh-release@v2
         with:
           tag_name: v2.7-${{ github.sha }}
           name: LAC v2.7 Release
@@ -114,10 +97,8 @@ jobs:
             - `pull-models` — qwen3.8-27b fetcher only
             - `kv-manage` — token provenance + risk levels
 
-            ### Self-Hosted Runner Notes
-            - Offline-first: `cargo test --offline`, `cargo build --offline --release`
-            - Target: Mac Studio M5 Ultra 96GB, Qwen 3.8 27B
-            - No external crates in scripts (std-only)
+            ### Notes
+            - Built on GitHub-hosted `macos-14` (ARM64), same pattern as foodshare (`ubuntu-24.04` / `macos-14`)
             - KV provenance chain: explicit → env → router 1h estimate → legacy probe
             - Circuit breaker: 3-strike/30s EWMA backend failure handler
             - Fastest-mode routing: reorder backends by measured latency
