@@ -21,14 +21,14 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name. Setup Rust nightly (for offline cache check)
+      - name: Setup Rust nightly (for offline cache check)
         uses: actions-rs/toolchain@v1
         with:
           profile: minimal
           toolchain: stable
           override: true
 
-      - name. Cache Cargo registry
+      - name: Cache Cargo registry
         uses: actions/cache@v4
         with:
           path: |
@@ -39,28 +39,28 @@ jobs:
           restore-keys: |
             cargo-${{ runner.os }}-
 
-      - name. Build release binaries (offline)
+      - name: Build release binaries (offline)
         uses: actions-rs/cargo@v1
         with:
           command: build
           args: --offline --release --package lac-bootstrap
           working-directory: rust-src
 
-      - name. Run offline test suite
+      - name: Run offline test suite
         uses: actions-rs/cargo@v1
         with:
           command: test
           args: --offline
           working-directory: rust-src
 
-      - name. Run integration test (router_intel)
+      - name: Run integration test (router_intel)
         uses: actions-rs/cargo@v1
         with:
           command: test
           args: --offline --router_intel
           working-directory: rust-src
 
-      - name. Upload release binaries
+      - name: Upload release binaries
         uses: actions/upload-artifact@v4
         with:
           name: lac-release-${{ runner.os }}-${{ github.sha }}
@@ -81,13 +81,13 @@ jobs:
     if: github.ref == 'refs/heads/master' && github.event_name != 'pull_request'
     runs-on: self-hosted
     steps:
-      - name. Download release artifacts
+      - name: Download release artifacts
         uses: actions/download-artifact@v4
         with:
           name: lac-release-${{ runner.os }}-${{ github.sha }}
           path: ./artifacts
 
-      - name. Create GitHub Release
+      - name: Create GitHub Release
         uses: softwaredigitalio/create-github-release@1
         with:
           tag_name: v2.7-${{ github.sha }}
