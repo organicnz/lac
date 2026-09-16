@@ -59,6 +59,7 @@ public struct ModelHubView: View {
     @EnvironmentObject private var network: NetworkManager
     @Binding var sidebarVisibility: NavigationSplitViewVisibility
     public var onSelectModel: ((String) -> Void)?
+    @Namespace private var filterPillNS
 
     public init(
         sidebarVisibility: Binding<NavigationSplitViewVisibility> = .constant(.all),
@@ -200,26 +201,56 @@ public struct ModelHubView: View {
                     .overlay(LiquidGlass.specularBorder(cornerRadius: 12))
             )
 
-            // Filter Tabs
+            // Filter Tabs. Tahoe best practice: GlassEffectContainer with
+            // glassEffectUnion so the selection pill morphs between filters
+            // instead of cross-fading flat capsules. Pre-Tahoe keeps the
+            // manual capsule stack. ScrollView retained on both paths so
+            // narrow windows scroll instead of compressing labels vertical.
             ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 8) {
-                    ForEach(ModelHubStore.ModelFilter.allCases) { filter in
-                        let isSelected = hub.selectedFilter == filter
-                        Button {
-                            LiquidGlass.haptic(.alignment)
-                            hub.setFilter(filter)
-                        } label: {
-                            Text(filter.rawValue)
-                                .font(.system(size: 11.5, weight: isSelected ? .semibold : .regular))
-                                .padding(.horizontal, 12)
-                                .padding(.vertical, 6)
-                                .background(
-                                    Capsule(style: .continuous)
-                                        .fill(isSelected ? Color.accentColor : Color.white.opacity(0.08))
+                if #available(macOS 26, *) {
+                    GlassEffectContainer(spacing: 8) {
+                        HStack(spacing: 8) {
+                            ForEach(ModelHubStore.ModelFilter.allCases) { filter in
+                                let isSelected = hub.selectedFilter == filter
+                                Button {
+                                    LiquidGlass.haptic(.alignment)
+                                    hub.setFilter(filter)
+                                } label: {
+                                    Text(filter.rawValue)
+                                        .font(.system(size: 11.5, weight: isSelected ? .semibold : .regular))
+                                        .padding(.horizontal, 12)
+                                        .padding(.vertical, 6)
+                                        .foregroundColor(isSelected ? .white : .primary)
+                                }
+                                .buttonStyle(.plain)
+                                .glassEffect(
+                                    .regular.tint(isSelected ? Color.accentColor.opacity(0.55) : Color.white.opacity(0.08)),
+                                    in: Capsule(style: .continuous)
                                 )
-                                .foregroundColor(isSelected ? .white : .primary)
+                                .glassEffectUnion(id: filter, namespace: filterPillNS)
+                            }
                         }
-                        .buttonStyle(.plain)
+                    }
+                } else {
+                    HStack(spacing: 8) {
+                        ForEach(ModelHubStore.ModelFilter.allCases) { filter in
+                            let isSelected = hub.selectedFilter == filter
+                            Button {
+                                LiquidGlass.haptic(.alignment)
+                                hub.setFilter(filter)
+                            } label: {
+                                Text(filter.rawValue)
+                                    .font(.system(size: 11.5, weight: isSelected ? .semibold : .regular))
+                                    .padding(.horizontal, 12)
+                                    .padding(.vertical, 6)
+                                    .background(
+                                        Capsule(style: .continuous)
+                                            .fill(isSelected ? Color.accentColor : Color.white.opacity(0.08))
+                                    )
+                                    .foregroundColor(isSelected ? .white : .primary)
+                            }
+                            .buttonStyle(.plain)
+                        }
                     }
                 }
             }
