@@ -8,9 +8,14 @@ on:
   workflow_dispatch:
 
 # Same as foodshare pattern: cancel superseded runs, GitHub-hosted runners.
+# Cancel-in-progress is scoped to non-master so a fast-follow push can never
+# kill an in-flight test→release publish on master mid-release.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
+
+permissions:
+  contents: read
 
 jobs:
   test:
@@ -73,7 +78,9 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v2.7-${{ github.sha }}
+          tag_name: v2.7.${{ github.run_number }}
+          files: ./artifacts/*
+          fail_on_unmatched_files: true
           name: LAC v2.7 Release
           body: |
             ## What's Changed

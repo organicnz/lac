@@ -1693,9 +1693,31 @@ fn block_field(block: &str, key: &str) -> Option<String> {
     None
 }
 
-/// Parse `- id:` blocks. Tolerates missing fields; unknown blocks are
-/// preserved verbatim by `update_task` (which edits line ranges, so it
-/// never corrupts neighbors).
+/// Allowlist for task ids. Ids flow into a transcript path
+/// (`~/.lac/task-logs/<id>-<ts>.log`), a git branch (`task/<id>`), and a
+/// commit message — all from YAML the worker does not fully control. Only
+/// `[A-Za-z0-9][A-Za-z0-9._-]{0,64}` passes, so `../../evil`, absolute
+/// paths, spaces, and control chars can never reach the fs or git.
+fn sanitize_task_id(id: &str) -> Option<String> {
+    if id.is_empty() || id.len() > 65 {
+        return None;
+    }
+    let mut chars = id.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphanumeric() => {}
+        _ => return None,
+    }
+    if !chars.all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-') {
+        return None;
+    }
+    Some(id.to_string())
+}
+
+/// Parse `- id:` blocks. Tolerates missing fields; blocks with an unsafe
+/// id are dropped here so no caller can ever interpolate them into a
+/// path, branch, or commit message. Unknown blocks are preserved verbatim
+/// by `update_task` (which edits line ranges, so it never corrupts
+/// neighbors).
 fn parse_tasks(content: &str) -> Vec<Task> {
     let mut tasks = Vec::new();
     let mut cur: Vec<&str> = Vec::new();
@@ -1706,14 +1728,20 @@ fn parse_tasks(content: &str) -> Vec<Task> {
         let block = cur.join("\n");
         if let (Some(id), Some(desc)) = (block_field(&block, "- id:"), block_field(&block, "task:"))
         {
-            tasks.push(Task {
-                id,
-                desc,
-                status: block_field(&block, "status:").unwrap_or_else(|| "pending".to_string()),
-                attempts: block_field(&block, "attempts:")
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(0),
-            });
+            match sanitize_task_id(&id) {
+                Some(id) => tasks.push(Task {
+                    id,
+                    desc,
+                    status: block_field(&block, "status:").unwrap_or_else(|| "pending".to_string()),
+                    attempts: block_field(&block, "attempts:")
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(0),
+                }),
+                None => {
+                    eprintln!("Skipping task block with unsafe id: {:?}", id);
+                    common::log_event("task_rejected", &format!("unsafe id rejected: {:?}", id));
+                }
+            }
         }
         cur.clear();
     };
@@ -2143,6 +2171,11 @@ fn cmd_worker(root: &str, args: &[String]) {
             }
         };
 
+        // Panic isolation: the 24/7 loop must survive a poisoned task.
+        // `task` is only borrowed below so its strike can still be
+        // counted afterwards if the closure unwinds.
+        let task_id = task.id.clone();
+        let survived = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         println!("\nProcessing queued task [{}]: \"{}\" (attempt {}/{})", task.id, task.desc, task.attempts + 1, MAX_TASK_ATTEMPTS);
         common::log_event("task_start", &format!("[{}] {}", task.id, task.desc));
         let _ = common::atomic_write(&worker_current_path(), &format!("id: {}\nbase: {}\n", task.id, base_branch));
@@ -2243,6 +2276,28 @@ fn cmd_worker(root: &str, args: &[String]) {
             git_in(root, &["checkout", &base_branch]);
         }
         let _ = fs::remove_file(worker_current_path());
+        }));
+        if survived.is_err() {
+            println!("  Task [{}] panicked; daemon survives. Counting a strike.", task_id);
+            common::log_event("task_panic", &format!("[{}] worker caught panic; state reset", task_id));
+            // Best-effort reset: plain `checkout` never discards user work,
+            // it only fails when local mods would be overwritten.
+            git_in(root, &["checkout", &base_branch]);
+            let _ = fs::remove_file(worker_current_path());
+            // A deterministically-poisoned task must dead-letter after 3
+            // strikes, not hot-loop the daemon forever.
+            if let Ok(c) = fs::read_to_string(&tasks_file) {
+                let bumped = task.attempts + 1;
+                let status = if bumped >= MAX_TASK_ATTEMPTS {
+                    println!("  Task [{}] reached {} attempts — dead-letter.", task_id, MAX_TASK_ATTEMPTS);
+                    common::log_event("task_dead_letter", &format!("[{}]", task_id));
+                    "failed"
+                } else {
+                    "pending"
+                };
+                let _ = common::atomic_write(&tasks_file, &update_task(&c, &task_id, status, true));
+            }
+        }
 
         if !continuous {
             // Drain mode re-reads the queue on the next iteration.
@@ -2500,6 +2555,47 @@ mod tests {
         assert_eq!(t[0].attempts, 0);
         assert_eq!(t[1].desc, "do second: with colon");
         assert_eq!(t[1].attempts, 2);
+    }
+
+    #[test]
+    fn task_id_sanitize_allows_sane_ids() {
+        assert_eq!(sanitize_task_id("a-1").as_deref(), Some("a-1"));
+        assert_eq!(sanitize_task_id("lac-004").as_deref(), Some("lac-004"));
+        assert_eq!(sanitize_task_id("A").as_deref(), Some("A"));
+        assert_eq!(sanitize_task_id("x.y_z-9").as_deref(), Some("x.y_z-9"));
+        assert!(sanitize_task_id(&"q".repeat(65)).is_some());
+    }
+
+    #[test]
+    fn task_id_sanitize_rejects_traversal_and_junk() {
+        for bad in [
+            "",
+            "../../evil",
+            "/abs",
+            "a/b",
+            "a b",
+            "-lead",
+            ".lead",
+            "semi;colon",
+            "dq\"q",
+            "sq'q",
+            "back`tick",
+            "dollar$",
+            "tilde~",
+            "ctrl\x01",
+            "star*",
+        ] {
+            assert!(sanitize_task_id(bad).is_none(), "must reject {:?}", bad);
+        }
+        assert!(sanitize_task_id(&"q".repeat(66)).is_none(), "must reject 66 chars");
+    }
+
+    #[test]
+    fn parse_drops_tasks_with_unsafe_ids() {
+        let yaml = "- id: \"../../evil\"\n  task: \"pwn\"\n  status: pending\n\n- id: \"ok-1\"\n  task: \"fine\"\n  status: pending\n";
+        let t = parse_tasks(yaml);
+        assert_eq!(t.len(), 1);
+        assert_eq!(t[0].id, "ok-1");
     }
 
     #[test]
