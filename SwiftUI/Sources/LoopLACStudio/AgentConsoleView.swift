@@ -109,6 +109,17 @@ public final class AgentConsoleStore: ObservableObject {
 
         self.activeProcess = proc
 
+        // 30s timeout: TERM → after 2s INT → after 2s KILL.
+        DispatchQueue.global().asyncAfter(deadline: .now() + 30) {
+            self.activeProcess?.terminate()
+            DispatchQueue.global().asyncAfter(deadline: .now() + 2) {
+                if self.activeProcess?.isRunning == true { self.activeProcess?.interrupt() }
+                DispatchQueue.global().asyncAfter(deadline: .now() + 2) {
+                    if self.activeProcess?.isRunning == true { Darwin.kill(self.activeProcess!.processIdentifier, SIGKILL) }
+                }
+            }
+        }
+
         let outHandle = outPipe.fileHandleForReading
         let errHandle = errPipe.fileHandleForReading
 
@@ -181,8 +192,10 @@ public final class AgentConsoleStore: ObservableObject {
     public func cancel() {
         guard isRunning, let proc = activeProcess else { return }
         proc.terminate()
-        activeProcess = nil
-        isRunning = false
+        // Do NOT clear isRunning/activeProcess here — the detached
+        // completion handler will run shortly (waitUntilExit returns after
+        // terminate) and safely nil them out, avoiding a race where the UI
+        // reads nil while the task is still dumping output.
         timer?.invalidate()
         timer = nil
         output.append("\n[Process terminated by user]\n")
@@ -256,6 +269,7 @@ public struct AgentConsoleView: View {
                 .buttonStyle(.plain)
                 .disabled(console.isRunning)
                 .help("Run cargo test on rust-src backend")
+                .accessibilityIdentifier("cargoTestsButton")
 
                 Button {
                     console.runSwiftTests(repoRoot: workspaceRoot)
@@ -274,6 +288,7 @@ public struct AgentConsoleView: View {
                 .buttonStyle(.plain)
                 .disabled(console.isRunning)
                 .help("Run swift test on SwiftUI package")
+                .accessibilityIdentifier("swiftTestsButton")
 
                 Button {
                     console.runGitDiff(repoRoot: workspaceRoot)
@@ -292,6 +307,7 @@ public struct AgentConsoleView: View {
                 .buttonStyle(.plain)
                 .disabled(console.isRunning)
                 .help("Inspect live uncommitted git diff")
+                .accessibilityIdentifier("gitDiffButton")
 
                 Button {
                     console.runStackHealth(repoRoot: workspaceRoot)
@@ -310,6 +326,7 @@ public struct AgentConsoleView: View {
                 .buttonStyle(.plain)
                 .disabled(console.isRunning)
                 .help("Run lac status check")
+                .accessibilityIdentifier("stackHealthButton")
 
                 Divider()
                     .frame(height: 14)
@@ -333,6 +350,7 @@ public struct AgentConsoleView: View {
                         }
                         .buttonStyle(.plain)
                         .help("Cancel running command")
+                        .accessibilityIdentifier("consoleStopButton")
                     }
                 } else if let code = console.lastExitCode {
                     HStack(spacing: 3) {

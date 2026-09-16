@@ -89,6 +89,13 @@ public func computeLineDiff(original: String, modified: String) -> [DiffLine] {
         }
     }
 
+    // Guard path: the DP table below is O(n·m) Ints — a 5k-line assistant
+    // output is 25M entries on the calling thread (freeze/OOM). Degrade to
+    // a linear prefix/suffix trim with a changed middle instead.
+    if n * m > 4_000_000 {
+        return simpleLineDiff(origLines: origLines, modLines: modLines)
+    }
+
     // Standard dynamic programming LCS table
     var dp = Array(repeating: Array(repeating: 0, count: m + 1), count: n + 1)
     for i in 0..<n {
@@ -121,6 +128,39 @@ public func computeLineDiff(original: String, modified: String) -> [DiffLine] {
     }
 
     return diff.reversed()
+}
+
+/// Linear fallback for `computeLineDiff` when the O(n·m) DP table would
+/// explode: longest common prefix + suffix stay `unchanged`, the middle
+/// becomes removed+added. O(n+m) time, O(1) extra space.
+public func simpleLineDiff(origLines: [String], modLines: [String]) -> [DiffLine] {
+    var prefix = 0
+    while prefix < origLines.count && prefix < modLines.count
+        && origLines[prefix] == modLines[prefix] {
+        prefix += 1
+    }
+    var suffix = 0
+    while suffix < origLines.count - prefix && suffix < modLines.count - prefix
+        && origLines[origLines.count - 1 - suffix] == modLines[modLines.count - 1 - suffix] {
+        suffix += 1
+    }
+    var out: [DiffLine] = []
+    out.reserveCapacity(origLines.count + modLines.count)
+    for i in 0..<prefix {
+        out.append(DiffLine(type: .unchanged, text: origLines[i], oldLineNumber: i + 1, newLineNumber: i + 1))
+    }
+    for i in prefix..<(origLines.count - suffix) {
+        out.append(DiffLine(type: .removed, text: origLines[i], oldLineNumber: i + 1, newLineNumber: nil))
+    }
+    for j in prefix..<(modLines.count - suffix) {
+        out.append(DiffLine(type: .added, text: modLines[j], oldLineNumber: nil, newLineNumber: j + 1))
+    }
+    for k in 0..<suffix {
+        let i = origLines.count - suffix + k
+        let j = modLines.count - suffix + k
+        out.append(DiffLine(type: .unchanged, text: origLines[i], oldLineNumber: i + 1, newLineNumber: j + 1))
+    }
+    return out
 }
 
 // MARK: - Partition Diff into Hunks
@@ -242,6 +282,7 @@ public struct CodeDiffView: View {
     @State private var diffLines: [DiffLine] = []
     @State private var hunks: [DiffHunk] = []
     @State private var viewMode: DiffDisplayMode = .hunks
+    @State private var diffTask: Task<Void, Never>?
 
     public enum DiffDisplayMode: String, CaseIterable, Identifiable {
         case hunks = "Hunks (Chunk-by-Chunk)"
@@ -381,6 +422,9 @@ public struct CodeDiffView: View {
         }
         .onAppear {
             recalculateDiff()
+        }
+        .onDisappear {
+            diffTask?.cancel()
         }
         .onChange(of: modifiedCode) { _ in
             recalculateDiff()
@@ -564,9 +608,22 @@ public struct CodeDiffView: View {
 
     // MARK: Actions & Synthesis
 
+    // Diffing runs detached (never on MainActor) with a stale-guard:
+    // a newer keystroke cancels the in-flight computation and its late
+    // completion is discarded instead of overwriting fresher results.
     private func recalculateDiff() {
-        diffLines = computeLineDiff(original: originalCode, modified: modifiedCode)
-        hunks = partitionIntoHunks(diffLines: diffLines)
+        diffTask?.cancel()
+        let orig = originalCode, mod = modifiedCode
+        diffTask = Task.detached(priority: .userInitiated) {
+            let lines = computeLineDiff(original: orig, modified: mod)
+            let computed = partitionIntoHunks(diffLines: lines)
+            await MainActor.run {
+                guard orig == self.originalCode, mod == self.modifiedCode else { return }
+                guard !Task.isCancelled else { return }
+                self.diffLines = lines
+                self.hunks = computed
+            }
+        }
     }
 
     private func toggleHunk(hunkIndex: Int, state: HunkState) {

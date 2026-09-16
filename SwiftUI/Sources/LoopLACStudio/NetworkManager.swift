@@ -104,17 +104,20 @@ class NetworkManager: ObservableObject {
         checkDaemonStatus()
     }
 
-    /// Resolve the `lac` binary: explicit env > ~/.local/bin > /opt/homebrew > /usr/local > PATH.
-    nonisolated static func lacBinary() -> String {
+    /// Resolve the `lac` binary: explicit env > ~/.local/bin > /opt/homebrew >
+    /// /usr/local > PATH. Returns the executable URL plus an argument prefix:
+    /// the PATH fallback goes through /usr/bin/env because a bare `"lac"`
+    /// is not a valid file URL (`Process.run` would always throw).
+    nonisolated static func lacExecutable() -> (url: URL, prefix: [String]) {
         let fm = FileManager.default
         if let env = ProcessInfo.processInfo.environment["LAC_BIN"], fm.isExecutableFile(atPath: env) {
-            return env
+            return (URL(fileURLWithPath: env), [])
         }
         let home = NSHomeDirectory()
         for cand in ["\(home)/.local/bin/lac", "/opt/homebrew/bin/lac", "/usr/local/bin/lac", "/usr/bin/lac"] {
-            if fm.isExecutableFile(atPath: cand) { return cand }
+            if fm.isExecutableFile(atPath: cand) { return (URL(fileURLWithPath: cand), []) }
         }
-        return "lac"
+        return (URL(fileURLWithPath: "/usr/bin/env"), ["lac"])
     }
 
     func checkDaemonStatus() {
@@ -123,7 +126,7 @@ class NetworkManager: ObservableObject {
         daemonInstalled = FileManager.default.fileExists(atPath: plist)
     }
 
-    func fetch() {
+    func fetch(clearLastError: Bool = true) {
         // Coalesce overlapping polls (3s dashboard ticker + manual refresh).
         guard !isChecking else { return }
         isChecking = true
@@ -142,7 +145,7 @@ class NetworkManager: ObservableObject {
                 let decoded = try JSONDecoder().decode(RouterStatusResponse.self, from: data)
                 await MainActor.run {
                     self.response = decoded
-                    self.lastError = nil
+                    if clearLastError { self.lastError = nil }
                     self.isChecking = false
                     self.autoRefreshPaused = false
                 }
@@ -177,24 +180,38 @@ class NetworkManager: ObservableObject {
     func runLac(_ args: [String], timeoutSeconds: Double = 30) async -> String {
         await withCheckedContinuation { cont in
             DispatchQueue.global().async {
+                let exe = Self.lacExecutable()
                 let p = Process()
-                p.executableURL = URL(fileURLWithPath: Self.lacBinary())
-                p.arguments = args
+                p.executableURL = exe.url
+                p.arguments = exe.prefix + args
                 let pipe = Pipe()
                 p.standardOutput = pipe
                 p.standardError = pipe
+                // Resume-once guard: the timeout path (kill) and the wait
+                // path below race by design, so the flag is lock-guarded —
+                // a double-resume crashes a CheckedContinuation.
+                let state = NSLock()
                 var resumed = false
                 func resumeOnce(_ s: String) {
-                    if !resumed {
-                        resumed = true
-                        cont.resume(returning: s)
-                    }
+                    state.lock()
+                    defer { state.unlock() }
+                    guard !resumed else { return }
+                    resumed = true
+                    cont.resume(returning: s)
                 }
-                // Timeout: hung `lac` must not hang the UI forever.
+                // Timeout escalates TERM → INT → KILL. The `waitUntilExit`
+                // below then returns and the real (partial) output is
+                // delivered — a SIGTERM-ignoring child can no longer wedge
+                // this worker thread forever.
                 DispatchQueue.global().asyncAfter(deadline: .now() + timeoutSeconds) {
-                    if p.isRunning {
-                        p.terminate()
-                        resumeOnce("")
+                    guard p.isRunning else { return }
+                    p.terminate()
+                    DispatchQueue.global().asyncAfter(deadline: .now() + 2) {
+                        guard p.isRunning else { return }
+                        p.interrupt()
+                        DispatchQueue.global().asyncAfter(deadline: .now() + 2) {
+                            if p.isRunning { Darwin.kill(p.processIdentifier, SIGKILL) }
+                        }
                     }
                 }
                 do {
@@ -211,9 +228,10 @@ class NetworkManager: ObservableObject {
 
     func spawnDetachedLac(_ args: [String]) {
         DispatchQueue.global().async {
+            let exe = Self.lacExecutable()
             let p = Process()
-            p.executableURL = URL(fileURLWithPath: Self.lacBinary())
-            p.arguments = args
+            p.executableURL = exe.url
+            p.arguments = exe.prefix + args
             let nullDev = FileHandle.nullDevice
             p.standardOutput = nullDev
             p.standardError = nullDev
@@ -293,34 +311,37 @@ class NetworkManager: ObservableObject {
         pullProgress = nil
         lastAction = "Pulling \(modelId)..."
         
-        DispatchQueue.global().async {
-            let p = Process()
-            p.executableURL = URL(fileURLWithPath: Self.lacBinary())
-            p.arguments = ["pull", modelId]
-            let pipe = Pipe()
-            p.standardOutput = pipe
-            p.standardError = pipe
-            
-            let fileHandle = pipe.fileHandleForReading
-            fileHandle.readabilityHandler = { handle in
-                let data = handle.availableData
-                if !data.isEmpty, let str = String(data: data, encoding: .utf8) {
-                    DispatchQueue.main.async { [weak self, str] in
-                        guard let self else { return }
-                        let combined = (self.pullOutput ?? "") + str
-                        // Keep only the last 2000 characters to avoid memory bloat
-                        self.pullOutput = combined.count > 2000
-                            ? String(combined.suffix(2000))
-                            : combined
-                        self.pullProgress = Self.parseProgress(from: combined)
-                    }
+        // The Process is created and published synchronously on MainActor
+        // BEFORE the background run starts: the old shape assigned
+        // `pullProcess` via a queued main.async, so a fast Cancel in the
+        // gap read nil and the child leaked. Only run/wait goes to .global.
+        let exe = Self.lacExecutable()
+        let p = Process()
+        p.executableURL = exe.url
+        p.arguments = exe.prefix + ["pull", modelId]
+        let pipe = Pipe()
+        p.standardOutput = pipe
+        p.standardError = pipe
+
+        let fileHandle = pipe.fileHandleForReading
+        fileHandle.readabilityHandler = { handle in
+            let data = handle.availableData
+            if !data.isEmpty, let str = String(data: data, encoding: .utf8) {
+                DispatchQueue.main.async { [weak self, str] in
+                    guard let self else { return }
+                    let combined = (self.pullOutput ?? "") + str
+                    // Keep only the last 2000 characters to avoid memory bloat
+                    self.pullOutput = combined.count > 2000
+                        ? String(combined.suffix(2000))
+                        : combined
+                    self.pullProgress = Self.parseProgress(from: combined)
                 }
             }
+        }
 
-            DispatchQueue.main.async { [weak self] in
-                self?.pullProcess = p
-            }
-            
+        self.pullProcess = p
+
+        DispatchQueue.global().async {
             do {
                 try p.run()
                 p.waitUntilExit()
@@ -389,7 +410,9 @@ class NetworkManager: ObservableObject {
 
     /// Switch the router's preferred backend via the existing
     /// /lac/switch endpoint (no new endpoints), then refresh.
-    func switchBackend(_ target: String) async {
+    /// - Parameter clearLastError: if false, `fetch()` won't nil the
+    ///   switch error so the user can see what went wrong.
+    func switchBackend(_ target: String, clearLastError: Bool = true) async {
         guard let url = URL(string: "http://127.0.0.1:\(port)/lac/switch?target=\(target)") else {
             lastError = "Invalid router URL (port \(port)) — cannot switch to \(target)"
             return
@@ -399,15 +422,14 @@ class NetworkManager: ObservableObject {
         do {
             let (_, resp) = try await URLSession.shared.data(for: req)
             guard let http = resp as? HTTPURLResponse, http.statusCode == 200 else {
-                lastError = "Router switch failed (HTTP \((resp as? HTTPURLResponse)?.statusCode ?? -1))"
-                fetch()
+                if clearLastError { lastError = "Router switch failed (HTTP \((resp as? HTTPURLResponse)?.statusCode ?? -1))" }
                 return
             }
             lastAction = "Switched router → \(target)"
         } catch {
-            lastError = "Router switch failed: \(error.localizedDescription)"
+            if clearLastError { lastError = "Router switch failed: \(error.localizedDescription)" }
         }
-        fetch()
+        fetch(clearLastError: false)
     }
 
     /// Install/uninstall the launchd daemons, record the first output
