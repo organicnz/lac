@@ -44,7 +44,7 @@ jobs:
       - name: Upload release binaries
         uses: actions/upload-artifact@v4
         with:
-          name: lac-release-${{ runner.os }}-${{ github.sha }}
+          name: lac-release-${{ github.sha }}
           path: |
             rust-src/target/release/lac
             rust-src/target/release/lac-router
@@ -67,7 +67,7 @@ jobs:
       - name: Download release artifacts
         uses: actions/download-artifact@v4
         with:
-          name: lac-release-${{ runner.os }}-${{ github.sha }}
+          name: lac-release-${{ github.sha }}
           path: ./artifacts
 
       - name: Create GitHub Release
