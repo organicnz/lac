@@ -73,3 +73,40 @@ Inference servers are kept alive via Apple `launchd` daemons in `~/Library/Launc
 - `org.lac.serve-mlx.plist`: Supervises `serve-mlx` with crash backoff and restart throttle.
 
 In case of Metal OOM (`Insufficient Memory`), `lac-router` returns HTTP 502 with error details, while `launchd` auto-restarts the inference backend within 10 seconds.
+
+---
+
+## 5. Native Orchestrator (Hermes)
+
+Normative spec: `.opencode/skills/hermes-orchestrator/SKILL.md`. Summary:
+
+There is no external Hermes process. `lac hermes` and `lac worker` are entry points into one native Rust loop (`cmd_worker` in `rust-src/src/lac.rs`):
+
+- **Selection**: `judge_next()` asks the `:8000` gateway to pick the most urgent pending task from `~/todo/lac-tasks.yaml`, given thermal state. Single-candidate queues, a down gateway, `LAC_JUDGE=off`, or any model/gateway failure all resolve to deterministic file order — judgment augments selection, never reliability.
+- **Execution per task**: thermal gate → KV checkpoint (`kv-manage truncate`) → isolated `task/<id>` branch → `opencode2 run` (@coder) → `make test` fail-closed gate → native reviewer pass (`review_diff`: `git diff HEAD` plus capped untracked contents, verdict derived from `[critical]`/`[major]` markers; one @coder fix round, max 2 review rounds) → commit on pass, reset + attempt bump on failure, dead-letter (`failed`) after 3 attempts. Reviewer infra failure never blocks a test-passing commit (event-logged); round-2 leftovers commit flagged `review_flagged` for human merge review. Panic-isolated via `catch_unwind`; single-flight locked; crash-recoverable to the base branch.
+- **Status**: `lac hermes status` reports queue counts, gateway, thermals, and model from the live machine. `lac hermes run [--drain]` delegates to the worker loop. `LAC_JUDGE=off` / `LAC_REVIEW=off` force deterministic skip of each LLM gate.
+
+---
+
+## 6. Remote Access via Tailscale (tailnet-only, no public ports)
+
+`lac-router` binds loopback by default. Remote Studio clients connect over the
+tailnet (WireGuard-encrypted), never the public internet. No `:8000` ingress
+rule on Oracle/VPS firewalls.
+
+- Router: `LAC_BIND_ADDR` (default `127.0.0.1`, remote `0.0.0.0` or a Tailscale
+  IP) + `LAC_API_TOKEN`. Non-loopback bind without a token refuses to start
+  (fail closed); non-loopback peers without a valid `Authorization: Bearer`
+  get 401 and are never forwarded. Loopback stays token-less for local dev.
+  Token comparison is constant-time. See `lac config` (redacted) and
+  `lac doctor` (`remote_auth` check).
+- Studio: `LACConnectionStore` (`SwiftUI/.../LACConnection.swift`) — host
+  (`100.x` or MagicDNS `mac.tailXXX.ts.net`), port, TLS toggle (off: tailnet
+  http is already encrypted; on: only for `tailscale serve --https`), Bearer
+  token in Keychain (`org.lac.studio`). All clients (chat, code, loops,
+  dashboard) route through `connection.url(path:)` + `authorize(&req)`.
+  Local serve/daemon actions self-disable while remote.
+- Ops: one tailnet, device approval + key expiry + Tailnet Lock on,
+  ACL `laptops => mac:8000`. `launchctl setenv LAC_API_TOKEN "$(openssl rand -hex 32)"`
+  then `lac daemon install`. Oracle box is a plain tailnet member (status/ping/
+  logs), never a public relay.

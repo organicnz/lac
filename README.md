@@ -28,6 +28,18 @@ Gateway: **`lac-router` on `:8000`** (auto-routes MLX `:8080`, llama-server `:80
 opencode2 run "Verify stack: list files and check git status"
 ```
 
+### Remote via Tailscale (no public ports)
+```bash
+# On the Mac: join tailnet, set token, bind all interfaces
+brew install tailscale && sudo tailscaled && tailscale up
+launchctl setenv LAC_API_TOKEN "$(openssl rand -hex 32)"
+LAC_BIND_ADDR=0.0.0.0 LAC_API_TOKEN="$LAC_API_TOKEN" ./rust-src/target/release/lac-router &
+# On any laptop: same tailnet, Studio → Ops → Gateway Connection →
+# host 100.x or mac.tailXXX.ts.net:8000 + paste token, Test.
+./rust-src/target/release/lac config   # bind + auth (redacted)
+./rust-src/target/release/lac doctor   # remote_auth check
+```
+
 ---
 
 ## Architecture & Layout
@@ -57,9 +69,9 @@ opencode2 run "Verify stack: list files and check git status"
 
 ## Documentation
 
-- [Operating Rules (AGENTS.md)](file:///Users/organic/dev/work/AI/LAC/AGENTS.md)
-- [Quickstart Guide (QUICKSTART.md)](file:///Users/organic/dev/work/AI/LAC/QUICKSTART.md)
-- [Architecture Blueprint (docs/ARCHITECTURE.md)](file:///Users/organic/dev/work/AI/LAC/docs/ARCHITECTURE.md)
-- [Speculative Decoding & MTP (docs/MTP_TUNING.md)](file:///Users/organic/dev/work/AI/LAC/docs/MTP_TUNING.md)
-- [Kanban & Autonomous Loops (docs/LOOPS_AND_KANBAN.md)](file:///Users/organic/dev/work/AI/LAC/docs/LOOPS_AND_KANBAN.md)
-- [Terminal Selection Guide (TERMINALS.md)](file:///Users/organic/dev/work/AI/LAC/TERMINALS.md)
+- [Operating Rules](docs/AGENTS.md)
+- [Quickstart Guide](docs/QUICKSTART.md)
+- [Architecture Blueprint](docs/ARCHITECTURE.md)
+- [Speculative Decoding & MTP](docs/MTP_TUNING.md)
+- [Kanban & Autonomous Loops](docs/LOOPS_AND_KANBAN.md)
+- [Terminal Selection Guide](docs/TERMINALS.md)
