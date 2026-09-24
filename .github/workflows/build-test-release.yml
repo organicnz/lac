@@ -2,17 +2,17 @@ name: Build, Test & Release LAC Stack
 
 on:
   push:
-    branches: [master]
+    branches: [main]
   pull_request:
-    branches: [master]
+    branches: [main]
   workflow_dispatch:
 
 # Same as foodshare pattern: cancel superseded runs, GitHub-hosted runners.
-# Cancel-in-progress is scoped to non-master so a fast-follow push can never
-# kill an in-flight test→release publish on master mid-release.
+# Cancel-in-progress is scoped to non-main so a fast-follow push can never
+# kill an in-flight test→release publish on main mid-release.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 permissions:
   contents: read
@@ -24,7 +24,7 @@ jobs:
     defaults:
       run:
         shell: bash
-        working-directory: rust-src
+        working-directory: .
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -38,13 +38,10 @@ jobs:
           workspaces: rust-src
 
       - name: Build release binaries
-        run: cargo build --locked --release
+        run: cargo build --manifest-path rust-src/Cargo.toml --locked --release
 
-      - name: Run test suite
-        run: cargo test --locked
-
-      - name: Run integration test (router_intel)
-        run: cargo test --locked --test router_intel
+      - name: Run delivery gate
+        run: make delivery-index validate
 
       - name: Upload release binaries
         uses: actions/upload-artifact@v4
@@ -64,7 +61,7 @@ jobs:
   # Optional: publish to release
   release:
     needs: test
-    if: github.ref == 'refs/heads/master' && github.event_name != 'pull_request'
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -78,10 +75,10 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v2.7.${{ github.run_number }}
+          tag_name: v2.8.${{ github.run_number }}
           files: ./artifacts/*
           fail_on_unmatched_files: true
-          name: LAC v2.7 Release
+          name: LAC v2.8 Release
           body: |
             ## What's Changed
 
@@ -91,7 +88,8 @@ jobs:
             - Transcript logging with `run_logged` + `task_log_path`
             - Doctor history JSONL + RAM-trend line
             - KV provenance `risk_level_full` with unit tests
-            - 120 tests passing (all units + 1 integration `router_intelligence`)
+            - Hermetic process-level gateway/CLI E2E smoke
+            - Rust and Swift delivery gates enforced by `make validate`
             - Clean release build, zero errors
 
             ### Binaries

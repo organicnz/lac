@@ -3,7 +3,7 @@
 //! v2.6 hardening over v2.5:
 //! - Shared `common` module (memory/thermal/ports/atomic writes/locks).
 //! - Worker is single-flight (lockdir), crash-recoverable
-//!   (~/.lac/worker-current restores the base branch on restart).
+//!   (~/.lac/worker-current preserves abandoned worktrees for review).
 //! - Queue updates target the task id (old `replacen("status: pending")`
 //!   could complete the WRONG task) via atomic writes, with an attempts
 //!   counter and dead-letter at 3.
@@ -21,11 +21,13 @@ use std::env;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
+use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-const VERSION: &str = "2.7-pro";
+const VERSION: &str = "2.8.0";
 const MAX_TASK_ATTEMPTS: u32 = 3;
 
 // ------------------------------------------------------------------ help ---
@@ -40,7 +42,7 @@ fn print_help() {
     println!("  daemon [install|uninstall|status] Manage macOS launchd background 24/7 services");
     println!("  status [--json]     Real-time stack health, ports, RAM, and thermals");
     println!("  serve [mlx|llama|ollama|auto] Start inference engine");
-    println!("  route [--daemon]    Launch unified intelligent router on :8000");
+    println!("  route [--daemon]    Launch unified intelligent router on :{}", common::gateway_port());
     println!("  stop                Stop router + inference servers started by lac");
     println!("  ps                  List lac-related processes and port table");
     println!("  logs [router|worker|mlx|llama] Tail daemon log files");
@@ -55,7 +57,7 @@ fn print_help() {
     println!("  kv [check|truncate] Context hygiene and memory leak prevention");
     println!("  loop [init|list|validate|run] Autonomous Kanban loop management");
     println!("  visualize           Launch SwiftUI dashboard visualizer");
-    println!("  chat \"prompt...\"      Single-shot chat through the :8000 gateway");
+    println!("  chat \"prompt...\"      Single-shot chat through the :{} gateway", common::gateway_port());
     println!("  code [-f file] \"...\"  Agentic Code Assistant (refactoring, tests, audits)");
     println!("  pull [model]        Pull model weights (MLX from Hugging Face or Ollama)");
     println!("  dashboard [--install] Launch dashboard, or install it to ~/.local/bin");
@@ -69,10 +71,12 @@ fn print_help() {
 /// Checks `.build/LAC Studio.app`, `LACStudio` binary, then `LAC_STUDIO` / `LAC_DASHBOARD`.
 fn cmd_visualize(root: &str) {
     if !common::port_up(common::gateway_port()) {
-        println!("Auto-starting lac-router on :8000 in background...");
+        let port = common::gateway_port();
+        println!("Auto-starting lac-router on :{} in background...", port);
         let router_bin = common::bin(root, "lac-router");
         let _ = Command::new(&router_bin)
-            .arg("8000")
+            .env("LAC_ROUTER_PORT", port.to_string())
+            .arg(port.to_string())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn();
@@ -164,7 +168,7 @@ fn cmd_chat(root: &str, args: &[String]) {
         std::process::exit(2);
     }
     if !common::port_up(common::gateway_port()) {
-        eprintln!("{} (gateway :8000 down).", NO_BACKEND_HINT);
+        eprintln!("{} (gateway :{} down).", NO_BACKEND_HINT, common::gateway_port());
         std::process::exit(1);
     }
     let model = env::var("LAC_CHAT_MODEL")
@@ -195,7 +199,7 @@ fn cmd_chat(root: &str, args: &[String]) {
             std::process::exit(1);
         }
         None => {
-            eprintln!("{} (gateway :8000 unreachable mid-request).", NO_BACKEND_HINT);
+            eprintln!("{} (gateway :{} unreachable mid-request).", NO_BACKEND_HINT, common::gateway_port());
             std::process::exit(1);
         }
     }
@@ -333,7 +337,7 @@ fn cmd_code(root: &str, args: &[String]) {
     }
 
     if !common::port_up(common::gateway_port()) {
-        eprintln!("{} (gateway :8000 down). Start with: lac route --daemon", NO_BACKEND_HINT);
+        eprintln!("{} (gateway :{} down). Start with: lac route --daemon", NO_BACKEND_HINT, common::gateway_port());
         std::process::exit(1);
     }
 
@@ -404,7 +408,7 @@ fn cmd_code(root: &str, args: &[String]) {
             std::process::exit(1);
         }
         None => {
-            eprintln!("{} (gateway :8000 unreachable mid-request).", NO_BACKEND_HINT);
+            eprintln!("{} (gateway :{} unreachable mid-request).", NO_BACKEND_HINT, common::gateway_port());
             std::process::exit(1);
         }
     }
@@ -447,10 +451,58 @@ fn cmd_dashboard(root: &str, args: &[String]) {
     cmd_visualize(root);
 }
 
+static PULL_CANCELLED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(unix)]
+fn install_pull_signal_handler() {
+    type Sighandler = unsafe extern "C" fn(std::ffi::c_int);
+    unsafe extern "C" {
+        fn signal(sig: std::ffi::c_int, handler: Sighandler) -> Sighandler;
+    }
+    unsafe extern "C" fn cancel(_: std::ffi::c_int) {
+        PULL_CANCELLED.store(true, Ordering::SeqCst);
+    }
+    unsafe {
+        signal(15, cancel);
+        signal(2, cancel);
+    }
+}
+
+#[cfg(not(unix))]
+fn install_pull_signal_handler() {}
+
+fn run_pull_command(command: &mut Command) -> i32 {
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(_) => return 1,
+    };
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.code().unwrap_or(1),
+            Ok(None) => {
+                if PULL_CANCELLED.load(Ordering::SeqCst) {
+                    kill_tree(child.id());
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return 130;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(_) => {
+                kill_tree(child.id());
+                let _ = child.kill();
+                let _ = child.wait();
+                return 1;
+            }
+        }
+    }
+}
+
 // --------------------------------------------------------------------- pull -
 
 /// Pull model weights from Hugging Face (MLX/GGUF) or Ollama into the local library.
-fn cmd_pull(_root: &str, args: &[String]) {
+fn cmd_pull(_root: &str, args: &[String]) -> i32 {
+    install_pull_signal_handler();
     let model = args.first().map(|s| s.trim()).filter(|s| !s.is_empty()).unwrap_or("qwen3.8-27b");
     println!("=== LAC Model Pull: {} ===", model);
 
@@ -461,48 +513,41 @@ fn cmd_pull(_root: &str, args: &[String]) {
         let hf_hub = format!("{}/hf/hub", common::model_base());
         let _ = fs::create_dir_all(&hf_hub);
 
-        if let Some(cli) = common::which("huggingface-cli") {
-            println!("Downloading via huggingface-cli into {}...", hf_hub);
-            let status = Command::new(cli)
-                .args(["download", model, "--local-dir-use-symlinks", "False"])
-                .status();
-            match status {
-                Ok(s) if s.success() => {
-                    println!("✓ Successfully downloaded {} to local cache.", model);
-                }
-                Ok(s) => eprintln!("huggingface-cli exited with status {}", s),
-                Err(e) => eprintln!("Failed to run huggingface-cli: {}", e),
+        if let Some(cli) = common::which("hf").or_else(|| common::which("huggingface-cli")) {
+            println!("Downloading via Hugging Face CLI into {}...", hf_hub);
+            let mut command = Command::new(cli);
+            command
+                .args(["download", model])
+                .env("HF_HOME", format!("{}/hf", common::model_base()))
+                .env("HF_HUB_CACHE", hf_hub.clone());
+            let code = run_pull_command(&mut command);
+            if code == 0 {
+                println!("✓ Successfully downloaded {} to local cache.", model);
+            } else if code == 130 {
+                eprintln!("Download cancelled.");
+            } else {
+                eprintln!("huggingface-cli exited with status {}", code);
             }
-        } else if let Some(py) = common::which("python3").or_else(|| common::which("python")) {
-            println!("Downloading via Python huggingface_hub snapshot_download...");
-            let script = format!(
-                "from huggingface_hub import snapshot_download; snapshot_download('{}')",
-                common::json_escape(model)
-            );
-            let status = Command::new(py).args(["-c", &script]).status();
-            match status {
-                Ok(s) if s.success() => println!("✓ Download complete for {}.", model),
-                Ok(s) => eprintln!("Download exited with status {}.", s),
-                Err(e) => eprintln!("Failed to run python download: {}", e),
-            }
-        } else {
-            eprintln!("Neither huggingface-cli nor python3 found in PATH.");
-            eprintln!("Install: pip install huggingface_hub  (or: brew install huggingface-cli)");
+            return code;
         }
+        eprintln!("Hugging Face CLI not found in PATH; install `brew install hf` before pulling models.");
+        return 1;
+    } else if let Some(ollama) = common::which("ollama") {
+        println!("Pulling Ollama model: {}", model);
+        let mut command = Command::new(ollama);
+        command.arg("pull").arg(model);
+        let code = run_pull_command(&mut command);
+        if code == 0 {
+            println!("✓ Successfully pulled Ollama model: {}", model);
+        } else if code == 130 {
+            eprintln!("Download cancelled.");
+        } else {
+            eprintln!("ollama pull exited with status {}", code);
+        }
+        return code;
     } else {
-        if let Some(ollama) = common::which("ollama") {
-            println!("Pulling Ollama model: {}", model);
-            let status = Command::new(ollama).arg("pull").arg(model).status();
-            match status {
-                Ok(s) if s.success() => {
-                    println!("✓ Successfully pulled Ollama model: {}", model);
-                }
-                Ok(s) => eprintln!("ollama pull exited with {}", s),
-                Err(e) => eprintln!("Failed to invoke ollama: {}", e),
-            }
-        } else {
-            eprintln!("ollama not found in PATH — install: brew install ollama");
-        }
+        eprintln!("ollama not found in PATH — install: brew install ollama");
+        1
     }
 }
 
@@ -643,7 +688,7 @@ fn cmd_status(root: &str, args: &[String]) {
     println!("  INFERENCE SERVICES (TCP probe):");
     println!(
         "  - LAC Gateway  : {}",
-        if gw { "ONLINE (:8000)" } else { "OFFLINE" }
+        if gw { format!("ONLINE (:{})", common::gateway_port()) } else { "OFFLINE".to_string() }
     );
     if mlx {
         println!("  - MLX (Q4 MTP) : ONLINE (:{})", mlx_port);
@@ -668,7 +713,7 @@ fn cmd_status(root: &str, args: &[String]) {
             println!("   lac serve mlx    (Speed Q4, native MTP ~45 tok/s)");
         }
         println!("   lac serve llama  (Quality Q8_0)");
-        println!("   lac route        (Start gateway on :8000)");
+        println!("   lac route        (Start gateway on :{})", common::gateway_port());
     }
 }
 
@@ -877,9 +922,9 @@ fn cmd_doctor(root: &str, args: &[String]) -> i32 {
         name: "svc_gateway",
         level: if gw_up { "ok" } else { "warn" },
         detail: if gw_up {
-            "gateway :8000 accepting".to_string()
+            format!("gateway :{} accepting", common::gateway_port())
         } else {
-            "gateway :8000 down (start with lac route --daemon)".to_string()
+            format!("gateway :{} down (start with lac route --daemon)", common::gateway_port())
         },
     });
     if !any_backend {
@@ -1345,7 +1390,7 @@ fn cmd_hermes(root: &str, args: &[String]) {
             let (pending, dead) = count_pending(&content);
             let total = parse_tasks(&content).len();
             println!("  Queue   : {} ({} total, {} retryable pending, {} dead-letter)", tasks_file, total, pending, dead);
-            println!("  Gateway : http://127.0.0.1:8000/v1 ({})", if common::port_up(common::gateway_port()) { "online" } else { "offline" });
+            println!("  Gateway : http://127.0.0.1:{}/v1 ({})", common::gateway_port(), if common::port_up(common::gateway_port()) { "online" } else { "offline" });
             println!("  Thermal : {}", common::thermal_state());
             println!("  Model   : {}", opencode_model(root));
             println!("  Loops   : {}/todo/lac-loops", home);
@@ -1514,9 +1559,9 @@ fn cmd_loop_run(root: &str, target: Option<&str>, dry_run: bool) {
     println!("\x1b[1;34m[1/5 PREFLIGHT]\x1b[0m Verifying resident model, context cap & thermals...");
     let gateway_up = common::port_up(common::gateway_port());
     if gateway_up {
-        println!("  ✓ Gateway :8000 online");
+        println!("  ✓ Gateway :{} online", common::gateway_port());
     } else {
-        println!("  ! Gateway :8000 inactive. Running offline simulation.");
+        println!("  ! Gateway :{} inactive. Running offline simulation.", common::gateway_port());
     }
     println!("  ✓ Context cap <= 32K verified (AGENTS.md policy)");
     println!("  ✓ Apple Silicon thermals: Nominal");
@@ -1689,7 +1734,14 @@ fn cmd_daemon(root: &str, args: &[String]) {
                         } else {
                             release_lac
                         };
-                        let out = common::retarget_launchd_plist(&content, &home, root, &want_bin);
+                        let mut out = common::retarget_launchd_plist(&content, &home, root, &want_bin);
+                        if label == "org.lac.router" {
+                            let port = common::gateway_port().to_string();
+                            out = out.replace(
+                                "<key>LAC_ROUTER_PORT</key>\n    <string>8000</string>",
+                                &format!("<key>LAC_ROUTER_PORT</key>\n    <string>{}</string>", port),
+                            );
+                        }
                         match common::atomic_write(&dst, &out) {
                             Ok(()) => println!("  [ok] Placed: {}", dst),
                             Err(e) => println!("  [x] Write {} failed: {}", dst, e),
@@ -1961,6 +2013,18 @@ fn update_task(content: &str, id: &str, new_status: &str, bump_attempts: bool) -
     }
     s
 }
+
+fn update_task_file(path: &str, id: &str, status: &str, bump_attempts: bool) -> bool {
+    let Some(_lock) = common::acquire_lock("lac-tasks", 30) else {
+        eprintln!("warning: queue lock busy; update deferred for {}", id);
+        return false;
+    };
+    let Ok(content) = fs::read_to_string(path) else {
+        return false;
+    };
+    common::atomic_write(path, &update_task(&content, id, status, bump_attempts)).is_ok()
+}
+
 
 /// Deterministic fallback order: first retryable pending task in file
 /// order. Judgment (`judge_next`) falls back to exactly this on any
@@ -2236,7 +2300,7 @@ fn review_diff(root: &str, task_desc: &str, logpath: &str) -> ReviewOutcome {
         return ReviewOutcome::Unavailable("LAC_REVIEW=off".to_string());
     }
     if !common::port_up(common::gateway_port()) {
-        return ReviewOutcome::Unavailable("gateway :8000 down".to_string());
+        return ReviewOutcome::Unavailable(format!("gateway :{} down", common::gateway_port()));
     }
     let diff = worker_diff(root);
     if diff.trim().is_empty() {
@@ -2457,17 +2521,12 @@ fn cmd_worker(root: &str, args: &[String]) {
         }
     };
 
-    // Crash recovery: a previous run may have died mid-task on a branch.
-    if let Ok(prev) = fs::read_to_string(worker_current_path()) {
-        let base = prev.lines().find_map(|l| {
-            let t = l.trim();
-            t.strip_prefix("base:").map(|v| v.trim().to_string())
-        });
-        if let Some(b) = base {
-            git_in(root, &["checkout", &b]);
-            common::log_event("worker_recover", &format!("restored base branch {}", b));
-            println!("Recovered from previous crash; restored branch {}.", b);
-        }
+    // Crash recovery: worktrees are isolated, so never checkout or reset the
+    // operator tree while recovering. Preserve any abandoned worktree for
+    // human review and clear only the marker.
+    if fs::metadata(worker_current_path()).is_ok() {
+        common::log_event("worker_recover_preserved", "abandoned worktree retained for human review");
+        println!("Previous worker state found; preserving its worktree for human review.");
         let _ = fs::remove_file(worker_current_path());
     }
 
@@ -2475,8 +2534,9 @@ fn cmd_worker(root: &str, args: &[String]) {
     if !common::port_up(common::gateway_port()) {
         let router_bin = common::bin(root, "lac-router");
         if fs::metadata(&router_bin).is_ok() {
-            println!("Starting LAC Unified Gateway on :8000 in background...");
+            println!("Starting LAC Unified Gateway on :{} in background...", common::gateway_port());
             match Command::new(&router_bin)
+                .env("LAC_ROUTER_PORT", common::gateway_port().to_string())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .spawn()
@@ -2491,7 +2551,7 @@ fn cmd_worker(root: &str, args: &[String]) {
                 Err(e) => println!("  [!] Router spawn failed: {}", e),
             }
             if common::wait_for_port(common::gateway_port(), Duration::from_secs(10)) {
-                println!("  [ok] LAC Gateway online on http://127.0.0.1:8000/v1");
+                println!("  [ok] LAC Gateway online on http://127.0.0.1:{}/v1", common::gateway_port());
             } else {
                 println!("  [!] Gateway did not come up; worker continues, backends probed directly.");
             }
@@ -2588,6 +2648,14 @@ fn cmd_worker(root: &str, args: &[String]) {
         // `task` is only borrowed below so its strike can still be
         // counted afterwards if the closure unwinds.
         let task_id = task.id.clone();
+        let task_branched = Arc::new(AtomicBool::new(false));
+        let worktree_path = format!(
+            "{}/.lac/worker-worktrees/{}-a{}-{}",
+            home,
+            task.id,
+            task.attempts + 1,
+            std::process::id()
+        );
         let survived = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         println!("\nProcessing queued task [{}]: \"{}\" (attempt {}/{})", task.id, task.desc, task.attempts + 1, MAX_TASK_ATTEMPTS);
         common::log_event("task_start", &format!("[{}] {}", task.id, task.desc));
@@ -2600,26 +2668,52 @@ fn cmd_worker(root: &str, args: &[String]) {
                 .output();
         }
 
-        // Branch only on clean, committed repos. A dirty tree means the
-        // human has work in flight: stay put and never reset it.
         let was_dirty = common::repo_dirty_in(root);
-        let branched: Option<String> = if has_commits && !was_dirty {
+        let branched: Option<String> = if has_commits {
             let branch = format!("task/{}", task.id);
-            println!("  [2/4] Isolated branch: {}", branch);
-            if git_in(root, &["checkout", "-B", &branch]) {
+            let _ = fs::create_dir_all(
+                Path::new(&worktree_path)
+                    .parent()
+                    .unwrap_or_else(|| Path::new(&home)),
+            );
+            println!("  [2/4] Isolated worktree: {}", branch);
+            let branch_ref = format!("refs/heads/{}", branch);
+            let branch_exists = git_in(root, &["show-ref", "--verify", "--quiet", &branch_ref]);
+            let added = if branch_exists {
+                git_in(root, &["worktree", "add", &worktree_path, &branch])
+            } else {
+                git_in(root, &["worktree", "add", "-b", &branch, &worktree_path])
+            };
+            if added {
                 Some(branch)
             } else {
-                println!("  [!] Branch creation failed; working on {}", base_branch);
+                println!("  [!] Worktree creation failed; refusing to mutate the operator tree.");
                 None
             }
         } else {
-            if was_dirty {
-                println!("  [2/4] Tree dirty — staying on current branch, failure will NOT reset.");
-            } else {
-                println!("  [2/4] No commits yet — working tree used directly.");
-            }
+            println!("  [2/4] No commits yet — working tree used directly.");
             None
         };
+        let work_root = branched
+            .as_ref()
+            .map(|_| worktree_path.clone())
+            .unwrap_or_else(|| root.to_string());
+        task_branched.store(branched.is_some(), Ordering::SeqCst);
+        if has_commits && branched.is_none() {
+            let bumped = task.attempts + 1;
+            let status = if bumped >= MAX_TASK_ATTEMPTS {
+                println!("  Task [{}] reached {} attempts — dead-letter.", task.id, MAX_TASK_ATTEMPTS);
+                common::log_event("task_dead_letter", &format!("[{}]", task.id));
+                "failed"
+            } else {
+                "pending"
+            };
+            if !update_task_file(&tasks_file, &task.id, status, true) {
+                common::log_event("task_update_failed", &format!("task {}", task.id));
+            }
+            let _ = fs::remove_file(worker_current_path());
+            return;
+        }
 
         println!("  [3/4] Dispatching to OpenCode V2 (@coder)...");
         let prompt = format!(
@@ -2631,7 +2725,7 @@ fn cmd_worker(root: &str, args: &[String]) {
         let mut impl_ok = run_logged(
             "opencode2",
             &["run", &prompt],
-            root,
+            &work_root,
             timeout,
             &logpath,
             &format!("opencode2 task {}", task.id),
@@ -2642,7 +2736,7 @@ fn cmd_worker(root: &str, args: &[String]) {
             println!("  [3b/4] Reliability gate: project tests...");
             // Fail-closed: a test runner that cannot even spawn must never
             // count as "tests passed" (that would commit untested code).
-            run_logged("make", &["test"], root, Duration::from_secs(600), &logpath, "make test")
+            run_logged("make", &["test"], &work_root, Duration::from_secs(600), &logpath, "make test")
                 .unwrap_or(false)
         } else {
             false
@@ -2657,7 +2751,7 @@ fn cmd_worker(root: &str, args: &[String]) {
             let mut round: u32 = 0;
             loop {
                 round += 1;
-                match review_diff(root, &task.desc, &logpath) {
+                match review_diff(&work_root, &task.desc, &logpath) {
                     ReviewOutcome::Approve => {
                         println!("  [3c/4] Reviewer round {}: approve.", round);
                         common::log_event("review_approve", &format!("[{}] round {}", task.id, round));
@@ -2681,7 +2775,7 @@ fn cmd_worker(root: &str, args: &[String]) {
                                 impl_ok = run_logged(
                                     "opencode2",
                                     &["run", &fix_prompt],
-                                    root,
+                                    &work_root,
                                     timeout,
                                     &logpath,
                                     &format!("opencode2 fix {} r{}", task.id, round),
@@ -2689,7 +2783,7 @@ fn cmd_worker(root: &str, args: &[String]) {
                                 .unwrap_or(false);
                                 test_ok = if impl_ok {
                                     println!("  [3b/4] Reliability gate (post-fix): project tests...");
-                                    run_logged("make", &["test"], root, Duration::from_secs(600), &logpath, "make test")
+                                    run_logged("make", &["test"], &work_root, Duration::from_secs(600), &logpath, "make test")
                                         .unwrap_or(false)
                                 } else {
                                     false
@@ -2714,65 +2808,84 @@ fn cmd_worker(root: &str, args: &[String]) {
 
         if impl_ok && test_ok {
             println!("  [4/4] Tests passed{}.", if review_flagged { " (review findings unresolved — flagged)" } else { "" });
-            if has_commits {
-                git_in(root, &["add", "-A"]);
+            if has_commits && branched.is_some() {
+                git_in(&work_root, &["add", "-A"]);
                 let msg = format!("feat({}): {}", task.id, task.desc.chars().take(120).collect::<String>());
-                git_in(root, &["commit", "-m", &msg]);
+                git_in(&work_root, &["commit", "-m", &msg]);
+            } else if was_dirty {
+                println!("  Operator tree was dirty; changes remain uncommitted for human review.");
+                review_flagged = true;
             }
             println!("  Task [{}] complete.", task.id);
             common::log_event("task_complete", &format!("[{}] review_flagged={}", task.id, review_flagged));
-            if let Ok(c) = fs::read_to_string(&tasks_file) {
-                common::persist_or_warn(&tasks_file, &update_task(&c, &task.id, "complete", false), "task_complete");
+            if !update_task_file(&tasks_file, &task.id, "complete", false) {
+                common::log_event("task_update_failed", &format!("task {}", task.id));
             }
         } else {
             println!("  Task [{}] failed reliability gate.", task.id);
             common::log_event("task_failed", &format!("[{}] attempt {}", task.id, task.attempts + 1));
-            if branched.is_some() && !was_dirty {
-                // Tree was clean and all changes are ours: reset tracked
-                // mods AND remove untracked task debris so the next task
-                // starts clean. Never runs on a pre-dirty tree.
-                git_in(root, &["checkout", "--", "."]);
-                git_in(root, &["clean", "-fd"]);
+            if branched.is_some() {
+                let stash_label = format!("lac failed task {} attempt {}", task.id, task.attempts + 1);
+                if git_in(&work_root, &["stash", "push", "-u", "-m", &stash_label]) {
+                    println!("  Preserved failed-task changes in git stash '{}'.", stash_label);
+                } else {
+                    println!("  Could not preserve failed-task changes; leaving the worktree for manual recovery.");
+                }
+                if !git_in(root, &["worktree", "remove", "--force", &worktree_path]) {
+                    println!("  Failed worktree remains at {}.", worktree_path);
+                }
             } else if was_dirty {
                 println!("  Leaving working tree untouched (was dirty before task).");
             }
-            if let Ok(c) = fs::read_to_string(&tasks_file) {
-                let bumped = task.attempts + 1;
-                let status = if bumped >= MAX_TASK_ATTEMPTS {
-                    println!("  Task [{}] reached {} attempts — dead-letter.", task.id, MAX_TASK_ATTEMPTS);
-                    common::log_event("task_dead_letter", &format!("[{}]", task.id));
-                    "failed"
-                } else {
-                    "pending"
-                };
-                common::persist_or_warn(&tasks_file, &update_task(&c, &task.id, status, true), "task_attempt_bump");
+            let bumped = task.attempts + 1;
+            let status = if bumped >= MAX_TASK_ATTEMPTS {
+                println!("  Task [{}] reached {} attempts — dead-letter.", task.id, MAX_TASK_ATTEMPTS);
+                common::log_event("task_dead_letter", &format!("[{}]", task.id));
+                "failed"
+            } else {
+                "pending"
+            };
+            if !update_task_file(&tasks_file, &task.id, status, true) {
+                common::log_event("task_update_failed", &format!("task {}", task.id));
             }
         }
 
         if branched.is_some() {
-            git_in(root, &["checkout", &base_branch]);
+            if !git_in(root, &["worktree", "remove", "--force", &worktree_path]) {
+                common::log_event("worker_cleanup_blocked", &format!("task {} worktree remains at {}", task.id, worktree_path));
+            } else {
+                let _ = fs::remove_file(worker_current_path());
+            }
+        } else if !was_dirty {
+            let _ = fs::remove_file(worker_current_path());
         }
-        let _ = fs::remove_file(worker_current_path());
         }));
         if survived.is_err() {
             println!("  Task [{}] panicked; daemon survives. Counting a strike.", task_id);
             common::log_event("task_panic", &format!("[{}] worker caught panic; state reset", task_id));
-            // Best-effort reset: plain `checkout` never discards user work,
-            // it only fails when local mods would be overwritten.
-            git_in(root, &["checkout", &base_branch]);
-            let _ = fs::remove_file(worker_current_path());
+            if task_branched.load(Ordering::SeqCst) {
+                let panic_stash = format!("lac panicked task {} attempt {}", task_id, task.attempts + 1);
+                let _ = git_in(&worktree_path, &["stash", "push", "-u", "-m", &panic_stash]);
+                if git_in(root, &["worktree", "remove", "--force", &worktree_path]) {
+                    let _ = fs::remove_file(worker_current_path());
+                } else {
+                    common::log_event("worker_recovery_blocked", &format!("task {} worktree remains at {}", task_id, worktree_path));
+                }
+            } else {
+                common::log_event("worker_recovery_blocked", &format!("task {} preserved unbranched tree", task_id));
+            }
             // A deterministically-poisoned task must dead-letter after 3
             // strikes, not hot-loop the daemon forever.
-            if let Ok(c) = fs::read_to_string(&tasks_file) {
-                let bumped = task.attempts + 1;
-                let status = if bumped >= MAX_TASK_ATTEMPTS {
-                    println!("  Task [{}] reached {} attempts — dead-letter.", task_id, MAX_TASK_ATTEMPTS);
-                    common::log_event("task_dead_letter", &format!("[{}]", task_id));
-                    "failed"
-                } else {
-                    "pending"
-                };
-                common::persist_or_warn(&tasks_file, &update_task(&c, &task_id, status, true), "task_panic_bump");
+            let bumped = task.attempts + 1;
+            let status = if bumped >= MAX_TASK_ATTEMPTS {
+                println!("  Task [{}] reached {} attempts — dead-letter.", task_id, MAX_TASK_ATTEMPTS);
+                common::log_event("task_dead_letter", &format!("[{}]", task_id));
+                "failed"
+            } else {
+                "pending"
+            };
+            if !update_task_file(&tasks_file, &task_id, status, true) {
+                common::log_event("task_update_failed", &format!("task {}", task_id));
             }
         }
 
@@ -2884,13 +2997,13 @@ fn cmd_config(root: &str) {
     println!("=== LAC effective configuration ===");
     println!("  version      : {}", VERSION);
     println!("  root         : {}", root);
-    println!("  gateway      : {}", e("LAC_GATEWAY_URL", "http://127.0.0.1:8000/v1"));
-    println!("  router_port  : {}", e("LAC_ROUTER_PORT", "8000"));
+    println!("  gateway      : {}", e("LAC_GATEWAY_URL", &format!("http://127.0.0.1:{}/v1", common::gateway_port())));
+    println!("  router_port  : {}", common::gateway_port());
     println!("  bind_addr    : {}", e("LAC_BIND_ADDR", &e("LAC_ROUTER_HOST", "127.0.0.1")));
     println!(
         "  auth         : {}",
         if env::var("LAC_API_TOKEN").map(|s| !s.trim().is_empty()).unwrap_or(false) {
-            "Bearer remote, open loopback (token set, redacted)"
+            "Bearer required on every listener (token set, redacted)"
         } else {
             "none (loopback only)"
         }
@@ -2978,8 +3091,10 @@ fn main() {
         "route" | "router" => {
             let is_daemon = args.iter().any(|a| a == "--daemon" || a == "-d");
             if is_daemon {
-                println!("Starting lac-router on :8000 in background...");
+                let port = common::gateway_port();
+                println!("Starting lac-router on :{} in background...", port);
                 match Command::new(common::bin(&root, "lac-router"))
+                    .env("LAC_ROUTER_PORT", port.to_string())
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())
                     .spawn()
@@ -2997,7 +3112,9 @@ fn main() {
                     }
                 }
             } else {
-                let _ = Command::new(common::bin(&root, "lac-router")).status();
+                let _ = Command::new(common::bin(&root, "lac-router"))
+                    .env("LAC_ROUTER_PORT", common::gateway_port().to_string())
+                    .status();
             }
         }
         "tui" => {
@@ -3019,7 +3136,7 @@ fn main() {
         "models" => {
             let _ = Command::new(common::bin(&root, "pull-models")).status();
         }
-        "pull" => cmd_pull(&root, &args[1..]),
+        "pull" => std::process::exit(cmd_pull(&root, &args[1..])),
         "version" | "-v" | "--version" => {
             println!("LAC (Local Agentic Coding) v{}", VERSION);
             println!("Engine: Qwen 3.8 27B Dense Hybrid VLM (MTP enabled)");

@@ -247,7 +247,7 @@ public class ModelHubStore: ObservableObject {
     @Published public var isLoadingRepoFiles: Bool = false
     @Published public var repoFilesError: String? = nil
 
-    public enum ModelFilter: String, CaseIterable, Identifiable {
+    public enum ModelFilter: String, CaseIterable, Identifiable, Sendable {
         case appleSilicon = "Apple Silicon"
         case mlx = "MLX Native"
         case gguf = "GGUF (llama.cpp)"
@@ -258,7 +258,7 @@ public class ModelHubStore: ObservableObject {
         public var id: String { rawValue }
     }
 
-    public enum ModelSizeFilter: String, CaseIterable, Identifiable {
+    public enum ModelSizeFilter: String, CaseIterable, Identifiable, Sendable {
         case all = "All Sizes"
         case small = "≤ 13B (Fast)"
         case medium = "14B – 69B (Balanced)"
@@ -517,11 +517,16 @@ public class ModelHubStore: ObservableObject {
     }
 
     public func revealInFinder(item: InstalledModelItem) {
+        guard !LACConnectionStore.shared.isRemote else { return }
         let url = URL(fileURLWithPath: item.path)
         NSWorkspace.shared.activateFileViewerSelecting([url])
     }
 
     public func deleteInstalledModel(item: InstalledModelItem) {
+        guard !LACConnectionStore.shared.isRemote else {
+            errorMessage = "Remote mode: model deletion is disabled on this client."
+            return
+        }
         try? FileManager.default.removeItem(atPath: item.path)
         scanInstalledModels()
     }

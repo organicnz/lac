@@ -93,6 +93,7 @@ class NetworkManager: ObservableObject {
     @Published var pullOutput: String?
     @Published var pullProgress: Double?
     private var pullProcess: Process?
+    private var routerStartInFlight = false
 
     /// Shared tailnet-ready connection (local 127.0.0.1 default, remote
     /// Tailscale IP/MagicDNS + Keychain Bearer token). All URLs flow here.
@@ -128,7 +129,7 @@ class NetworkManager: ObservableObject {
         daemonInstalled = FileManager.default.fileExists(atPath: plist)
     }
 
-    func fetch(clearLastError: Bool = true) {
+    func fetch(clearLastError: Bool = true, allowAutoStart: Bool = true) {
         // Coalesce overlapping polls (3s dashboard ticker + manual refresh).
         guard !isChecking else { return }
         isChecking = true
@@ -137,6 +138,7 @@ class NetworkManager: ObservableObject {
                 guard let url = connection.url(path: "/lac/status") else {
                     await MainActor.run {
                         self.lastError = "Invalid router URL (\(connection.displayName))"
+                        self.isChecking = false
                     }
                     return
                 }
@@ -158,7 +160,10 @@ class NetworkManager: ObservableObject {
                 await MainActor.run {
                     self.lastError = error.localizedDescription
                     self.isChecking = false
-                    if !self.hasAutoStartedRouter {
+                    if self.isRemote {
+                        self.hasAutoStartedRouter = false
+                    }
+                    if allowAutoStart && !self.isRemote && !self.hasAutoStartedRouter {
                         self.hasAutoStartedRouter = true
                         Task { await self.startRouter() }
                     }
@@ -173,6 +178,10 @@ class NetworkManager: ObservableObject {
 
     /// Host facts via `lac status --json` (never blocks the router card).
     func fetchHostFacts() async {
+        guard !isRemote else {
+            host = nil
+            return
+        }
         let out = await runLac(["status", "--json"])
         guard let data = out.data(using: .utf8),
               let decoded = try? JSONDecoder().decode(LacStatusJson.self, from: data)
@@ -182,60 +191,57 @@ class NetworkManager: ObservableObject {
 
     @discardableResult
     func runLac(_ args: [String], timeoutSeconds: Double = 30) async -> String {
-        await withCheckedContinuation { cont in
-            DispatchQueue.global().async {
-                let exe = Self.lacExecutable()
-                let p = Process()
-                p.executableURL = exe.url
-                p.arguments = exe.prefix + args
-                let pipe = Pipe()
-                p.standardOutput = pipe
-                p.standardError = pipe
-                // Resume-once guard: the timeout path (kill) and the wait
-                // path below race by design, so the flag is lock-guarded —
-                // a double-resume crashes a CheckedContinuation.
-                let state = NSLock()
-                var resumed = false
-                func resumeOnce(_ s: String) {
-                    state.lock()
-                    defer { state.unlock() }
-                    guard !resumed else { return }
-                    resumed = true
-                    cont.resume(returning: s)
-                }
-                // Timeout escalates TERM → INT → KILL. The `waitUntilExit`
-                // below then returns and the real (partial) output is
-                // delivered — a SIGTERM-ignoring child can no longer wedge
-                // this worker thread forever.
-                DispatchQueue.global().asyncAfter(deadline: .now() + timeoutSeconds) {
+        let routerPort = port
+        let apiToken = connection.token
+        return await Task.detached(priority: .utility) { () -> String in
+            let exe = Self.lacExecutable()
+            let p = Process()
+            p.executableURL = exe.url
+            p.arguments = exe.prefix + args
+            var environment = ProcessInfo.processInfo.environment
+            environment["LAC_ROUTER_PORT"] = String(routerPort)
+            if !apiToken.isEmpty {
+                environment["LAC_API_TOKEN"] = apiToken
+            }
+            p.environment = environment
+            let pipe = Pipe()
+            p.standardOutput = pipe
+            p.standardError = pipe
+            DispatchQueue.global().asyncAfter(deadline: .now() + timeoutSeconds) {
+                guard p.isRunning else { return }
+                p.terminate()
+                DispatchQueue.global().asyncAfter(deadline: .now() + 2) {
                     guard p.isRunning else { return }
-                    p.terminate()
+                    p.interrupt()
                     DispatchQueue.global().asyncAfter(deadline: .now() + 2) {
-                        guard p.isRunning else { return }
-                        p.interrupt()
-                        DispatchQueue.global().asyncAfter(deadline: .now() + 2) {
-                            if p.isRunning { Darwin.kill(p.processIdentifier, SIGKILL) }
-                        }
+                        if p.isRunning { Darwin.kill(p.processIdentifier, SIGKILL) }
                     }
                 }
-                do {
-                    try p.run()
-                    p.waitUntilExit()
-                    let s = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-                    resumeOnce(s)
-                } catch {
-                    resumeOnce("")
-                }
             }
-        }
+            do {
+                try p.run()
+                p.waitUntilExit()
+                return String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+            } catch {
+                return ""
+            }
+        }.value
     }
 
     func spawnDetachedLac(_ args: [String]) {
+        let routerPort = port
+        let apiToken = connection.token
         DispatchQueue.global().async {
             let exe = Self.lacExecutable()
             let p = Process()
             p.executableURL = exe.url
             p.arguments = exe.prefix + args
+            var environment = ProcessInfo.processInfo.environment
+            environment["LAC_ROUTER_PORT"] = String(routerPort)
+            if !apiToken.isEmpty {
+                environment["LAC_API_TOKEN"] = apiToken
+            }
+            p.environment = environment
             let nullDev = FileHandle.nullDevice
             p.standardOutput = nullDev
             p.standardError = nullDev
@@ -313,9 +319,19 @@ class NetworkManager: ObservableObject {
         return String(format: "%.0f MB", Double(bytes) / (1024.0 * 1024.0))
     }
 
-    func stopAll() async { _ = await runLac(["stop"]) }
+    func stopAll() async {
+        guard !isRemote else {
+            lastAction = "Remote tailnet: stop services on the Mac, not here."
+            return
+        }
+        _ = await runLac(["stop"])
+    }
 
     func pullModel(_ modelId: String, expectedBytes: Int64? = nil) {
+        guard !isRemote else {
+            lastAction = "Remote tailnet: pull models on the Mac, not here."
+            return
+        }
         guard pullingModelId == nil else { return }
         // Disk preflight: refuse before spawning when the download
         // provably does not fit (15% headroom for temp files).
@@ -343,6 +359,12 @@ class NetworkManager: ObservableObject {
         let p = Process()
         p.executableURL = exe.url
         p.arguments = exe.prefix + ["pull", modelId]
+        var environment = ProcessInfo.processInfo.environment
+        environment["LAC_ROUTER_PORT"] = String(port)
+        if !connection.token.isEmpty {
+            environment["LAC_API_TOKEN"] = connection.token
+        }
+        p.environment = environment
         let pipe = Pipe()
         p.standardOutput = pipe
         p.standardError = pipe
@@ -375,7 +397,7 @@ class NetworkManager: ObservableObject {
                 DispatchQueue.main.async {
                     if p.terminationStatus != 0 {
                         // Terminated by user cancel (SIGTERM) — not a failure.
-                        if p.terminationStatus == 15 {
+                        if p.terminationStatus == 15 || p.terminationStatus == 130 {
                             self.lastAction = "Pull cancelled"
                         } else {
                             self.lastError = "Pull failed with status \(p.terminationStatus)"
@@ -471,62 +493,70 @@ class NetworkManager: ObservableObject {
     /// Start the gateway in the background, poll until responsive, then refresh.
     /// No-op on remote tailnet (the Mac owns the router there).
     func startRouter() async {
-        guard !isRemote else { return }
-        await MainActor.run {
-            self.lastAction = "Starting lac-router on :\(port)..."
-            self.isChecking = true
-        }
+        guard !isRemote, !routerStartInFlight else { return }
+        routerStartInFlight = true
+        defer { routerStartInFlight = false }
+        hasAutoStartedRouter = false
+        lastAction = "Starting lac-router on :\(port)..."
+        isChecking = true
 
         let home = NSHomeDirectory()
-        // 1. If daemon plist exists, install / start via launchctl
         let plist = "\(home)/Library/LaunchAgents/org.lac.router.plist"
-        if FileManager.default.fileExists(atPath: plist) {
+        if FileManager.default.fileExists(atPath: plist) && connection.token.isEmpty {
             _ = await runLac(["daemon", "install"])
         } else {
-            // 2. Otherwise start via `lac route --daemon`
             let out = await runLac(["route", "--daemon"])
-            if !out.isEmpty {
-                await MainActor.run {
-                    self.lastAction = out.split(separator: "\n").first.map(String.init)
-                }
+            if let first = out.split(separator: "\n").first {
+                lastAction = String(first)
             }
         }
 
-        // 3. Fallback: if port is still not responding, execute lac-router binary directly
+        for _ in 0..<6 {
+            try? await Task.sleep(nanoseconds: 500_000_000)
+            if await checkRouterHealth() {
+                autoRefreshPaused = false
+                lastError = nil
+                isChecking = false
+                fetch()
+                return
+            }
+        }
+
         let routerCandidates = [
             "\(home)/.local/bin/lac-router",
             "/opt/homebrew/bin/lac-router",
             "/usr/local/bin/lac-router"
         ]
-        for cand in routerCandidates {
-            if FileManager.default.isExecutableFile(atPath: cand) {
-                let p = Process()
-                p.executableURL = URL(fileURLWithPath: cand)
-                p.arguments = ["\(port)"]
-                p.standardOutput = FileHandle.nullDevice
-                p.standardError = FileHandle.nullDevice
-                try? p.run()
-                break
+        if let candidate = routerCandidates.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) {
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: candidate)
+            p.arguments = ["\(port)"]
+            var environment = ProcessInfo.processInfo.environment
+            environment["LAC_ROUTER_PORT"] = String(port)
+            if !connection.token.isEmpty {
+                environment["LAC_API_TOKEN"] = connection.token
             }
+            p.environment = environment
+            p.standardOutput = FileHandle.nullDevice
+            p.standardError = FileHandle.nullDevice
+            try? p.run()
         }
 
-        // Poll up to 6 times (3 seconds) for the router to become ready
         for _ in 0..<6 {
             try? await Task.sleep(nanoseconds: 500_000_000)
             if await checkRouterHealth() {
-                await MainActor.run {
-                    self.autoRefreshPaused = false
-                    self.lastError = nil
-                    self.isChecking = false
-                    self.fetch()
-                }
+                autoRefreshPaused = false
+                lastError = nil
+                isChecking = false
+                fetch()
                 return
             }
         }
 
-        await MainActor.run {
-            self.fetch()
-        }
+        lastError = "Router did not become ready on :\(port)."
+        lastAction = "Router start failed"
+        isChecking = false
+        fetch(allowAutoStart: false)
     }
 
     func checkRouterHealth() async -> Bool {

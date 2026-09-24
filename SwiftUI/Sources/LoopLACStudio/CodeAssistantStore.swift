@@ -172,6 +172,7 @@ impl<T: Copy, const N: usize> RingBuffer<T, N> {
     private var port: Int { connection.port }
 
     private var streamTask: Task<Void, Never>?
+    private var streamGeneration: UInt64 = 0
 
     public init() {
         let initialTab = EditorTab(
@@ -315,6 +316,8 @@ impl<T: Copy, const N: usize> RingBuffer<T, N> {
         streamResponse = ""
         isProcessing = true
         lastInstruction = instruction
+        streamGeneration &+= 1
+        let generation = streamGeneration
 
         let code = sourceCode.trimmingCharacters(in: .whitespacesAndNewlines)
         let lang = selectedLanguage
@@ -334,25 +337,33 @@ Task: \(instruction)
 """
         }
 
-        streamTask = Task { [weak self] in
+        streamTask = Task { [weak self, generation] in
             guard let self else { return }
-            defer { self.isProcessing = false }
+            defer {
+                if self.streamGeneration == generation {
+                    self.isProcessing = false
+                    self.streamTask = nil
+                }
+            }
 
             do {
-                let full = try await self.streamCompletion(prompt: fullPrompt)
-                guard !Task.isCancelled else { return }
+                let full = try await self.streamCompletion(prompt: fullPrompt, generation: generation)
+                guard self.streamGeneration == generation, !Task.isCancelled else { return }
                 self.streamResponse = full
             } catch is CancellationError {
+                guard self.streamGeneration == generation else { return }
                 if !self.streamResponse.isEmpty {
                     self.streamResponse += "\n\n*[Task Interrupted]*"
                 }
             } catch {
+                guard self.streamGeneration == generation else { return }
                 self.errorText = error.localizedDescription
             }
         }
     }
 
     public func cancel() {
+        streamGeneration &+= 1
         streamTask?.cancel()
         streamTask = nil
         isProcessing = false
@@ -381,7 +392,7 @@ Task: \(instruction)
 
     // MARK: Streaming Network Client
 
-    private func streamCompletion(prompt: String) async throws -> String {
+    private func streamCompletion(prompt: String, generation: UInt64) async throws -> String {
         guard let url = connection.url(path: "/v1/chat/completions") else {
             throw URLError(.badURL)
         }
@@ -447,6 +458,7 @@ Task: \(instruction)
 
             for choice in chunk.choices ?? [] {
                 if let piece = choice.delta?.content, !piece.isEmpty {
+                    guard self.streamGeneration == generation else { return full }
                     full += piece
                     self.streamResponse = full
                 }

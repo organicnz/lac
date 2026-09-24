@@ -148,6 +148,8 @@ class ChatStore: ObservableObject {
     public var port: Int { connection.port }
 
     private var streamTask: Task<Void, Never>?
+    private var streamGeneration: UInt64 = 0
+    private let rootURL: URL
 
     var activeThread: ChatThread? {
         threads.first { $0.id == activeThreadId }
@@ -161,6 +163,14 @@ class ChatStore: ObservableObject {
         URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent(".lac/chat-titles.json")
     }
 
+    private var threadsFileURL: URL {
+        rootURL.appendingPathComponent(".lac/chat-threads.jsonl")
+    }
+
+    private var titlesFileURL: URL {
+        rootURL.appendingPathComponent(".lac/chat-titles.json")
+    }
+
     /// Local 27B KV budget: never request more than 4k completion tokens —
     /// contextCap/2 at 64k would OOM unified memory mid-stream.
     nonisolated static func maxTokens(forContextCap cap: Int) -> Int? {
@@ -168,7 +178,8 @@ class ChatStore: ObservableObject {
         return min(cap / 2, 4096)
     }
 
-    init() {
+    init(rootURL: URL = URL(fileURLWithPath: NSHomeDirectory())) {
+        self.rootURL = rootURL
         load()
         if activeThreadId == nil { _ = newThread() }
     }
@@ -366,7 +377,7 @@ class ChatStore: ObservableObject {
     }
 
     private func rewriteAllThreads() {
-        let file = Self.threadsFile()
+        let file = threadsFileURL
         try? FileManager.default.createDirectory(
             at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
         var buffer = Data()
@@ -391,7 +402,7 @@ class ChatStore: ObservableObject {
     }
 
     private func saveTitles() {
-        let file = Self.titlesFile()
+        let file = titlesFileURL
         try? FileManager.default.createDirectory(
             at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
         let map = Dictionary(uniqueKeysWithValues: threads.map { ($0.id, $0.title) })
@@ -428,7 +439,7 @@ class ChatStore: ObservableObject {
     }
 
     private func loadTitles() -> [String: String] {
-        guard let data = try? Data(contentsOf: Self.titlesFile()),
+        guard let data = try? Data(contentsOf: titlesFileURL),
               let map = try? JSONDecoder().decode([String: String].self, from: data)
         else { return [:] }
         return map
@@ -437,7 +448,7 @@ class ChatStore: ObservableObject {
     // MARK: persistence (one JSONL line per message)
 
     func load() {
-        let file = Self.threadsFile()
+        let file = threadsFileURL
         let exists = FileManager.default.fileExists(atPath: file.path)
         
         // Robustness: gracefully handle missing or corrupted file
@@ -519,7 +530,7 @@ class ChatStore: ObservableObject {
     }
 
     private func persist(_ threadId: String, _ msg: ChatMessage) {
-        let file = Self.threadsFile()
+        let file = threadsFileURL
         try? FileManager.default.createDirectory(
             at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
         guard let payload = try? JSONEncoder().encode(
@@ -608,18 +619,25 @@ class ChatStore: ObservableObject {
         guard !isSending else { return }
         isSending = true
         streamText = ""
+        streamGeneration &+= 1
+        let generation = streamGeneration
         let tStart = CFAbsoluteTimeGetCurrent()
-        streamTask = Task { @MainActor [weak self, tid] in
+        streamTask = Task { @MainActor [weak self, tid, generation] in
             guard let self else { return }
             defer {
-                self.isSending = false
+                if self.streamGeneration == generation {
+                    self.isSending = false
+                    self.streamTask = nil
+                }
             }
             do {
                 // onPiece runs on MainActor already (streamChat is isolated),
                 // so the transcript updates inline with no hop.
                 let reply = try await self.streamChat(model: model, history: history) { piece in
+                    guard self.streamGeneration == generation else { return }
                     self.streamText += piece
                 }
+                guard self.streamGeneration == generation else { return }
                 let duration = CFAbsoluteTimeGetCurrent() - tStart
                 let estTokens = max(1, reply.count / 4)
                 let tokPerSec = duration > 0.05 ? Double(estTokens) / duration : 0.0
@@ -695,6 +713,7 @@ class ChatStore: ObservableObject {
                 }
                 self.streamText = ""
             } catch is CancellationError {
+                guard self.streamGeneration == generation else { return }
                 let duration = CFAbsoluteTimeGetCurrent() - tStart
                 if !self.streamText.isEmpty {
                     let partial = ChatMessage(
@@ -710,6 +729,7 @@ class ChatStore: ObservableObject {
                     self.streamText = ""
                 }
             } catch {
+                guard self.streamGeneration == generation else { return }
                 let duration = CFAbsoluteTimeGetCurrent() - tStart
                 if !self.streamText.isEmpty {
                     let partial = ChatMessage(
@@ -730,6 +750,7 @@ class ChatStore: ObservableObject {
     }
 
     func cancel() {
+        streamGeneration &+= 1
         streamTask?.cancel()
         streamTask = nil
         isSending = false

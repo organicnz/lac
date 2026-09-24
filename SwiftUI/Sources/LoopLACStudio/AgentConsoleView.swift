@@ -110,14 +110,16 @@ public final class AgentConsoleStore: ObservableObject {
         self.activeProcess = proc
 
         // 30s timeout: TERM → after 2s INT → after 2s KILL.
-        DispatchQueue.global().asyncAfter(deadline: .now() + 30) {
-            self.activeProcess?.terminate()
-            DispatchQueue.global().asyncAfter(deadline: .now() + 2) {
-                if self.activeProcess?.isRunning == true { self.activeProcess?.interrupt() }
-                DispatchQueue.global().asyncAfter(deadline: .now() + 2) {
-                    if self.activeProcess?.isRunning == true { Darwin.kill(self.activeProcess!.processIdentifier, SIGKILL) }
-                }
-            }
+        Task { @MainActor [weak self, proc] in
+            try? await Task.sleep(for: .seconds(30))
+            guard let self, self.activeProcess?.processIdentifier == proc.processIdentifier else { return }
+            proc.terminate()
+            try? await Task.sleep(for: .seconds(2))
+            guard self.activeProcess?.processIdentifier == proc.processIdentifier else { return }
+            proc.interrupt()
+            try? await Task.sleep(for: .seconds(2))
+            guard self.activeProcess?.processIdentifier == proc.processIdentifier else { return }
+            Darwin.kill(proc.processIdentifier, SIGKILL)
         }
 
         let outHandle = outPipe.fileHandleForReading

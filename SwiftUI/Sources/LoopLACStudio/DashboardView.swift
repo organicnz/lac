@@ -134,11 +134,11 @@ struct DashboardView: View {
             StatBox(title: "Active", value: activeValue,
                     icon: "brain.head.profile", color: .blue)
             StatBox(title: "RAM Free",
-                    value: network.host?.free_ram_gib.map { String(format: "%.1f GiB", $0) } ?? "—",
+                    value: network.isRemote ? "Remote" : (network.host?.free_ram_gib.map { String(format: "%.1f GiB", $0) } ?? "—"),
                     icon: "memorychip", color: .green)
             StatBox(title: "Thermal",
-                    value: network.host?.thermal?.capitalized ?? "—",
-                    icon: "thermometer", color: thermalColor(network.host?.thermal ?? ""))
+                    value: network.isRemote ? "Remote" : (network.host?.thermal?.capitalized ?? "—"),
+                    icon: "thermometer", color: network.isRemote ? .secondary : thermalColor(network.host?.thermal ?? ""))
         }
     }
 
@@ -190,12 +190,16 @@ struct DashboardView: View {
             HStack(spacing: 10) {
                 Button("MLX") { Task { await network.startMLX() } }
                     .lacGlass()
+                    .disabled(network.isRemote)
                 Button("Llama") { Task { await network.startLlama() } }
                     .lacGlass()
+                    .disabled(network.isRemote)
                 Button("Ollama") { Task { await network.startOllama() } }
                     .lacGlass()
+                    .disabled(network.isRemote)
                 Button("Stop All") { Task { await network.stopAll() } }
                     .lacGlass()
+                    .disabled(network.isRemote)
             }
             HStack(spacing: 8) {
                 Text("Backend:").font(.caption).foregroundColor(.secondary)
@@ -232,11 +236,11 @@ struct DashboardView: View {
                 Spacer()
                 Button("Install") { Task { await network.setDaemon(enabled: true) } }
                     .controlSize(.small)
-                    .disabled(network.daemonInstalled)
+                    .disabled(network.isRemote || network.daemonInstalled)
                     .lacGlass()
                 Button("Uninstall") { Task { await network.setDaemon(enabled: false) } }
                     .controlSize(.small)
-                    .disabled(!network.daemonInstalled)
+                    .disabled(network.isRemote || !network.daemonInstalled)
                     .lacGlass()
             }
             if let action = network.lastAction {
@@ -322,8 +326,10 @@ struct EmptyStateView: View {
                     }
                     .lacGlassProminent()
 
-                    Button("Start router") { Task { await network.startRouter() } }
-                        .lacGlass()
+                    if !network.isRemote {
+                        Button("Start router") { Task { await network.startRouter() } }
+                            .lacGlass()
+                    }
                 }
                 if let action = network.lastAction {
                     Text(action).font(.caption).foregroundColor(.secondary).lineLimit(2)
@@ -332,6 +338,8 @@ struct EmptyStateView: View {
             .padding(32)
             .liquidGlassCard(cornerRadius: 18, hoverable: false)
             .frame(maxWidth: 480)
+            ConnectionSettingsView(connection: LACConnectionStore.shared)
+                .frame(maxWidth: 620)
             Spacer()
         }
         .padding(24)

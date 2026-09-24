@@ -1,0 +1,16 @@
+min_version: 2.1.2
+assert_lefthook_installed: true
+no_auto_install: true
+
+pre-commit:
+  piped: true
+  follow: true
+  commands:
+    delivery:
+      run: make delivery-index validate
+
+pre-push:
+  follow: true
+  commands:
+    delivery:
+      run: make delivery-index validate

@@ -1,7 +1,7 @@
 # LAC — Local Agentic Coding Makefile
 # Target: Apple Silicon Macs (best on high-RAM Studio) | Qwen 3.8 27B
 
-.PHONY: all default build test status doctor route route-daemon serve-mlx serve-llama tui studio dashboard bench tune loop-init loop-list worker worker-drain daemon-install daemon-uninstall daemon-status stop ps logs config scripts bootstrap install clean help
+.PHONY: all default build test lint smoke release-smoke validate delivery-index app-check hooks-install hooks-check status doctor route route-daemon serve-mlx serve-llama tui studio dashboard bench tune loop-init loop-list worker worker-drain daemon-install daemon-uninstall daemon-status stop ps logs config scripts bootstrap install clean help
 
 .DEFAULT_GOAL := default
 
@@ -22,15 +22,64 @@ build:
 
 test:
 	@echo "🧪 Running Rust test suite..."
-	@cd rust-src && cargo test
-	@if command -v swift >/dev/null 2>&1; then \
-		echo "🍎 Running Swift test suite (LAC Studio)..."; \
-		cd SwiftUI && swift test; \
+	@cd rust-src && cargo test --locked -- --skip process_level_gateway_and_cli_smoke
+	@if ! command -v swift >/dev/null 2>&1; then \
+		echo "Swift toolchain is required for the delivery gate." >&2; \
+		exit 1; \
 	fi
+	@echo "🍎 Running Swift test suite (LAC Studio)..."
+	@cd SwiftUI && swift test
+
+smoke:
+	@echo "🧪 Running process-level gateway/CLI E2E smoke..."
+	@cd rust-src && cargo test --locked --test e2e_smoke -- --nocapture
+
+release-smoke:
+	@echo "🧪 Running E2E smoke against release binaries..."
+	@cd rust-src && cargo build --locked --release
+	@cd rust-src && LAC_E2E_BIN_DIR="$(CURDIR)/rust-src/target/release" cargo test --locked --test e2e_smoke -- --nocapture
+
+lint:
+	@echo "🔎 Running strict Rust and Swift lint checks..."
+	@cargo clippy --manifest-path rust-src/Cargo.toml --all-targets --all-features -- -D warnings -A clippy::collapsible-if -A clippy::collapsible-match -A clippy::doc-lazy-continuation -A clippy::needless-range-loop -A clippy::manual-strip -A clippy::needless-return -A clippy::unnecessary-map-or -A clippy::useless-borrows-in-formatting -A clippy::manual-range-contains
+	@cd SwiftUI && swift build -Xswiftc -warnings-as-errors
+
+delivery-index:
+	@missing=0; \
+	for path in lefthook.yml rust-src/tests/e2e_smoke.rs rust-src/tests/support/mod.rs; do \
+		if ! git ls-files --error-unmatch -- "$$path" >/dev/null 2>&1; then \
+			echo "Delivery gate file is not tracked: $$path" >&2; \
+			missing=1; \
+		fi; \
+	done; \
+	test "$$missing" -eq 0
+
+validate:
+	@$(MAKE) lint
+	@$(MAKE) test
+	@$(MAKE) smoke
+	@$(MAKE) release-smoke
+	@$(MAKE) app-check
+
+app-check:
+	@echo "📦 Building and verifying the packaged LAC Studio app..."
+	@cd SwiftUI && ./package-app.sh
+	@plutil -lint SwiftUI/.build/'Loop LAC Studio.app'/Contents/Info.plist
+	@test "$$(/usr/libexec/PlistBuddy -c 'Print :NSAppTransportSecurity:NSAllowsLocalNetworking' SwiftUI/.build/'Loop LAC Studio.app'/Contents/Info.plist)" = "true"
+	@! /usr/libexec/PlistBuddy -c 'Print :NSAppTransportSecurity:NSAllowsArbitraryLoads' SwiftUI/.build/'Loop LAC Studio.app'/Contents/Info.plist >/dev/null 2>&1
+	@codesign --verify --deep --strict SwiftUI/.build/'Loop LAC Studio.app'
 
 app:
-	@echo "🍎 Packaging LAC Studio native macOS app..."
+	@echo "📦 Packaging LAC Studio macOS app..."
 	@cd SwiftUI && ./package-app.sh
+
+hooks-install:
+	@lefthook install
+
+hooks-check:
+	@lefthook validate
+	@lefthook check-install
+
 
 status:
 	@$(LAC_BIN) status
@@ -158,12 +207,20 @@ help:
 	@echo "  make ps             List lac processes + port table"
 	@echo "  make logs           Tail router log"
 	@echo "  make config         Print effective configuration"
-  @echo "  make scripts        Compile standalone Rust launchers (scripts/*.rs)"
-  @echo "  make bootstrap      Build suite + run idempotent machine bootstrap"
-  @echo "  make build          Build release binaries"
-  @echo "  make install        Install binaries to ~/.local/bin"
-  @echo "  make test           Run cargo unit tests"
-  @echo "  make clean          Remove Rust + Swift build outputs + scripts/bin"
-  @echo "  make app            Package LAC Studio macOS app"
-  @echo "  make loop-init      Install Kanban queue + loop templates to ~/todo"
-  @echo "  make loop-list      List available loop workflows"
+	@echo "  make scripts        Compile standalone Rust launchers (scripts/*.rs)"
+	@echo "  make bootstrap      Build suite + run idempotent machine bootstrap"
+	@echo "  make build          Build release binaries"
+	@echo "  make install        Install binaries to ~/.local/bin"
+	@echo "  make test           Run Rust and Swift test suites"
+	@echo "  make lint           Run strict Rust Clippy and Swift warning checks"
+	@echo "  make smoke          Run process-level gateway/CLI E2E smoke"
+	@echo "  make release-smoke  Run E2E smoke against release binaries"
+	@echo "  make validate       Run the complete fail-closed delivery gate"
+	@echo "  make delivery-index Verify required gate files are tracked"
+	@echo "  make app-check      Package, sign, and verify LAC Studio"
+	@echo "  make clean          Remove Rust + Swift build outputs + scripts/bin"
+	@echo "  make app            Package LAC Studio macOS app"
+	@echo "  make hooks-install  Install the Lefthook pre-commit gate"
+	@echo "  make hooks-check    Validate Lefthook and hook installation"
+	@echo "  make loop-init      Install Kanban queue + loop templates to ~/todo"
+	@echo "  make loop-list      List available loop workflows"

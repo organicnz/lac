@@ -2,11 +2,11 @@ import SwiftUI
 
 // MARK: - ConnectionSettingsView: local vs Tailscale remote gateway
 //
-// Local: 127.0.0.1:8000, no token.
-// Remote: Tailscale IP (100.x) or MagicDNS (mac.tailXXX.ts.net), port 8000,
-// Bearer token from `LAC_API_TOKEN` on the Mac. WireGuard already encrypts
-// the tailnet, so plain http is correct; enable TLS only for
-// `tailscale serve --https` fronting.
+// Local: 127.0.0.1:8000, no token unless the router is explicitly secured.
+// Remote: MagicDNS (mac.tailXXX.ts.net), port 443,
+// Bearer token from `LAC_API_TOKEN` on the Mac. Remote profiles require TLS
+// through `tailscale serve --https`; arbitrary public hosts and plaintext
+// remote prompts are rejected before a request is created.
 
 struct ConnectionSettingsView: View {
     @ObservedObject var connection: LACConnectionStore
@@ -33,7 +33,7 @@ struct ConnectionSettingsView: View {
             }
 
             HStack(spacing: 8) {
-                TextField("100.64.0.5 or mac.tailXXX.ts.net or 127.0.0.1", text: $connection.host)
+                TextField("mac.tailXXX.ts.net or 127.0.0.1", text: $connection.host)
                     .textFieldStyle(.roundedBorder)
                     .font(.system(size: 12, design: .monospaced))
                     .frame(maxWidth: .infinity)
@@ -44,7 +44,7 @@ struct ConnectionSettingsView: View {
                 Toggle("TLS", isOn: $connection.useTLS)
                     .toggleStyle(.checkbox)
                     .font(.caption)
-                    .help("On only for tailscale serve --https fronting. Tailnet http is already WireGuard-encrypted.")
+                    .help("Required for remote profiles; use tailscale serve --https.")
             }
 
             SecureField("Bearer token (LAC_API_TOKEN on the Mac) — required for remote", text: $connection.token)
@@ -76,7 +76,7 @@ struct ConnectionSettingsView: View {
             }
 
             if connection.isRemote && connection.token.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                Text("Remote without a token gets 401. Paste LAC_API_TOKEN from the Mac.")
+                Text("Remote requires TLS and a token. Paste LAC_API_TOKEN from the Mac.")
                     .font(.caption)
                     .foregroundColor(.orange)
             }

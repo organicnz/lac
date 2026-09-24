@@ -53,7 +53,7 @@ fn bin(root: &str, name: &str) -> String {
 }
 
 fn status_header(root: &str) -> String {
-    let gw = if port_up(8000) { "UP  " } else { "DOWN" };
+    let gw = if port_up(common::gateway_port()) { "UP  " } else { "DOWN" };
     let o = if port_up(11434) { "UP  " } else { "DOWN" };
     let mlx = if port_up(common::mlx_port()) { "UP  " } else { "DOWN" };
     let llama = if port_up(8081) { "UP  " } else { "DOWN" };
@@ -113,8 +113,8 @@ fn health_check(root: &str) {
     println!("{}", http_models(common::mlx_port()));
     println!("\n-- llama :8081 --");
     println!("{}", http_models(8081));
-    println!("\n-- gateway :8000 --");
-    match common::http_get(8000, "/lac/status", 3000) {
+    println!("\n-- gateway :{} --", common::gateway_port());
+    match common::http_get(common::gateway_port(), "/lac/status", 3000) {
         Some((200, b)) => println!("{}", b),
         Some((c, _)) => println!("HTTP {}", c),
         None => println!("OFFLINE"),
@@ -457,7 +457,7 @@ fn session_tokens() -> Option<u64> {
 fn switch_backend() {
     clear();
     println!("=== Router Backend Switch ===\n");
-    println!("  Current preference is shown at http://127.0.0.1:8000/lac/status\n");
+    println!("  Current preference is shown at http://127.0.0.1:{}/lac/status\n", common::gateway_port());
     println!("  1) auto    (MLX -> llama -> Ollama failover)");
     println!("  2) mlx     (Q4 speed lane)");
     println!("  3) llama   (Q8 quality lane)");
@@ -478,10 +478,14 @@ fn switch_backend() {
         "5" => "fastest",
         _ => return,
     };
-    match common::http_get(8000, &format!("/lac/switch?target={}", target), 5000) {
+    match common::http_get(
+        common::gateway_port(),
+        &format!("/lac/switch?target={}", target),
+        5000,
+    ) {
         Some((200, b)) => println!("{}", b),
         Some((c, _)) => println!("router replied HTTP {}", c),
-        None => println!("router :8000 unreachable — start it with lac route --daemon"),
+        None => println!("router :{} unreachable — start it with lac route --daemon", common::gateway_port()),
     }
     pause();
 }
@@ -618,8 +622,12 @@ fn live_monitor(root: &str) {
         println!("  {}", status_header(root));
         println!("===========================================================\n");
 
-        let gw_up = port_up(8000);
-        let gw_status = if gw_up { "\x1B[32mONLINE (:8000)\x1B[0m" } else { "\x1B[31mOFFLINE\x1B[0m" };
+        let gw_up = port_up(common::gateway_port());
+        let gw_status = if gw_up {
+            format!("\x1B[32mONLINE (:{})\x1B[0m", common::gateway_port())
+        } else {
+            "\x1B[31mOFFLINE\x1B[0m".to_string()
+        };
         println!("Gateway:      {}", gw_status);
 
         let free_gb = free_ram_gib().unwrap_or(0.0);

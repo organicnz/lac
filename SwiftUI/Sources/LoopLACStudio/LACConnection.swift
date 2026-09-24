@@ -5,12 +5,12 @@ import SwiftUI
 // MARK: - LACConnectionStore: local + Tailscale remote gateway profiles
 //
 // Single source of truth for every gateway URL in Studio. Local default is
-// `http://127.0.0.1:8000` (no token). Remote is a Tailscale IP or MagicDNS
-// name (e.g. `100.64.0.5` or `mac.tailabc123.ts.net`) with a Bearer token.
+// `http://127.0.0.1:8000` (no token). Remote is a Tailscale MagicDNS name
+// (e.g. `mac.tailabc123.ts.net`) with TLS and a Bearer token.
 //
-// Transport is WireGuard-encrypted by Tailscale, so plain `http` inside the
-// tailnet is correct. Flip `useTLS` on only when fronting via
-// `tailscale serve --https`.
+// Remote profiles are restricted to Tailscale addresses and require TLS via
+// `tailscale serve --https`; this prevents a typo or public DNS endpoint from
+// receiving prompts or the gateway token. Local loopback HTTP remains open.
 //
 // Host/port/TLS persist in UserDefaults; the token lives in Keychain
 // (service `org.lac.studio`, account `gateway-token`), never on disk.
@@ -20,13 +20,34 @@ final class LACConnectionStore: ObservableObject {
     static let shared = LACConnectionStore()
 
     @Published var host: String {
-        didSet { UserDefaults.standard.set(host, forKey: Self.hostKey); touch() }
+        didSet {
+            let next = Self.normalized(host)
+            if host != next { host = next }
+            if Self.normalized(oldValue) != next {
+                if !token.isEmpty { token = "" }
+                if Self.isMagicDNSHost(next) {
+                    useTLS = true
+                } else if Self.isLoopback(next) {
+                    useTLS = false
+                }
+            }
+            UserDefaults.standard.set(host, forKey: Self.hostKey)
+            touch()
+        }
     }
     @Published var port: Int {
-        didSet { UserDefaults.standard.set(port, forKey: Self.portKey); touch() }
+        didSet {
+            if oldValue != port { token = "" }
+            UserDefaults.standard.set(port, forKey: Self.portKey)
+            touch()
+        }
     }
     @Published var useTLS: Bool {
-        didSet { UserDefaults.standard.set(useTLS, forKey: Self.tlsKey); touch() }
+        didSet {
+            if oldValue != useTLS { token = "" }
+            UserDefaults.standard.set(useTLS, forKey: Self.tlsKey)
+            touch()
+        }
     }
     /// In-memory token; persisted to Keychain on set.
     @Published var token: String {
@@ -60,28 +81,71 @@ final class LACConnectionStore: ObservableObject {
         if self.host.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             self.host = "127.0.0.1"
         }
+        if isRemote && useTLS == nil {
+            self.useTLS = true
+        }
     }
 
-    var isRemote: Bool {
-        let h = host.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return h != "127.0.0.1" && h != "localhost" && h != "::1" && !h.isEmpty
+    private static func normalized(_ value: String) -> String {
+        var h = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        if h.count >= 2, h.hasPrefix("["), h.hasSuffix("]") {
+            h.removeFirst()
+            h.removeLast()
+        }
+        return h
     }
+
+    private static func isLoopback(_ value: String) -> Bool {
+        let h = value.lowercased()
+        if h == "localhost" || h == "::1" { return true }
+        let parts = h.split(separator: ".")
+        if parts.count == 4, let first = Int(parts[0]), first == 127,
+           parts.dropFirst().allSatisfy({ Int($0).map { (0...255).contains($0) } == true }) {
+            return true
+        }
+        return false
+    }
+
+    private static func isMagicDNSHost(_ value: String) -> Bool {
+        value.lowercased().hasSuffix(".ts.net")
+    }
+
+    var normalizedHost: String { Self.normalized(host) }
+
+    var isRemote: Bool { !Self.isLoopback(normalizedHost) }
 
     var scheme: String { useTLS ? "https" : "http" }
 
-    var displayName: String { "\(scheme)://\(host):\(port)" }
+    var displayName: String { "\(scheme)://\(normalizedHost):\(port)" }
 
     func url(path: String) -> URL? {
+        let h = normalizedHost
+        guard !h.isEmpty,
+              (1...65535).contains(port),
+              !h.contains(where: { $0.isWhitespace || "/?#@".contains($0) }),
+              !isRemote || (useTLS && Self.isMagicDNSHost(h)) else {
+            return nil
+        }
         let p = path.hasPrefix("/") ? path : "/\(path)"
-        return URL(string: "\(scheme)://\(host):\(port)\(p)")
+        var components = URLComponents()
+        components.scheme = scheme
+        components.host = h
+        components.port = port
+        if let queryStart = p.firstIndex(of: "?") {
+            components.path = String(p[..<queryStart])
+            components.query = String(p[p.index(after: queryStart)...])
+        } else {
+            components.path = p
+        }
+        return components.url
     }
 
-    /// Attach `Authorization: Bearer` when a token is set AND the target is
-    /// remote. Local loopback stays token-less for frictionless dev; remote
-    /// without a token is fail-closed at the router (401), surfaced in UI.
+    /// Attach `Authorization: Bearer` whenever a token is configured. A
+    /// router with a token requires it on loopback too, which prevents local
+    /// reverse proxies from bypassing the remote gate.
     func authorize(_ req: inout URLRequest) {
         let t = token.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !t.isEmpty, isRemote else { return }
+        guard !t.isEmpty, !t.contains(where: { $0.isNewline }) else { return }
         req.setValue("Bearer \(t)", forHTTPHeaderField: "Authorization")
     }
 

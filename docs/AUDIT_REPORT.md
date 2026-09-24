@@ -1,21 +1,23 @@
 # LAC Code Audit Report
 
 **Generated:** 2026-09-12  
-**Re-verified:** 2026-09-22 (10x pro pass: router framing + remote auth closed, full suite green)  
-**Scope:** `rust-src/` codebase hygiene and integrity  
+**Re-verified:** 2026-09-24 (10x pro delivery pass)
+**Scope:** Rust backend, Swift Studio, router framing/auth, packaging, and delivery checks
 **Model:** lac/qwen3.8-27b  
-**Status:** ✅ 182/182 cargo tests green (was ⚠️ 2 failures, 5 warnings on 09-12; residual `backends down` is operational, not code)
+**Status:** ✅ Rust + Swift tests, process-level E2E smoke, and packaged-app verification are enforced by `make validate`
 
 ---
 
 ## Executive Summary
 
-The LAC Rust codebase has been audited for structural hygiene, daemon reliability, and compliance with project standards. Key findings include:
+The delivery path is now fail-closed and hermetic:
 
-- **2 failures** requiring attention (down from initial 3)
-- **5 warnings** moderate priority
-- **Daemon system** fully operational with launchd persistence
-- **Inference stack** running Q4 MTP at 45 tok/s on MLX
+- Rust unit/integration tests and Swift Testing run from the same `make test` gate used by the worker.
+- `make smoke` starts the real router plus a deterministic backend and exercises the real `lac status` and `lac chat` processes.
+- `make validate` additionally builds, signs, and verifies the packaged Studio app.
+- Lefthook runs `make delivery-index validate` on both pre-commit and pre-push; CI runs the same tracked-file check and gate.
+- Remote auth, chunked response framing, cancellation state, and model-pull exit status have regression coverage.
+- Remaining service/model availability messages are operational state, not source-code test failures.
 
 ---
 
@@ -27,7 +29,7 @@ The LAC Rust codebase has been audited for structural hygiene, daemon reliabilit
 | Memory | ✓ | 4.0+ GiB free (moderate pressure) |
 | Disk Home | ✓ | 31 GiB free on $HOME volume |
 | OpenCode Config | ✓ | opencode.jsonc present |
-| Agent Rules | ✓ | AGENTS.md present |
+| Agent Rules | ✓ | `docs/AGENTS.md` present; `lac doctor` accepts the documented fallback |
 | Loop Templates | ✓ | 4 loop templates installed |
 | Skills | ✓ | 14 skills installed |
 | OpenCode Tool | ✓ | V2 harness available |
@@ -49,12 +51,12 @@ The LAC Rust codebase has been audited for structural hygiene, daemon reliabilit
 
 ---
 
-## ❌ Failures
+## ⚠️ Operational State
 
 | Category | Level | Detail | Resolution |
 |----------|-------|--------|------------|
-| Ollama Symlink | fail | dangling symlink — rerun `lac bootstrap` | Run `lac bootstrap` to re-establish symlink |
-| Backends | fail | no inference backend serving | Start with `lac serve mlx` and `lac route --daemon` |
+| Ollama Symlink | warn | dangling symlink may exist on the host | Run `lac bootstrap` to re-establish it |
+| Backends | warn | no inference backend serving | Start with `lac serve mlx` and `lac route --daemon` |
 
 ---
 
@@ -112,13 +114,15 @@ $ lac daemon uninstall
 
 ---
 
-## 2026-09-22 Re-verification (10x pro pass)
+## 2026-09-24 Re-verification (10x pro delivery pass)
 
-- **Router framing (lac-router v2.8):** `sse_relay` hold-open now ends at Content-Length (<3s, was 4.0s stall); chunked SSE byte-identical + incremental; keep-alives SSE-only, never JSON. New unit tests: `resp_framing_parsed`, `chunk_terminal_detected`.
-- **Remote auth closed:** `LAC_BIND_ADDR`/`LAC_API_TOKEN` now enforced — non-loopback bind without token refuses to start (exit 1, verified live); remote peers without valid `Bearer` get 401 pre-routing (constant-time compare, loopback exempt). Matches `docs/ARCHITECTURE.md` + `launchd/org.lac.router.plist` (loopback default) + Studio `LACConnectionStore` (Keychain token).
-- **Doctor:** `agent_rules` now checks `docs/AGENTS.md` (+ root fallback); `lac doctor --json` exit codes real. Residual `backends down` = no inference running, operational not code.
-- **Suite:** 182/182 cargo green (15+24+43+28+15+16+21+17 unit + 3 integration: sse_relay, router_intel, router_auth), Swift `swift build` warning-free, release `lac`/`lac-router` rebuilt.
-- **Deferred (separate PRs):** `lac.rs:3407` → `health/ops/orchestrate/client` modules; `ChatView.swift:1763` → container + MessageRow + Markdown + SystemTuning. Not split in this change (one risk per change).
+- **Canonical gate:** `make test` runs the Rust and Swift suites; `make smoke` runs the real router/CLI E2E; `make validate` also packages and verifies the signed Studio app. Lefthook and CI invoke `make delivery-index validate`, so required gate/test files cannot be omitted from the commit.
+- **Router framing (lac-router v2.8):** `sse_relay` covers Content-Length early close, incremental chunked SSE, split chunk boundaries, chunk extensions, terminal trailers, and SSE-only keep-alives. The chunk parser is stateful and rejects data that merely contains a terminal-looking byte sequence.
+- **Remote auth closed:** non-loopback startup without a token fails closed; a configured token is required on every listener, including loopback; forwarded proxy headers also require the token. Constant-time comparison and successful non-loopback traffic are covered by `router_auth`.
+- **Studio delivery:** connection settings are available before a router exists, remote clients cannot run local daemon/host-fact actions, malformed URLs clear loading state, and packaged builds include local-network ATS permission for dynamic Tailscale hosts.
+- **State safety:** Chat, Code Assistant, and loop runners use generation guards so cancelled work cannot overwrite a newer run; stores use injectable roots in tests; failed worker tasks preserve changes in a recoverable stash instead of deleting them.
+- **Model pull:** failures and cancellation return nonzero, input is passed as an argument rather than interpolated source, and the CLI owns the downloader process tree.
+- **Counts:** the exact count is reported by the test runner; the previous stale arithmetic and active-daemon snapshot are intentionally not presented as guarantees.
 
 ---
 

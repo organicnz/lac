@@ -1,6 +1,7 @@
 # Rust build artifacts
 /rust-src/target/
 /rust-src/**/target/
+*.profraw
 /scripts/bin/
 *.rs.bk
 

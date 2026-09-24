@@ -3,8 +3,33 @@ import Testing
 
 @testable import LoopLACStudio
 
+private func testDirectory() -> URL {
+    let url = FileManager.default.temporaryDirectory.appendingPathComponent("lac-swift-tests-\(UUID().uuidString)")
+    try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+    return url
+}
+
 // The live gateway may be v2.0 (old daemon) or v2.7+: the dashboard
 // must decode both instead of blanking on a missing key.
+struct ConnectionStoreTests {
+    @Test @MainActor func buildsSafeGatewayURLs() {
+        let store = LACConnectionStore(host: "mac.tailabc123.ts.net", port: 443, useTLS: true, token: "")
+        #expect(store.url(path: "/lac/status")?.absoluteString == "https://mac.tailabc123.ts.net:443/lac/status")
+        #expect(store.url(path: "/lac/switch?target=llama")?.absoluteString == "https://mac.tailabc123.ts.net:443/lac/switch?target=llama")
+
+        let plaintext = LACConnectionStore(host: "mac.tailabc123.ts.net", port: 8000, useTLS: false, token: "")
+        #expect(plaintext.url(path: "/lac/status") == nil)
+        let ipHost = LACConnectionStore(host: "100.64.0.5", port: 443, useTLS: true, token: "")
+        #expect(ipHost.url(path: "/lac/status") == nil)
+        let publicHost = LACConnectionStore(host: "example.com", port: 443, useTLS: true, token: "")
+        #expect(publicHost.url(path: "/lac/status") == nil)
+        let invalidHost = LACConnectionStore(host: "bad host", port: 443, useTLS: true, token: "")
+        #expect(invalidHost.url(path: "/lac/status") == nil)
+        let invalidPort = LACConnectionStore(host: "127.0.0.1", port: 0, useTLS: false, token: "")
+        #expect(invalidPort.url(path: "/lac/status") == nil)
+    }
+}
+
 struct RouterDecodeTests {
     // Exact v2.0 shape observed on :8000 (no uptime/inflight/stats).
     static let v20 = """
@@ -89,7 +114,9 @@ struct ChatStoreTests {
     }
 
     @Test @MainActor func chatStoreMutations() {
-        let store = ChatStore()
+        let root = testDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = ChatStore(rootURL: root)
         let t = store.newThread()
         #expect(store.activeThreadId == t.id)
         let m1 = ChatMessage(role: "user", content: "Prompt 1")
@@ -105,7 +132,9 @@ struct ChatStoreTests {
     }
 
     @Test @MainActor func chatMessageVariants() {
-        let store = ChatStore()
+        let root = testDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = ChatStore(rootURL: root)
         let t = store.newThread()
         let v1 = MessageVariant(content: "Variant 1", model: "model-a")
         let v2 = MessageVariant(content: "Variant 2", model: "model-b")
@@ -124,7 +153,9 @@ struct ChatStoreTests {
     }
 
     @Test @MainActor func chatThreadForking() {
-        let store = ChatStore()
+        let root = testDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = ChatStore(rootURL: root)
         let t = store.newThread()
         let m1 = ChatMessage(role: "user", content: "Prompt 1")
         let m2 = ChatMessage(role: "assistant", content: "Answer 1")
@@ -217,7 +248,9 @@ struct LoopsStoreTests {
     }
 
     @Test @MainActor func loopsStoreMutations() {
-        let store = LoopsStore()
+        let root = testDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = LoopsStore(tasksURL: root.appendingPathComponent("tasks.yaml"))
         #expect(!store.loops.isEmpty)
         #expect(!store.tasks.isEmpty)
 
@@ -648,7 +681,9 @@ struct CompletionBudgetTests {
 
 struct ThreadTitlePersistenceTests {
     @Test @MainActor func renameSurvivesReload() {
-        let store = ChatStore()
+        let root = testDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = ChatStore(rootURL: root)
         let t = store.newThread()
         if let idx = store.threads.firstIndex(where: { $0.id == t.id }) {
             store.threads[idx].messages.append(
@@ -657,7 +692,7 @@ struct ThreadTitlePersistenceTests {
         store.renameThread(t.id, title: "My Custom Title")
 
         // A fresh instance (simulated restart) must keep the rename.
-        let reloaded = ChatStore()
+        let reloaded = ChatStore(rootURL: root)
         #expect(reloaded.threads.first(where: { $0.id == t.id })?.title == "My Custom Title")
 
         // Cleanup: remove the probe thread from both files.
@@ -668,7 +703,10 @@ struct ThreadTitlePersistenceTests {
 
 struct LoopsWritePathTests {
     @Test @MainActor func writesTargetUserQueueNeverTemplates() {
-        let store = LoopsStore()
+        let root = testDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let target = root.appendingPathComponent("todo/lac-tasks.yaml")
+        let store = LoopsStore(tasksURL: target)
         let url = store.tasksWriteURL()
         #expect(url.path.hasSuffix("todo/lac-tasks.yaml"))
         #expect(!url.path.contains("templates"))

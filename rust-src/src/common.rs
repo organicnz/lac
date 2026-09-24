@@ -291,6 +291,10 @@ pub fn http_ready(port: u16, timeout_ms: u64) -> bool {
 /// (status_code, body). Cap 256 KiB — enough for model lists, bounded
 /// against pathological responses.
 pub fn http_get(port: u16, path: &str, timeout_ms: u64) -> Option<(u16, String)> {
+    http_get_auth(port, path, timeout_ms, port == gateway_port())
+}
+
+fn http_get_auth(port: u16, path: &str, timeout_ms: u64, authorized: bool) -> Option<(u16, String)> {
     use std::io::{Read, Write};
     let addr = format!("127.0.0.1:{}", port);
     let sa: std::net::SocketAddr = addr.parse().ok()?;
@@ -298,9 +302,19 @@ pub fn http_get(port: u16, path: &str, timeout_ms: u64) -> Option<(u16, String)>
         TcpStream::connect_timeout(&sa, Duration::from_millis(timeout_ms.min(2000))).ok()?;
     let _ = s.set_read_timeout(Some(Duration::from_millis(timeout_ms.min(5000))));
     let _ = s.set_write_timeout(Some(Duration::from_millis(2000)));
+    let auth = if authorized {
+        env::var("LAC_API_TOKEN")
+            .ok()
+            .map(|token| token.trim().to_string())
+            .filter(|token| !token.is_empty() && !token.chars().any(|c| c.is_control()))
+            .map(|token| format!("Authorization: Bearer {}\r\n", token))
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
     let req = format!(
-        "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
-        path, addr
+        "GET {} HTTP/1.1\r\nHost: {}\r\n{}Connection: close\r\n\r\n",
+        path, addr, auth
     );
     s.write_all(req.as_bytes()).ok()?;
     let mut buf: Vec<u8> = Vec::new();
@@ -331,21 +345,48 @@ pub fn http_get(port: u16, path: &str, timeout_ms: u64) -> Option<(u16, String)>
 /// Blocking HTTP POST over 127.0.0.1. Returns (status_code, body).
 /// std-only, bounded read buffer up to 4MB.
 pub fn http_post(port: u16, path: &str, body: &str, timeout_ms: u64) -> Option<(u16, String)> {
-    http_post_addr(&format!("127.0.0.1:{}", port), path, body, Duration::from_millis(timeout_ms))
+    http_post_addr_auth(
+        &format!("127.0.0.1:{}", port),
+        path,
+        body,
+        Duration::from_millis(timeout_ms),
+        true,
+    )
 }
 
 /// Blocking HTTP POST to a specific socket address with total deadline budget.
 pub fn http_post_addr(addr: &str, path: &str, body: &str, budget: Duration) -> Option<(u16, String)> {
+    http_post_addr_auth(addr, path, body, budget, false)
+}
+
+fn http_post_addr_auth(
+    addr: &str,
+    path: &str,
+    body: &str,
+    budget: Duration,
+    authorized: bool,
+) -> Option<(u16, String)> {
     use std::io::{Read, Write};
     if budget.is_zero() {
         return None;
     }
     let start = Instant::now();
     let sa: std::net::SocketAddr = addr.parse().ok()?;
+    let auth = if authorized {
+        env::var("LAC_API_TOKEN")
+            .ok()
+            .map(|token| token.trim().to_string())
+            .filter(|token| !token.is_empty() && !token.chars().any(|c| c.is_control()))
+            .map(|token| format!("Authorization: Bearer {}\r\n", token))
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
     let req = format!(
-        "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
         path,
         addr,
+        auth,
         body.len(),
         body
     );
@@ -564,7 +605,12 @@ pub fn acquire_lock(name: &str, stale_secs: u64) -> Option<DirLock> {
                             }
                         }
                     }
-                    Err(_) => true,
+                    Err(_) => fs::metadata(&dir)
+                        .and_then(|meta| meta.modified())
+                        .ok()
+                        .and_then(|modified| modified.duration_since(SystemTime::UNIX_EPOCH).ok())
+                        .map(|modified| now_unix().saturating_sub(modified.as_secs()) >= stale_secs)
+                        .unwrap_or(false),
                 };
                 if stale {
                     let _ = fs::remove_dir_all(&dir);

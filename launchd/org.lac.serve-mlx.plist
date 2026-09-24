@@ -22,12 +22,18 @@
     </dict>
     <key>ThrottleInterval</key>
     <integer>30</integer>
+    <key>Timeout</key>
+    <integer>60</integer>
+    <key>ExitTimeOut</key>
+    <integer>60</integer>
     <key>StandardOutPath</key>
     <string>/Users/organic/Library/Logs/lac-serve-mlx.log</string>
     <key>StandardErrorPath</key>
     <string>/Users/organic/Library/Logs/lac-serve-mlx.err</string>
     <key>EnvironmentVariables</key>
     <dict>
+        <key>LAUNCHDAEMON</key>
+        <string>1</string>
         <key>HF_HOME</key>
         <string>/Volumes/AIModels/hf</string>
         <key>HF_HUB_CACHE</key>

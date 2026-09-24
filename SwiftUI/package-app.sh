@@ -51,6 +51,13 @@ cat << 'EOF' > "$APP_DIR/Contents/Info.plist"
     <string>AppIcon</string>
     <key>NSHighResolutionCapable</key>
     <true/>
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>LAC Studio connects to your local and Tailscale gateway.</string>
+    <key>NSAppTransportSecurity</key>
+    <dict>
+        <key>NSAllowsLocalNetworking</key>
+        <true/>
+    </dict>
 </dict>
 </plist>
 EOF

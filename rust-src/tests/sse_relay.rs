@@ -8,16 +8,14 @@
 //!      when the backend holds the socket open (no read-until-EOF stall);
 //!   3. idle `: keep-alive` comments enter SSE bodies but NEVER JSON
 //!      bodies (LAC_ROUTER_KEEPALIVE_SECS=1 keeps this test fast).
-//! One sequential #[test]: process env is global, scenarios run in order.
+//! One sequential #[test]: child environments are explicit; scenarios run in order.
+
+mod support;
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::thread;
 use std::time::{Duration, Instant};
-
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
-}
 
 fn read_exact_head(stream: &mut TcpStream) -> Vec<u8> {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
@@ -51,9 +49,10 @@ fn req_content_length(head: &[u8]) -> usize {
 }
 
 /// Scripted backend: scenario comes from the POST body's "scenario" field.
-fn spawn_backend(port: u16) {
+fn spawn_backend() -> u16 {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("fake backend bind");
+    let port = listener.local_addr().expect("fake backend address").port();
     thread::spawn(move || {
-        let listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
         for stream in listener.incoming().flatten() {
             thread::spawn(move || {
                 let mut s = stream;
@@ -112,8 +111,20 @@ fn spawn_backend(port: u16) {
                         [raw.clone(), b"\r\n\r\n".to_vec(), body.clone()].concat(),
                     );
                 }
-                let scenario = if text.contains("sse-chunked") {
+                let scenario = if text.contains("sse-mid-chunk") {
+                    "sse-mid-chunk"
+                } else if text.contains("sse-chunked-slow") {
+                    "sse-chunked-slow"
+                } else if text.contains("sse-chunked") {
                     "sse-chunked"
+                } else if text.contains("short-cl") {
+                    "short-cl"
+                } else if text.contains("short-chunk") {
+                    "short-chunk"
+                } else if text.contains("sse-trailer") {
+                    "sse-trailer"
+                } else if text.contains("sse-split") {
+                    "sse-split"
                 } else if text.contains("hold-open") {
                     "hold-open"
                 } else if text.contains("sse-slow") {
@@ -123,6 +134,19 @@ fn spawn_backend(port: u16) {
                 };
                 eprintln!("[fake] scenario={} body_len={}", scenario, body.len());
                 match scenario {
+                    "sse-mid-chunk" => {
+                        let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nhe");
+                        thread::sleep(Duration::from_secs(3));
+                        let _ = s.write_all(b"llo\r\n0\r\n\r\n");
+                    }
+                    "sse-chunked-slow" => {
+                        let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n");
+                        thread::sleep(Duration::from_secs(3));
+                        let event = b"data: chunked-slow-event\n\n";
+                        let _ = s.write_all(format!("{:X}\r\n", event.len()).as_bytes());
+                        let _ = s.write_all(event);
+                        let _ = s.write_all(b"\r\n0\r\n\r\n");
+                    }
                     "sse-chunked" => {
                         let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n");
                         for ev in ["data: A\n\n", "data: B\n\n", "data: C\n\n", "data: [DONE]\n\n"] {
@@ -130,6 +154,29 @@ fn spawn_backend(port: u16) {
                             thread::sleep(Duration::from_millis(100));
                         }
                         let _ = s.write_all(b"0\r\n\r\n");
+                    }
+                    "sse-trailer" => {
+                        let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n");
+                        let event = b"data: trailer-event\n\n";
+                        let _ = s.write_all(format!("{:X}\r\n", event.len()).as_bytes());
+                        let _ = s.write_all(event);
+                        let _ = s.write_all(b"\r\n0\r\nX-Trailer: yes\r\n\r\n");
+                        thread::sleep(Duration::from_secs(3));
+                    }
+                    "sse-split" => {
+                        let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n");
+                        let event = b"data: 0\r\n\r\n";
+                        let _ = s.write_all(format!("{:X}\r", event.len()).as_bytes());
+                        thread::sleep(Duration::from_millis(100));
+                        let _ = s.write_all(b"\ndata: 0\r");
+                        thread::sleep(Duration::from_millis(100));
+                        let _ = s.write_all(b"\n\r\n\r\n0\r\n\r\n");
+                    }
+                    "short-cl" => {
+                        let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 100\r\nConnection: close\r\n\r\nabc");
+                    }
+                    "short-chunk" => {
+                        let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nab\r\n");
                     }
                     "hold-open" => {
                         let payload = r#"{"choices":[{"message":{"content":"hold-open ok"}}]}"#;
@@ -158,14 +205,7 @@ fn spawn_backend(port: u16) {
             });
         }
     });
-}
-
-struct RouterChild(std::process::Child);
-impl Drop for RouterChild {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
+    port
 }
 
 /// Raw POST through the router; returns (raw bytes, arrival timeline, total).
@@ -215,32 +255,29 @@ fn wait_router(port: u16) {
 
 #[test]
 fn relay_framing_regressions() {
+    let _port_lock = support::PortLock::acquire();
     let tmp_home = std::env::temp_dir().join(format!("lac-test-relay-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&tmp_home);
-    let orig_home = std::env::var("HOME").ok();
-
-    let llama_port = free_port();
-    let dead_port = free_port(); // nothing listens: mlx/ollama stay down
-    let router_port = free_port();
-
-    unsafe {
-        std::env::set_var("HOME", &tmp_home);
-        std::env::set_var("MLX_PORT", dead_port.to_string());
-        std::env::set_var("LAC_LLAMA_PORT", llama_port.to_string());
-        std::env::set_var("LAC_OLLAMA_PORT", dead_port.to_string());
-        std::env::set_var("LAC_ROUTER_PORT", router_port.to_string());
-        std::env::set_var("LAC_BACKEND", "llama");
-        std::env::set_var("LAC_ROUTER_KEEPALIVE_SECS", "1");
-    }
-
-    spawn_backend(llama_port);
+    let llama_port = spawn_backend();
+    let dead_listener = TcpListener::bind(("127.0.0.1", 0)).expect("dead backend reservation");
+    let dead_port = dead_listener.local_addr().expect("dead backend address").port();
     let router_bin = env!("CARGO_BIN_EXE_lac-router");
-    let child = std::process::Command::new(router_bin)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("router binary runs");
-    let _guard = RouterChild(child);
+    let home_env = tmp_home.to_string_lossy().into_owned();
+    let llama_env = llama_port.to_string();
+    let dead_env = dead_port.to_string();
+    let router = support::spawn_router(
+        router_bin,
+        &[
+            ("HOME", &home_env),
+            ("LAC_BIND_ADDR", "127.0.0.1"),
+            ("MLX_PORT", &dead_env),
+            ("LAC_LLAMA_PORT", &llama_env),
+            ("LAC_OLLAMA_PORT", &dead_env),
+            ("LAC_BACKEND", "llama"),
+            ("LAC_ROUTER_KEEPALIVE_SECS", "1"),
+        ],
+    );
+    let router_port = router.port;
     wait_router(router_port);
 
     // 1. Chunked SSE: byte-identical AND incremental.
@@ -259,6 +296,28 @@ fn relay_framing_regressions() {
     assert!(times[0].0 < 0.5, "first event prompt: {:?}", times);
     assert!(!raw[head_end..].windows(13).any(|w| w == b": keep-alive\n"), "no injection needed (backend kept talking)");
 
+    let (raw_split, _, split_total) = probe(router_port, "sse-split");
+    let split_head_end = raw_split
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|p| p + 4)
+        .unwrap_or(raw_split.len());
+    let split_body = &raw_split[split_head_end..];
+    let split_event = b"data: 0\r\n\r\n";
+    let mut split_expected = Vec::new();
+    split_expected.extend_from_slice(format!("{:X}\r", split_event.len()).as_bytes());
+    split_expected.extend_from_slice(b"\n");
+    split_expected.extend_from_slice(split_event);
+    split_expected.extend_from_slice(b"\r\n0\r\n\r\n");
+    assert_eq!(split_body, split_expected.as_slice());
+    assert!(split_total < 2.0, "split chunk must not be truncated: {split_total}");
+
+    let (raw_trailer, _, trailer_total) = probe(router_port, "sse-trailer");
+    let trailer_text = String::from_utf8_lossy(&raw_trailer).to_string();
+    assert!(trailer_text.contains("trailer-event"));
+    assert!(trailer_total < 2.0, "trailer terminal must close promptly: {trailer_total}");
+    assert!(!trailer_text.contains(": keep-alive"));
+
     // 2. Hold-open: complete CL response ends the relay promptly.
     let (raw2, _, total2) = probe(router_port, "hold-open");
     assert!(total2 < 3.0, "relay ends at Content-Length, not backend close: {:.2}s", total2);
@@ -270,17 +329,30 @@ fn relay_framing_regressions() {
     assert!(body3.contains(": keep-alive"), "SSE keep-alive alive: {}", &body3[..body3.len().min(200)]);
     assert!(body3.contains("slow-event"), "event intact: {}", &body3[body3.len().saturating_sub(200)..]);
 
+    let (raw_chunked_slow, _, _) = probe(router_port, "sse-chunked-slow");
+    let chunked_slow = String::from_utf8_lossy(&raw_chunked_slow).to_string();
+    assert!(chunked_slow.contains("E\r\n: keep-alive\n\n\r\n"));
+    assert!(chunked_slow.contains("chunked-slow-event"));
+
+    let (raw_mid_chunk, _, _) = probe(router_port, "sse-mid-chunk");
+    let mid_chunk = String::from_utf8_lossy(&raw_mid_chunk).to_string();
+    assert!(mid_chunk.contains("5\r\nhello\r\n0\r\n\r\n"));
+    assert!(!mid_chunk.contains("E\r\n: keep-alive"));
+
     // 3b. JSON + silence: NO injection, body parses as JSON object tail.
     let (raw4, _, _) = probe(router_port, "json-slow");
     let text4 = String::from_utf8_lossy(&raw4).to_string();
     assert!(!text4.contains(": keep-alive"), "JSON body must stay clean: {}", text4);
     assert!(text4.contains("slow-json-ok"), "JSON body complete: {}", text4);
 
-    unsafe {
-        match orig_home {
-            Some(h) => std::env::set_var("HOME", h),
-            None => std::env::remove_var("HOME"),
-        }
-    }
+    let (short_cl, _, _) = probe(router_port, "short-cl");
+    assert!(String::from_utf8_lossy(&short_cl).contains("abc"));
+    let (short_chunk, _, _) = probe(router_port, "short-chunk");
+    assert!(String::from_utf8_lossy(&short_chunk).contains("ab"));
+    let usage = std::fs::read_to_string(format!("{}/.lac/router-usage.jsonl", tmp_home.display()))
+        .expect("usage log exists");
+    assert_eq!(usage.matches("\"outcome\":\"stream-broke\"").count(), 2);
+
+    drop(router);
     let _ = std::fs::remove_dir_all(&tmp_home);
 }

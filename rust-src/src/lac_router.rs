@@ -80,6 +80,7 @@ fn backend_id_for_port(port: u16) -> usize {
 }
 
 const MAX_HEADERS: usize = 65536;
+const MAX_BODY: usize = 16 * 1024 * 1024;
 const MAX_INFLIGHT: usize = 128;
 const STREAM_BUDGET: Duration = Duration::from_secs(600);
 
@@ -334,6 +335,68 @@ fn read_headers(client: &TcpStream) -> io::Result<Vec<u8>> {
         ));
     }
     Ok(buf)
+}
+
+fn header_contains(headers: &[u8], name: &str) -> bool {
+    String::from_utf8_lossy(headers)
+        .lines()
+        .take_while(|line| !line.trim().is_empty())
+        .filter_map(|line| line.split_once(':'))
+        .any(|(key, _)| key.trim().eq_ignore_ascii_case(name))
+}
+
+fn read_request_body(client: &TcpStream, initial: &[u8]) -> Result<Vec<u8>, ()> {
+    let mut client = client;
+    let header_len = find_headers_end(initial).ok_or(())?;
+    let mut request = initial.to_vec();
+    let mut buffer = [0u8; 16384];
+    let _ = client.set_read_timeout(Some(STREAM_BUDGET));
+    if let Some(content_len) = parse_content_length_strict(initial).map_err(|_| ())? {
+        let target = header_len.checked_add(content_len).ok_or(())?;
+        if target > header_len.saturating_add(MAX_BODY) {
+            return Err(());
+        }
+        while request.len() < target {
+            let n = client.read(&mut buffer).map_err(|_| ())?;
+            if n == 0 {
+                return Err(());
+            }
+            request.extend_from_slice(&buffer[..n]);
+        }
+        request.truncate(target);
+        return Ok(request);
+    }
+    if header_contains(&initial[..header_len], "transfer-encoding")
+        && String::from_utf8_lossy(&initial[..header_len])
+            .to_ascii_lowercase()
+            .contains("chunked")
+    {
+        let max_request = header_len.saturating_add(MAX_BODY);
+        if request.len() > max_request {
+            return Err(());
+        }
+        let mut detector = ChunkedDetector::default();
+        let mut fed = header_len;
+        if !detector.feed(&request[header_len..]) {
+            loop {
+                let n = client.read(&mut buffer).map_err(|_| ())?;
+                if n == 0 {
+                    return Err(());
+                }
+                request.extend_from_slice(&buffer[..n]);
+                if request.len() > max_request {
+                    return Err(());
+                }
+                let next = &request[fed..];
+                fed = request.len();
+                if detector.feed(next) {
+                    break;
+                }
+            }
+        }
+        return Ok(request);
+    }
+    Ok(request)
 }
 
 fn request_line(buf: &[u8]) -> (String, String) {
@@ -728,6 +791,8 @@ fn merged_models(hc: &HealthCache, routes: &RouteMap) -> Option<String> {
 enum ForwardError {
     /// TCP connect (or initial write) failed: safe to try the next backend.
     Connect,
+    /// Backend returned a retryable HTTP response before headers were forwarded.
+    HttpStatus(u16),
     /// Stream broke mid-proxy: the response is already partial, do not retry.
     Stream,
 }
@@ -793,24 +858,30 @@ fn pick_backends(
     order
 }
 
-/// Borrowed-client forward: on `Connect` failure the caller still owns
-fn parse_content_length(headers: &[u8]) -> Option<usize> {
+fn parse_content_length_strict(headers: &[u8]) -> Result<Option<usize>, ()> {
     let head = String::from_utf8_lossy(headers);
+    let mut value = None;
     for line in head.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             break;
         }
         let mut parts = trimmed.splitn(2, ':');
-        if let (Some(name), Some(val)) = (parts.next(), parts.next()) {
+        if let (Some(name), Some(raw)) = (parts.next(), parts.next()) {
             if name.trim().eq_ignore_ascii_case("content-length") {
-                if let Ok(len) = val.trim().parse::<usize>() {
-                    return Some(len);
+                let parsed = raw.trim().parse::<usize>().map_err(|_| ())?;
+                if value.is_some_and(|existing| existing != parsed) {
+                    return Err(());
                 }
+                value = Some(parsed);
             }
         }
     }
-    None
+    Ok(value)
+}
+
+fn parse_content_length(headers: &[u8]) -> Option<usize> {
+    parse_content_length_strict(headers).ok().flatten()
 }
 
 /// Remote auth: tailnet-only Bearer gate (fail closed).
@@ -825,8 +896,18 @@ fn bind_host() -> String {
 
 fn api_token() -> String {
     env::var("LAC_API_TOKEN")
+        .ok()
         .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty() && !s.chars().any(|c| c.is_control()))
         .unwrap_or_default()
+}
+
+fn bind_address(host: &str, port: u16) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{}]:{}", host, port)
+    } else {
+        format!("{}:{}", host, port)
+    }
 }
 
 fn is_loopback_host(h: &str) -> bool {
@@ -862,14 +943,27 @@ fn bearer_from(headers: &[u8]) -> Option<String> {
         if let Some((name, val)) = t.split_once(':') {
             if name.trim().eq_ignore_ascii_case("authorization") {
                 let v = val.trim();
-                if let Some(tok) = v.strip_prefix("Bearer ").or_else(|| v.strip_prefix("bearer ")) {
-                    return Some(tok.trim().to_string());
+                let (scheme, token) = v.split_once(char::is_whitespace)?;
+                if !scheme.eq_ignore_ascii_case("bearer") {
+                    return None;
                 }
-                return None;
+                return Some(token.trim().to_string()).filter(|s| !s.is_empty());
             }
         }
     }
     None
+}
+
+fn forwarded_request(headers: &[u8]) -> bool {
+    let head = String::from_utf8_lossy(headers);
+    head.lines().take_while(|line| !line.trim().is_empty()).any(|line| {
+        line.split_once(':').is_some_and(|(name, _)| {
+            matches!(
+                name.trim().to_ascii_lowercase().as_str(),
+                "forwarded" | "x-forwarded-for" | "x-forwarded-proto" | "x-real-ip"
+            )
+        })
+    })
 }
 
 fn unauthorized(stream: &mut TcpStream) -> io::Result<()> {
@@ -889,8 +983,18 @@ fn keepalive_secs() -> u64 {
         .unwrap_or(15)
 }
 
+fn response_status(headers: &[u8]) -> Option<u16> {
+    String::from_utf8_lossy(headers)
+        .lines()
+        .next()?
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()
+}
+
 /// Parse response framing: (content-length, is_chunked, is_sse).
-fn parse_resp_headers(head: &[u8]) -> (Option<usize>, bool, bool) {
+fn parse_resp_headers(head: &[u8]) -> Result<(Option<usize>, bool, bool), ()> {
     let s = String::from_utf8_lossy(head).to_lowercase();
     let mut cl: Option<usize> = None;
     let mut chunked = false;
@@ -903,11 +1007,11 @@ fn parse_resp_headers(head: &[u8]) -> (Option<usize>, bool, bool) {
         if let Some((name, val)) = t.split_once(':') {
             match name.trim() {
                 "content-length" => {
-                    if cl.is_none() {
-                        if let Ok(n) = val.trim().parse::<usize>() {
-                            cl = Some(n);
-                        }
+                    let n = val.trim().parse::<usize>().map_err(|_| ())?;
+                    if cl.is_some_and(|existing| existing != n) {
+                        return Err(());
                     }
+                    cl = Some(n);
                 }
                 "transfer-encoding" => {
                     if val.contains("chunked") {
@@ -927,17 +1031,121 @@ fn parse_resp_headers(head: &[u8]) -> (Option<usize>, bool, bool) {
     if chunked {
         cl = None;
     }
-    (cl, chunked, sse)
+    Ok((cl, chunked, sse))
 }
 
-/// True when the trailing bytes complete a chunked body (`0\r\n\r\n`).
-fn chunk_term(tail: &[u8]) -> bool {
-    tail.len() >= 5 && &tail[tail.len() - 5..] == b"0\r\n\r\n"
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ChunkState {
+    Size,
+    Data,
+    DataEnd,
+    Trailers,
+    Done,
+    Invalid,
+}
+
+struct ChunkedDetector {
+    state: ChunkState,
+    line: Vec<u8>,
+    remaining: u64,
+}
+
+impl Default for ChunkedDetector {
+    fn default() -> Self {
+        Self {
+            state: ChunkState::Size,
+            line: Vec::with_capacity(32),
+            remaining: 0,
+        }
+    }
+}
+
+impl ChunkedDetector {
+    fn at_boundary(&self) -> bool {
+        matches!(self.state, ChunkState::Size | ChunkState::Trailers)
+    }
+
+    fn feed(&mut self, data: &[u8]) -> bool {
+        let mut i = 0;
+        while i < data.len() {
+            match self.state {
+                ChunkState::Size | ChunkState::DataEnd | ChunkState::Trailers => {
+                    if self.line.last() == Some(&b'\r') {
+                        if data[i] != b'\n' {
+                            self.state = ChunkState::Invalid;
+                            return false;
+                        }
+                        let line = std::mem::replace(&mut self.line, Vec::with_capacity(32));
+                        let state = self.state;
+                        i += 1;
+                        match state {
+                            ChunkState::Size => match parse_size_line(&line) {
+                                Some(size) if size > 0 => {
+                                    self.remaining = size;
+                                    self.state = ChunkState::Data;
+                                }
+                                Some(_) => self.state = ChunkState::Trailers,
+                                None => {
+                                    self.state = ChunkState::Invalid;
+                                    return false;
+                                }
+                            },
+                            ChunkState::DataEnd if line == b"\r" => self.state = ChunkState::Size,
+                            ChunkState::DataEnd => {
+                                self.state = ChunkState::Invalid;
+                                return false;
+                            }
+                            ChunkState::Trailers if line == b"\r" => {
+                                self.state = ChunkState::Done;
+                                return true;
+                            }
+                            ChunkState::Trailers => {}
+                            _ => unreachable!(),
+                        }
+                    } else if data[i] == b'\n' {
+                        self.state = ChunkState::Invalid;
+                        return false;
+                    } else {
+                        self.line.push(data[i]);
+                        i += 1;
+                    }
+                }
+                ChunkState::Data => {
+                    let take = self.remaining.min((data.len() - i) as u64) as usize;
+                    i += take;
+                    self.remaining -= take as u64;
+                    if self.remaining == 0 {
+                        self.state = ChunkState::DataEnd;
+                    }
+                }
+                ChunkState::Done => return true,
+                ChunkState::Invalid => return false,
+            }
+        }
+        self.state == ChunkState::Done
+    }
+}
+
+fn parse_size_line(line: &[u8]) -> Option<u64> {
+    let line = String::from_utf8_lossy(line);
+    let size = line.split(';').next()?.trim();
+    if size.is_empty() {
+        return None;
+    }
+    u64::from_str_radix(size, 16).ok()
+}
+
+#[cfg(test)]
+fn chunk_terminal_detected(chunks: &[&[u8]]) -> bool {
+    let mut detector = ChunkedDetector::default();
+    chunks.iter().any(|chunk| detector.feed(chunk))
 }
 fn try_forward(
-    client: &TcpStream,
+    mut client: &TcpStream,
     target_port: u16,
     initial_bytes: &[u8],
+    body_complete: bool,
+    head_request: bool,
 ) -> Result<(u64, u64, Option<f64>), ForwardError> {
     let t_start = Instant::now();
     let target_addr: SocketAddr = format!("127.0.0.1:{}", target_port)
@@ -965,83 +1173,47 @@ fn try_forward(
     let body_in_initial = initial_bytes.len().saturating_sub(header_len);
     let content_len = parse_content_length(initial_bytes);
 
-    let t1 = if let Some(cl) = content_len {
-        if body_in_initial >= cl {
-            // Whole body is already in initial_bytes and forwarded!
-            // No client upload thread needed; request is already complete.
-            None
-        } else {
-            let mut remaining = cl - body_in_initial;
-            let mut client_read = client.try_clone().map_err(|_| ForwardError::Stream)?;
-            let mut server_write = server.try_clone().map_err(|_| ForwardError::Stream)?;
-            Some(thread::spawn(move || -> u64 {
-                let mut buf = [0u8; 16384];
-                let mut n_total = 0u64;
-                while remaining > 0 {
-                    let to_read = buf.len().min(remaining);
-                    match client_read.read(&mut buf[..to_read]) {
-                        Ok(0) => break,
-                        Ok(n) => {
-                            n_total += n as u64;
-                            remaining = remaining.saturating_sub(n);
-                            if server_write.write_all(&buf[..n]).is_err() {
-                                break;
-                            }
-                        }
-                        Err(_) => break,
-                    }
-                }
-                let _ = server_write.shutdown(std::net::Shutdown::Write);
-                n_total
-            }))
-        }
-    } else {
-        let mut client_read = client.try_clone().map_err(|_| ForwardError::Stream)?;
-        let mut server_write = server.try_clone().map_err(|_| ForwardError::Stream)?;
-        Some(thread::spawn(move || -> u64 {
-            let mut buf = [0u8; 16384];
-            let mut n_total = 0u64;
-            loop {
-                match client_read.read(&mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        n_total += n as u64;
-                        if server_write.write_all(&buf[..n]).is_err() {
-                            break;
-                        }
-                    }
-                    Err(_) => break,
-                }
+    let mut up_extra = 0u64;
+    let mut upload = [0u8; 16384];
+    if let Some(cl) = content_len {
+        let mut remaining = cl.saturating_sub(body_in_initial);
+        while remaining > 0 {
+            let to_read = upload.len().min(remaining);
+            let n = client.read(&mut upload[..to_read]).map_err(|_| ForwardError::Stream)?;
+            if n == 0 {
+                return Err(ForwardError::Stream);
             }
-            let _ = server_write.shutdown(std::net::Shutdown::Write);
-            n_total
-        }))
-    };
+            server.write_all(&upload[..n]).map_err(|_| ForwardError::Stream)?;
+            up_extra += n as u64;
+            remaining -= n;
+        }
+    } else if !body_complete {
+        loop {
+            let n = client.read(&mut upload).map_err(|_| ForwardError::Stream)?;
+            if n == 0 {
+                break;
+            }
+            server.write_all(&upload[..n]).map_err(|_| ForwardError::Stream)?;
+            up_extra += n as u64;
+        }
+    }
+    let _ = server.shutdown(std::net::Shutdown::Write);
 
     let mut server_read = server;
-    // Owned write handle; the borrowed `client` stays with the caller for
-    // potential failover to the next backend.
     let mut client_write = client.try_clone().map_err(|_| ForwardError::Stream)?;
     let mut buf = [0u8; 16384];
     let mut down_total = 0u64;
     let mut ttfb: Option<f64> = None;
-    // Response framing: parse headers incrementally so we can end a
-    // complete Content-Length body early (hold-open backends) and only
-    // inject SSE keep-alives into event-streams (never JSON).
     let mut head_buf: Vec<u8> = Vec::with_capacity(4096);
     let mut headers_done = false;
     let mut resp_cl: Option<usize> = None;
     let mut resp_chunked = false;
     let mut resp_sse = false;
+    let mut sse_boundary = true;
     let mut resp_body: usize = 0;
-    let mut tail: Vec<u8> = Vec::new();
-    let push_tail = |data: &[u8], tail: &mut Vec<u8>| {
-        tail.extend_from_slice(data);
-        if tail.len() > 16 {
-            let excess = tail.len() - 16;
-            tail.drain(..excess);
-        }
-    };
+    let mut chunk_detector = ChunkedDetector::default();
+    let mut write_failed = false;
+
     loop {
         match server_read.read(&mut buf) {
             Ok(0) => break,
@@ -1051,61 +1223,116 @@ fn try_forward(
                 }
                 let chunk = &buf[..n];
                 down_total += n as u64;
-                if client_write.write_all(chunk).is_err() {
-                    break;
-                }
                 if !headers_done {
                     head_buf.extend_from_slice(chunk);
                     if head_buf.len() > MAX_HEADERS {
-                        // Pathological headers: fall back to opaque relay.
+                        if client_write.write_all(&head_buf).is_err() {
+                            write_failed = true;
+                            break;
+                        }
                         headers_done = true;
+                        head_buf.clear();
                     } else if let Some(h_end) = find_headers_end(&head_buf) {
-                        let (cl, chunked, sse) = parse_resp_headers(&head_buf[..h_end]);
-                        resp_cl = cl;
-                        resp_chunked = chunked;
+                        let (cl, chunked, sse) = match parse_resp_headers(&head_buf[..h_end]) {
+                            Ok(framing) => framing,
+                            Err(_) => return Err(ForwardError::Stream),
+                        };
+                        let status = response_status(&head_buf[..h_end]);
+                        if status.is_some_and(|code| (100..200).contains(&code) && code != 101) {
+                            head_buf.drain(..h_end);
+                            continue;
+                        }
+                        if let Some(code) = status.filter(|code| *code == 404 || *code >= 500) {
+                            return Err(ForwardError::HttpStatus(code));
+                        }
+                        let bodyless = head_request || matches!(status, Some(204 | 304));
+                        resp_cl = if bodyless { Some(0) } else { cl };
+                        resp_chunked = if bodyless { false } else { chunked };
                         resp_sse = sse;
-                        resp_body = head_buf.len().saturating_sub(h_end);
-                        push_tail(&head_buf, &mut tail);
                         headers_done = true;
+                        if client_write.write_all(&head_buf[..h_end]).is_err() {
+                            write_failed = true;
+                            break;
+                        }
+                        let body = &head_buf[h_end..];
+                        let body_len = if let Some(len) = resp_cl {
+                            body.len().min(len)
+                        } else {
+                            body.len()
+                        };
+                        resp_body = body_len;
+                        if !body[..body_len].is_empty()
+                            && client_write.write_all(&body[..body_len]).is_err()
+                        {
+                            write_failed = true;
+                            break;
+                        }
                         if let Some(len) = resp_cl {
                             if resp_body >= len {
                                 break;
                             }
-                        } else if resp_chunked && chunk_term(&tail) {
+                        } else if resp_chunked && chunk_detector.feed(body) {
                             break;
+                        }
+                        if resp_sse && !resp_chunked && !body.is_empty() {
+                            sse_boundary = body.ends_with(b"\n\n");
                         }
                     }
                 } else {
+                    if client_write.write_all(chunk).is_err() {
+                        write_failed = true;
+                        break;
+                    }
                     resp_body += n;
-                    push_tail(chunk, &mut tail);
                     if let Some(len) = resp_cl {
                         if resp_body >= len {
                             break;
                         }
-                    } else if resp_chunked && chunk_term(&tail) {
+                    } else if resp_chunked && chunk_detector.feed(chunk) {
                         break;
+                    }
+                    if resp_sse && !resp_chunked {
+                        sse_boundary = chunk.ends_with(b"\n\n");
                     }
                 }
             }
-            Err(e) if (e.kind() == io::ErrorKind::TimedOut || e.kind() == io::ErrorKind::WouldBlock) && t_start.elapsed() < STREAM_BUDGET => {
-                // Only SSE streams get comment keep-alives, and only after
-                // headers so JSON bodies stay byte-clean.
+            Err(e)
+                if (e.kind() == io::ErrorKind::TimedOut
+                    || e.kind() == io::ErrorKind::WouldBlock)
+                    && t_start.elapsed() < STREAM_BUDGET =>
+            {
                 if headers_done && resp_sse {
-                    let _ = client_write.write_all(b": keep-alive\n\n");
+                    if resp_chunked {
+                        if chunk_detector.at_boundary() {
+                            let _ = client_write.write_all(b"E\r\n: keep-alive\n\n\r\n");
+                        }
+                    } else if resp_cl.is_none() && sse_boundary {
+                        let _ = client_write.write_all(b": keep-alive\n\n");
+                    }
                 }
                 continue;
             }
             Err(_) => break,
         }
     }
+
+    if write_failed {
+        return Err(ForwardError::Stream);
+    }
+    if !headers_done {
+        return Err(ForwardError::Stream);
+    }
+    if let Some(len) = resp_cl {
+        if resp_body < len {
+            return Err(ForwardError::Stream);
+        }
+    }
+    if resp_chunked && chunk_detector.state != ChunkState::Done {
+        return Err(ForwardError::Stream);
+    }
     let _ = client_write.shutdown(std::net::Shutdown::Write);
     let _ = client.shutdown(std::net::Shutdown::Both);
-    let up_extra = t1.map(|h| h.join().unwrap_or(0)).unwrap_or(0);
-    Ok((
-        initial_bytes.len() as u64 + up_extra,
-        down_total,
-        ttfb,
-    ))
+    Ok((initial_bytes.len() as u64 + up_extra, down_total, ttfb))
 }
 
 struct InflightGuard {
@@ -1120,7 +1347,7 @@ impl Drop for InflightGuard {
 
 #[allow(clippy::too_many_arguments)]
 fn handle_connection(
-    client: TcpStream,
+    mut client: TcpStream,
     preferred: Arc<AtomicUsize>,
     hc: Arc<HealthCache>,
     stats: StatsMap,
@@ -1155,7 +1382,9 @@ fn handle_connection(
         .peer_addr()
         .map(|a| is_loopback_peer(&a))
         .unwrap_or(false);
-    if !peer_loopback {
+    let proxy_forwarded = forwarded_request(&initial);
+    let auth_required = !peer_loopback || proxy_forwarded || !expected_token.is_empty();
+    if auth_required {
         let ok = !expected_token.is_empty()
             && bearer_from(&initial)
                 .map(|t| constant_time_eq(&t, &expected_token))
@@ -1216,6 +1445,42 @@ fn handle_connection(
         None
     };
 
+    let initial_headers = find_headers_end(&initial).unwrap_or(initial.len());
+    let request_content_length = match parse_content_length_strict(&initial) {
+        Ok(value) => value,
+        Err(_) => {
+            let mut c = client;
+            let _ = json_response(&mut c, "400 Bad Request", "{\"error\":{\"message\":\"invalid Content-Length\"}}");
+            return;
+        }
+    };
+    let chunked_request = header_contains(&initial[..initial_headers], "transfer-encoding")
+        && String::from_utf8_lossy(&initial[..initial_headers])
+            .to_ascii_lowercase()
+            .contains("chunked");
+    if request_content_length.is_some() && chunked_request {
+        let mut c = client;
+        let _ = json_response(&mut c, "400 Bad Request", "{\"error\":{\"message\":\"ambiguous request framing\"}}");
+        return;
+    }
+    let body_framed = request_content_length.is_some() || chunked_request;
+    let body_complete = body_framed || matches!(method.as_str(), "GET" | "HEAD" | "OPTIONS");
+    if header_contains(&initial[..initial_headers], "expect")
+        && String::from_utf8_lossy(&initial[..initial_headers])
+            .to_ascii_lowercase()
+            .contains("100-continue")
+    {
+        let _ = client.write_all(b"HTTP/1.1 100 Continue\r\n\r\n");
+    }
+    let initial = match read_request_body(&client, &initial) {
+        Ok(request) => request,
+        Err(_) => {
+            let mut c = client;
+            let _ = json_response(&mut c, "400 Bad Request", "{\"error\":{\"message\":\"incomplete request body\"}}");
+            return;
+        }
+    };
+
     let candidates = pick_backends(pref, &hc, &stats, model_hint);
     if candidates.is_empty() {
         let err_body = format!(
@@ -1234,7 +1499,7 @@ fn handle_connection(
     let t0 = Instant::now();
     let mut tried: Vec<u16> = Vec::new();
     for (bid, port) in candidates {
-        match try_forward(&client, port, &initial) {
+        match try_forward(&client, port, &initial, body_complete, method == "HEAD") {
             Ok((up, down, ttfb)) => {
                 let up_body = up.saturating_sub(header_len as u64);
                 let down_body = down.saturating_sub(200);
@@ -1273,6 +1538,26 @@ fn handle_connection(
             Err(ForwardError::Connect) => {
                 note_error(&stats, port);
                 tried.push(port);
+                continue;
+            }
+            Err(ForwardError::HttpStatus(status)) => {
+                note_error(&stats, port);
+                tried.push(port);
+                log_usage(
+                    rid_n,
+                    backend_name(bid),
+                    port,
+                    &model,
+                    0,
+                    0,
+                    0,
+                    None,
+                    "http-error",
+                );
+                eprintln!(
+                    "[lac-router rid={}] {} {} -> backend HTTP {}; trying next",
+                    rid_n, method, path, status
+                );
                 continue;
             }
             Err(ForwardError::Stream) => {
@@ -1330,6 +1615,15 @@ fn main() {
     let token = api_token();
     // Fail closed: a non-loopback bind without a token would expose the
     // gateway unauthenticated — refuse to start instead.
+    if !is_loopback_host(&host)
+        && env::var("LAC_ALLOW_INSECURE_BIND").ok().as_deref() != Some("1")
+    {
+        eprintln!(
+            "Refusing non-loopback bind {} without explicit LAC_ALLOW_INSECURE_BIND=1. Use tailscale serve --https in front of loopback.",
+            host
+        );
+        std::process::exit(1);
+    }
     if !is_loopback_host(&host) && token.is_empty() {
         eprintln!(
             "Refusing to bind lac-router to {} without LAC_API_TOKEN (remote would be open). Set LAC_API_TOKEN.",
@@ -1337,9 +1631,10 @@ fn main() {
         );
         std::process::exit(1);
     }
+    let token_required = !token.is_empty();
     let expected_token: Arc<String> = Arc::new(token);
 
-    let bind_addr = format!("{}:{}", host, port);
+    let bind_addr = bind_address(&host, port);
     let listener = match TcpListener::bind(&bind_addr) {
         Ok(l) => l,
         Err(e) => {
@@ -1347,6 +1642,10 @@ fn main() {
             std::process::exit(1);
         }
     };
+    let bound_addr = listener
+        .local_addr()
+        .map(|addr| addr.to_string())
+        .unwrap_or_else(|_| bind_addr.clone());
 
     let hc = Arc::new(HealthCache::new(Duration::from_secs(1)));
     let stats: StatsMap = Arc::new(Mutex::new(HashMap::new()));
@@ -1357,10 +1656,12 @@ fn main() {
 
     eprintln!("========================================================");
     eprintln!("  LAC Unified Intelligent Router v2.8 (Rust native)");
-    eprintln!("  Listening on http://{}", bind_addr);
+    eprintln!("  Listening on http://{}", bound_addr);
     eprintln!(
         "  Remote auth: {}",
-        if is_loopback_host(&host) {
+        if token_required {
+            "Bearer required on all peers (including loopback)"
+        } else if is_loopback_host(&host) {
             "loopback open (local dev)"
         } else {
             "Bearer required for non-loopback (fail-closed)"
@@ -1376,10 +1677,10 @@ fn main() {
         "  Preferred backend: {} (LAC_BACKEND env > ~/.lac/router-backend)",
         backend_name(preferred.load(Ordering::SeqCst))
     );
-    eprintln!("  Health & metrics: http://{}/lac/status", bind_addr);
+    eprintln!("  Health & metrics: http://{}/lac/status", bound_addr);
     eprintln!(
         "  Hot-swap backend: http://{}/lac/switch?target=[mlx|llama|ollama|auto|fastest]",
-        bind_addr
+        bound_addr
     );
     eprintln!("  Usage log: {}", usage_log_path());
     eprintln!("========================================================");
@@ -1522,6 +1823,12 @@ mod tests {
         assert_eq!(parse_content_length(req), Some(42));
         let get = b"GET /v1/models HTTP/1.1\r\nHost: localhost\r\n\r\n";
         assert_eq!(parse_content_length(get), None);
+        let duplicate = b"POST / HTTP/1.1\r\nContent-Length: 4\r\nContent-Length: 4\r\n\r\ntest";
+        assert_eq!(parse_content_length_strict(duplicate), Ok(Some(4)));
+        let conflicting = b"POST / HTTP/1.1\r\nContent-Length: 4\r\nContent-Length: 5\r\n\r\n";
+        assert!(parse_content_length_strict(conflicting).is_err());
+        let invalid = b"POST / HTTP/1.1\r\nContent-Length: nope\r\n\r\n";
+        assert!(parse_content_length_strict(invalid).is_err());
     }
 
     #[test]
@@ -1529,21 +1836,37 @@ mod tests {
         let json = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 48\r\nConnection: keep-alive\r\n\r\n";
         assert_eq!(
             parse_resp_headers(json),
-            (Some(48), false, false)
+            Ok((Some(48), false, false))
         );
         let sse = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n";
-        assert_eq!(parse_resp_headers(sse), (None, true, true));
+        assert_eq!(parse_resp_headers(sse), Ok((None, true, true)));
         // Chunked wins over Content-Length per RFC 7230.
         let both = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 99\r\nContent-Type: text/event-stream\r\n\r\n";
-        assert_eq!(parse_resp_headers(both), (None, true, true));
+        assert_eq!(parse_resp_headers(both), Ok((None, true, true)));
+        let conflicting = b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\n";
+        assert!(parse_resp_headers(conflicting).is_err());
     }
 
     #[test]
-    fn chunk_terminal_detected() {
-        assert!(chunk_term(b"data: A\n\n\r\n0\r\n\r\n"));
-        assert!(chunk_term(b"0\r\n\r\n"));
-        assert!(!chunk_term(b"data: A\n\n"));
-        assert!(!chunk_term(b""));
+    fn chunk_terminal_detected_across_splits_and_trailers() {
+        let wire = b"5;ext=1\r\nhello\r\n0\r\nX-Trailer: yes\r\n\r\n";
+        for split in 0..=wire.len() {
+            assert!(
+                chunk_terminal_detected(&[&wire[..split], &wire[split..]]),
+                "split at {} lost terminal chunk",
+                split
+            );
+        }
+        assert!(chunk_terminal_detected(&[b"0\r\n\r\n"]));
+        assert!(!chunk_terminal_detected(&[b"5\r\nhello\r\n"]));
+        assert!(!chunk_terminal_detected(&[b"5\r\nhello0\r\n\r\n0\r\n\r\n"]));
+    }
+
+    #[test]
+    fn response_status_parsed() {
+        assert_eq!(response_status(b"HTTP/1.1 200 OK\r\n\r\n"), Some(200));
+        assert_eq!(response_status(b"HTTP/1.1 503 Service Unavailable\r\n\r\n"), Some(503));
+        assert_eq!(response_status(b"not-http"), None);
     }
 
     #[test]
@@ -1553,15 +1876,21 @@ mod tests {
         assert!(is_loopback_host("::1"));
         assert!(!is_loopback_host("0.0.0.0"));
         assert!(!is_loopback_host("100.64.0.5"));
+        assert_eq!(bind_address("127.0.0.1", 8000), "127.0.0.1:8000");
+        assert_eq!(bind_address("::1", 8000), "[::1]:8000");
         assert!(constant_time_eq("abc", "abc"));
         assert!(!constant_time_eq("abc", "abd"));
         assert!(!constant_time_eq("abc", "abcd"));
         let req = b"GET /v1/models HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer sekrit\r\n\r\n";
         assert_eq!(bearer_from(req).as_deref(), Some("sekrit"));
+        let mixed = b"GET /v1/models HTTP/1.1\r\nAuthorization: bEaReR sekrit\r\n\r\n";
+        assert_eq!(bearer_from(mixed).as_deref(), Some("sekrit"));
         let noauth = b"GET /v1/models HTTP/1.1\r\nHost: x\r\n\r\n";
         assert_eq!(bearer_from(noauth), None);
         let bad = b"GET /x HTTP/1.1\r\nAuthorization: Basic abc\r\n\r\n";
         assert_eq!(bearer_from(bad), None);
+        let forwarded = b"GET /v1/models HTTP/1.1\r\nX-Forwarded-For: 100.64.0.5\r\n\r\n";
+        assert!(forwarded_request(forwarded));
         let peer_lo: SocketAddr = "127.0.0.1:8000".parse().unwrap();
         let peer_remote: SocketAddr = "100.64.0.5:1234".parse().unwrap();
         assert!(is_loopback_peer(&peer_lo));

@@ -4,15 +4,13 @@
 //!   1. non-loopback bind (`LAC_BIND_ADDR=0.0.0.0`) without `LAC_API_TOKEN`
 //!      refuses to start (exit 1, "Refusing" on stderr);
 //!   2. loopback bind without a token stays open (`GET /lac/status` -> 200).
-//! One sequential #[test]: process env is global, scenarios run in order.
+//! One sequential #[test]: child environments are explicit and isolated.
 
-use std::io::Read;
+mod support;
+
+use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::time::{Duration, Instant};
-
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
-}
 
 fn wait_status(port: u16, timeout: Duration) -> bool {
     let start = Instant::now();
@@ -24,7 +22,6 @@ fn wait_status(port: u16, timeout: Duration) -> bool {
             s.set_read_timeout(Some(Duration::from_millis(800))).ok();
             let _ = s.write_all(b"GET /lac/status HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
             let mut buf = Vec::new();
-            use std::io::Write as _;
             let _ = s.read_to_end(&mut buf);
             if String::from_utf8_lossy(&buf).contains("200 OK") {
                 return true;
@@ -35,40 +32,53 @@ fn wait_status(port: u16, timeout: Duration) -> bool {
     false
 }
 
+fn request_status(port: u16, authorization: Option<&str>, forwarded: bool) -> Option<u16> {
+    let addr = format!("127.0.0.1:{}", port).parse().ok()?;
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(500)).ok()?;
+    stream.set_read_timeout(Some(Duration::from_millis(800))).ok()?;
+    let auth = authorization
+        .map(|token| format!("Authorization: Bearer {}\r\n", token))
+        .unwrap_or_default();
+    let forwarded = if forwarded { "X-Forwarded-For: 100.64.0.5\r\n" } else { "" };
+    let request = format!(
+        "GET /lac/status HTTP/1.1\r\nHost: x\r\n{}{}Connection: close\r\n\r\n",
+        forwarded, auth
+    );
+    stream.write_all(request.as_bytes()).ok()?;
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).ok()?;
+    String::from_utf8_lossy(&response)
+        .lines()
+        .next()?
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()
+}
+
 #[test]
 fn remote_auth_fail_closed_and_loopback_open() {
-    use std::io::Write as _;
+    let _port_lock = support::PortLock::acquire();
     let tmp_home = std::env::temp_dir().join(format!("lac-test-auth-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&tmp_home);
-    let orig_home = std::env::var("HOME").ok();
-    let orig_bind = std::env::var("LAC_BIND_ADDR").ok();
-    let orig_token = std::env::var("LAC_API_TOKEN").ok();
-    let orig_port = std::env::var("LAC_ROUTER_PORT").ok();
-    // Keep backends down: auth is decided before routing, no backend needed.
-    let orig_mlx = std::env::var("MLX_PORT").ok();
-    let orig_llama = std::env::var("LAC_LLAMA_PORT").ok();
-    let orig_ollama = std::env::var("LAC_OLLAMA_PORT").ok();
-    let dead_port = free_port().to_string();
-
     let router_bin = env!("CARGO_BIN_EXE_lac-router");
-
-    unsafe {
-        std::env::set_var("HOME", &tmp_home);
-        std::env::set_var("MLX_PORT", &dead_port);
-        std::env::set_var("LAC_LLAMA_PORT", &dead_port);
-        std::env::set_var("LAC_OLLAMA_PORT", &dead_port);
-    }
+    let dead_listener = TcpListener::bind(("127.0.0.1", 0)).expect("dead backend reservation");
+    let dead_port = dead_listener.local_addr().expect("dead backend address").port();
+    let dead_env = dead_port.to_string();
+    let home_env = tmp_home.to_string_lossy().into_owned();
 
     // 1. Fail closed: 0.0.0.0 without a token must exit 1 with "Refusing".
-    let refuse_port = free_port();
-    unsafe {
-        std::env::set_var("LAC_BIND_ADDR", "0.0.0.0");
-        std::env::remove_var("LAC_API_TOKEN");
-        std::env::set_var("LAC_ROUTER_PORT", refuse_port.to_string());
-    }
-    let out = std::process::Command::new(router_bin)
-        .output()
-        .expect("router binary runs");
+    let mut refusal = std::process::Command::new(router_bin);
+    refusal
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", &home_env)
+        .env("LAC_BIND_ADDR", "0.0.0.0")
+        .env("LAC_ROUTER_PORT", "0")
+        .env("MLX_PORT", &dead_env)
+        .env("LAC_LLAMA_PORT", &dead_env)
+        .env("LAC_OLLAMA_PORT", &dead_env);
+    let out = refusal.output().expect("router binary runs");
     assert_eq!(out.status.code(), Some(1), "non-loopback bind without token must exit 1");
     assert!(
         String::from_utf8_lossy(&out.stderr).contains("Refusing"),
@@ -77,51 +87,65 @@ fn remote_auth_fail_closed_and_loopback_open() {
     );
 
     // 2. Loopback without a token stays open for local dev.
-    let open_port = free_port();
-    unsafe {
-        std::env::set_var("LAC_BIND_ADDR", "127.0.0.1");
-        std::env::remove_var("LAC_API_TOKEN");
-        std::env::set_var("LAC_ROUTER_PORT", open_port.to_string());
-    }
-    let mut child = std::process::Command::new(router_bin)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("router binary runs");
-    let ok = wait_status(open_port, Duration::from_secs(15));
-    let _ = child.kill();
-    let _ = child.wait();
+    let open_router = support::spawn_router(
+        router_bin,
+        &[
+            ("HOME", &home_env),
+            ("LAC_BIND_ADDR", "127.0.0.1"),
+            ("MLX_PORT", &dead_env),
+            ("LAC_LLAMA_PORT", &dead_env),
+            ("LAC_OLLAMA_PORT", &dead_env),
+        ],
+    );
+    let ok = wait_status(open_router.port, Duration::from_secs(15));
     assert!(ok, "loopback without token must serve /lac/status 200");
 
-    unsafe {
-        match orig_home {
-            Some(h) => std::env::set_var("HOME", h),
-            None => std::env::remove_var("HOME"),
-        }
-        match orig_bind {
-            Some(v) => std::env::set_var("LAC_BIND_ADDR", v),
-            None => std::env::remove_var("LAC_BIND_ADDR"),
-        }
-        match orig_token {
-            Some(v) => std::env::set_var("LAC_API_TOKEN", v),
-            None => std::env::remove_var("LAC_API_TOKEN"),
-        }
-        match orig_port {
-            Some(v) => std::env::set_var("LAC_ROUTER_PORT", v),
-            None => std::env::remove_var("LAC_ROUTER_PORT"),
-        }
-        match orig_mlx {
-            Some(v) => std::env::set_var("MLX_PORT", v),
-            None => std::env::remove_var("MLX_PORT"),
-        }
-        match orig_llama {
-            Some(v) => std::env::set_var("LAC_LLAMA_PORT", v),
-            None => std::env::remove_var("LAC_LLAMA_PORT"),
-        }
-        match orig_ollama {
-            Some(v) => std::env::set_var("LAC_OLLAMA_PORT", v),
-            None => std::env::remove_var("LAC_OLLAMA_PORT"),
-        }
+    let token_router = support::spawn_router(
+        router_bin,
+        &[
+            ("HOME", &home_env),
+            ("LAC_BIND_ADDR", "127.0.0.1"),
+            ("LAC_API_TOKEN", "test-secret"),
+            ("MLX_PORT", &dead_env),
+            ("LAC_LLAMA_PORT", &dead_env),
+            ("LAC_OLLAMA_PORT", &dead_env),
+        ],
+    );
+    let token_port = token_router.port;
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(10)
+        && request_status(token_port, Some("test-secret"), false) != Some(200)
+    {
+        std::thread::sleep(Duration::from_millis(100));
     }
+    assert_eq!(request_status(token_port, None, false), Some(401));
+    assert_eq!(request_status(token_port, Some("wrong"), false), Some(401));
+    assert_eq!(request_status(token_port, Some("test-secret"), false), Some(200));
+    assert_eq!(request_status(token_port, Some("test-secret"), true), Some(200));
+    assert_eq!(request_status(token_port, None, true), Some(401));
+    let remote_router = support::spawn_router(
+        router_bin,
+        &[
+            ("HOME", &home_env),
+            ("LAC_BIND_ADDR", "0.0.0.0"),
+            ("LAC_API_TOKEN", "test-secret"),
+            ("LAC_ALLOW_INSECURE_BIND", "1"),
+            ("MLX_PORT", &dead_env),
+            ("LAC_LLAMA_PORT", &dead_env),
+            ("LAC_OLLAMA_PORT", &dead_env),
+        ],
+    );
+    let remote_port = remote_router.port;
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(10)
+        && request_status(remote_port, Some("test-secret"), false) != Some(200)
+    {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(request_status(remote_port, None, false), Some(401));
+    assert_eq!(request_status(remote_port, Some("test-secret"), false), Some(200));
+    drop(remote_router);
+    drop(token_router);
+    drop(open_router);
     let _ = std::fs::remove_dir_all(&tmp_home);
 }

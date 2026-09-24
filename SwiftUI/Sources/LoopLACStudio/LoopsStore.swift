@@ -1,4 +1,5 @@
 import AppKit
+import Darwin
 import Foundation
 import SwiftUI
 
@@ -173,14 +174,18 @@ public class LoopsStore: ObservableObject {
     @Published public var runnerLogs: String = ""
     @Published public var isRunningLoop: Bool = false
     @Published public var isGateAwaitingApproval: Bool = false
+    @Published public var errorMessage: String?
     @Published public var selectedModel: String = "mlx-community/Qwen3.8-27B-4bit"
 
     private var connection: LACConnectionStore { LACConnectionStore.shared }
     private var port: Int { connection.port }
 
     private var runTask: Task<Void, Never>?
+    private var runGeneration: UInt64 = 0
+    private let tasksWriteURLOverride: URL?
 
-    public init() {
+    public init(tasksURL: URL? = nil) {
+        tasksWriteURLOverride = tasksURL
         loadLoops()
         loadTasks()
     }
@@ -191,17 +196,91 @@ public class LoopsStore: ObservableObject {
         tasks.filter { $0.status == status }
     }
 
-    public func moveTask(id: String, to newStatus: TaskStatus) {
-        if let idx = tasks.firstIndex(where: { $0.id == id }) {
-            tasks[idx].status = newStatus
-            saveTasks()
-            LiquidGlass.haptic(.alignment)
+    private var queueLockURL: URL {
+        if let tasksWriteURLOverride {
+            return tasksWriteURLOverride.deletingLastPathComponent().appendingPathComponent(".lac-queue.lock")
         }
+        return FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".lac/locks/lac-tasks")
+    }
+
+    private func withQueueLock(_ action: () -> Void) -> Bool {
+        let lockURL = queueLockURL
+        try? FileManager.default.createDirectory(
+            at: lockURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        let deadline = Date().addingTimeInterval(30)
+        var acquired = false
+        while !acquired {
+            do {
+                try FileManager.default.createDirectory(atPath: lockURL.path, withIntermediateDirectories: false)
+                acquired = true
+            } catch {
+                let ownerPath = lockURL.appendingPathComponent("owner").path
+                let owner = (try? String(contentsOfFile: ownerPath, encoding: .utf8))
+                    .flatMap { Int32($0.trimmingCharacters(in: .whitespacesAndNewlines)) }
+                if let owner {
+                    if kill(owner, 0) != 0 {
+                        try? FileManager.default.removeItem(at: lockURL)
+                    } else if Date() >= deadline {
+                        return false
+                    } else {
+                        Thread.sleep(forTimeInterval: 0.05)
+                    }
+                } else {
+                    let created = (try? FileManager.default.attributesOfItem(atPath: lockURL.path))?[.creationDate] as? Date
+                    if created.map({ Date().timeIntervalSince($0) >= 30 }) == true {
+                        try? FileManager.default.removeItem(at: lockURL)
+                    } else if Date() >= deadline {
+                        return false
+                    } else {
+                        Thread.sleep(forTimeInterval: 0.05)
+                    }
+                }
+            }
+        }
+        let owner = String(ProcessInfo.processInfo.processIdentifier)
+        try? owner.data(using: .utf8)?.write(to: lockURL.appendingPathComponent("owner"))
+        defer { try? FileManager.default.removeItem(at: lockURL) }
+        action()
+        return true
+    }
+
+    private func withQueueMutation(_ action: () -> Void) {
+        var saved = false
+        guard withQueueLock({
+            if let content = try? String(contentsOf: tasksWriteURL(), encoding: .utf8) {
+                tasks = Self.parseTasksYaml(content)
+            }
+            action()
+            saved = saveTasksUnlocked()
+        }) else {
+            errorMessage = "Queue is busy; try again."
+            return
+        }
+        guard saved else {
+            errorMessage = "Queue update could not be saved."
+            return
+        }
+        errorMessage = nil
+    }
+
+    public func moveTask(id: String, to newStatus: TaskStatus) {
+        var changed = false
+        withQueueMutation {
+            if let idx = tasks.firstIndex(where: { $0.id == id }) {
+                tasks[idx].status = newStatus
+                changed = true
+            }
+        }
+        if changed { LiquidGlass.haptic(.alignment) }
     }
 
     public func addTask(_ item: TaskItem) {
-        tasks.append(item)
-        saveTasks()
+        withQueueMutation {
+            tasks.append(item)
+        }
         LiquidGlass.haptic(.alignment)
     }
 
@@ -214,28 +293,28 @@ public class LoopsStore: ObservableObject {
         let trimmed = taskDescription.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
 
-        // Max-plus-one: tasks.count+1 duplicates IDs after deletes,
-        // which breaks ForEach identity in the Kanban board.
-        let maxN = tasks.compactMap {
-            Int($0.id.replacingOccurrences(of: "lac-", with: ""))
-        }.max() ?? 0
-        let newId = String(format: "lac-%03d", maxN + 1)
-        let item = TaskItem(
-            id: newId,
-            task: trimmed,
-            priority: priority,
-            status: .pending,
-            loopName: loopName,
-            module: module?.isEmpty == true ? nil : module
-        )
-        tasks.insert(item, at: 0)
-        saveTasks()
+        withQueueMutation {
+            let maxN = tasks.compactMap {
+                Int($0.id.replacingOccurrences(of: "lac-", with: ""))
+            }.max() ?? 0
+            let newId = String(format: "lac-%03d", maxN + 1)
+            let item = TaskItem(
+                id: newId,
+                task: trimmed,
+                priority: priority,
+                status: .pending,
+                loopName: loopName,
+                module: module?.isEmpty == true ? nil : module
+            )
+            tasks.insert(item, at: 0)
+        }
         LiquidGlass.haptic(.alignment)
     }
 
     public func deleteTask(id: String) {
-        tasks.removeAll { $0.id == id }
-        saveTasks()
+        withQueueMutation {
+            tasks.removeAll { $0.id == id }
+        }
         LiquidGlass.haptic(.alignment)
     }
 
@@ -245,15 +324,23 @@ public class LoopsStore: ObservableObject {
         guard !isRunningLoop else { return }
         activeTask = task
         isRunningLoop = true
+        runGeneration &+= 1
+        let generation = runGeneration
         isGateAwaitingApproval = false
         runnerLogs = "=== Initiating LAC Loop: \(task.loopName) for [\(task.id)] ===\n"
         runnerLogs += "Task: \(task.task)\n\n"
 
         moveTask(id: task.id, to: .inProgress)
 
-        runTask = Task { [weak self] in
+        runTask = Task { [weak self, generation] in
             guard let self else { return }
-            defer { self.isRunningLoop = false }
+            defer {
+                if self.runGeneration == generation {
+                    self.isRunningLoop = false
+                    self.runTask = nil
+                }
+            }
+            guard self.runGeneration == generation else { return }
 
             // Phase 1: Preflight (local environment checks)
             self.currentRunnerPhase = .preflight
@@ -261,7 +348,7 @@ public class LoopsStore: ObservableObject {
             do {
                 try await Task.sleep(nanoseconds: 1_200_000_000)
             } catch { return } // cancelled — stop the pipeline
-            try? Task.checkCancellation()
+            guard self.runGeneration == generation, !Task.isCancelled else { return }
             // NOTE: local heuristic until `lac status --json` is wired in.
             self.appendLog("✓ Preflight (local heuristic): proceeding — verify thermals in Ops Dashboard.")
 
@@ -271,15 +358,15 @@ public class LoopsStore: ObservableObject {
             let prompt = "Implement task \(task.id): \(task.task). Output exact code without committing."
             do {
                 let reply = try await self.queryGateway(prompt: prompt, system: "You are @coder. Implement the requested task with minimal diffs and idiomatic design.")
-                try? Task.checkCancellation()
+                guard self.runGeneration == generation, !Task.isCancelled else { return }
                 self.appendLog("✓ Code Implementation Complete:\n" + String(reply.prefix(300)) + "\n...")
             } catch is CancellationError {
                 return
             } catch {
+                guard self.runGeneration == generation else { return }
                 self.appendLog("⚠ Implement step failed (\(error.localizedDescription)). Continuing to review gate.")
             }
-            try? Task.checkCancellation()
-            if Task.isCancelled { return }
+            guard self.runGeneration == generation, !Task.isCancelled else { return }
 
             // Phase 3: Reviewer Audit (advisory until @reviewer lane is wired)
             self.currentRunnerPhase = .review
@@ -287,8 +374,7 @@ public class LoopsStore: ObservableObject {
             do {
                 try await Task.sleep(nanoseconds: 1_500_000_000)
             } catch { return }
-            try? Task.checkCancellation()
-            if Task.isCancelled { return }
+            guard self.runGeneration == generation, !Task.isCancelled else { return }
             self.appendLog("• Reviewer Report (advisory): no automated checks ran — human gate below is authoritative.")
 
             // Phase 4: Apply & Test Gate (advisory until test harness is wired)
@@ -297,11 +383,11 @@ public class LoopsStore: ObservableObject {
             do {
                 try await Task.sleep(nanoseconds: 1_200_000_000)
             } catch { return }
-            try? Task.checkCancellation()
-            if Task.isCancelled { return }
+            guard self.runGeneration == generation, !Task.isCancelled else { return }
             self.appendLog("• Test Gate (advisory): no test harness ran — confirm via `cargo test` / `swift test` before approving.")
 
             // Phase 5: Human Gate
+            guard self.runGeneration == generation, !Task.isCancelled else { return }
             self.currentRunnerPhase = .humanGate
             self.appendLog("\n[5/5] Phase: Human Review Gate (AGENTS.md mandatory requirement)")
             self.appendLog("Awaiting human inspection of git diff before task completion...")
@@ -320,6 +406,7 @@ public class LoopsStore: ObservableObject {
     }
 
     public func cancelLoop() {
+        runGeneration &+= 1
         runTask?.cancel()
         runTask = nil
         isRunningLoop = false
@@ -384,10 +471,13 @@ public class LoopsStore: ObservableObject {
 
     /// User-writable queue location (readable in tests to pin the path).
     func tasksWriteURL() -> URL {
+        if let tasksWriteURLOverride {
+            return tasksWriteURLOverride
+        }
         // Writes always go to the user's queue — never into the repo's
         // templates/ copy, which would dirty the working tree on every
         // Kanban mutation. Reads still fall back to templates/.
-        FileManager.default.homeDirectoryForCurrentUser
+        return FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("todo/lac-tasks.yaml")
     }
 
@@ -422,11 +512,16 @@ public class LoopsStore: ObservableObject {
         }
     }
 
-    private func saveTasks() {
+    private func saveTasksUnlocked() -> Bool {
         let url = tasksWriteURL()
         let yaml = Self.serializeTasksYaml(tasks)
-        try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try? yaml.write(to: url, atomically: true, encoding: .utf8)
+        do {
+            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try yaml.write(to: url, atomically: true, encoding: .utf8)
+            return true
+        } catch {
+            return false
+        }
     }
 
     private func seedDefaultTasks() {

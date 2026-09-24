@@ -30,12 +30,13 @@ opencode2 run "Verify stack: list files and check git status"
 
 ### Remote via Tailscale (no public ports)
 ```bash
-# On the Mac: join tailnet, set token, bind all interfaces
+# On the Mac: join tailnet, set token, keep router on loopback, front it with TLS
 brew install tailscale && sudo tailscaled && tailscale up
-launchctl setenv LAC_API_TOKEN "$(openssl rand -hex 32)"
-LAC_BIND_ADDR=0.0.0.0 LAC_API_TOKEN="$LAC_API_TOKEN" ./rust-src/target/release/lac-router &
+export LAC_API_TOKEN="$(openssl rand -hex 32)"
+launchctl setenv LAC_API_TOKEN "$LAC_API_TOKEN"
+tailscale serve --https 443 http://127.0.0.1:8000
 # On any laptop: same tailnet, Studio → Ops → Gateway Connection →
-# host 100.x or mac.tailXXX.ts.net:8000 + paste token, Test.
+# host mac.tailXXX.ts.net:443 + enable TLS + paste token, Test.
 ./rust-src/target/release/lac config   # bind + auth (redacted)
 ./rust-src/target/release/lac doctor   # remote_auth check
 ```
