@@ -47,11 +47,11 @@ fn print_help() {
     println!("  config              Print effective configuration (ports, models, paths)");
     println!("  tui                 Launch interactive LAC Terminal Dashboard");
     println!("  doctor [--json]     End-to-end diagnostics (exit 1 when issues found)");
-    println!("  bench [port]        Measure latency, TTFT, and tok/s against local endpoints");
-    println!("  tune [--apply]      Rank all live lanes; --apply pins the winner");
+    println!("  bench [port] [--tokens N] [--temp F]  Measure latency, TTFT, tok/s");
+    println!("  tune [--apply] [--tokens N] [--temp F] Rank lanes; --apply pins winner");
     println!("  thermal             Inspect thermals, power state, and throttling risk");
     println!("  cap [--set N]       Check or enforce session context window cap (16K hygiene)");
-    println!("  hermes [run|status] Bridge to higher-order Hermes orchestrator");
+    println!("  hermes [run|status] Native Hermes orchestrator (judgment-augmented worker)");
     println!("  kv [check|truncate] Context hygiene and memory leak prevention");
     println!("  loop [init|list|validate|run] Autonomous Kanban loop management");
     println!("  visualize           Launch SwiftUI dashboard visualizer");
@@ -68,7 +68,7 @@ fn print_help() {
 /// Launch the native macOS LAC Studio app when built, else print build guidance.
 /// Checks `.build/LAC Studio.app`, `LACStudio` binary, then `LAC_STUDIO` / `LAC_DASHBOARD`.
 fn cmd_visualize(root: &str) {
-    if !common::port_up(8000) {
+    if !common::port_up(common::gateway_port()) {
         println!("Auto-starting lac-router on :8000 in background...");
         let router_bin = common::bin(root, "lac-router");
         let _ = Command::new(&router_bin)
@@ -153,7 +153,7 @@ fn post_chat(body: &str) -> Option<(u16, String)> {
         .and_then(|v| v.trim().parse::<u64>().ok())
         .filter(|n| *n > 0)
         .unwrap_or(300);
-    common::http_post(8000, "/v1/chat/completions", body, secs * 1000)
+    common::http_post(common::gateway_port(), "/v1/chat/completions", body, secs * 1000)
 }
 
 fn cmd_chat(root: &str, args: &[String]) {
@@ -163,7 +163,7 @@ fn cmd_chat(root: &str, args: &[String]) {
         eprintln!("Model: LAC_CHAT_MODEL env, else opencode.jsonc model.");
         std::process::exit(2);
     }
-    if !common::port_up(8000) {
+    if !common::port_up(common::gateway_port()) {
         eprintln!("{} (gateway :8000 down).", NO_BACKEND_HINT);
         std::process::exit(1);
     }
@@ -226,6 +226,15 @@ fn print_terminal_diff(original: &str, modified: &str, file_name: &str) {
     let mod_lines: Vec<&str> = modified.lines().collect();
     println!("\x1B[1m--- a/{}\x1B[0m", file_name);
     println!("\x1B[1m+++ b/{}\x1B[0m", file_name);
+
+    // O(n·m) LCS guard: large files fall back to simple +/- to avoid OOM/stall.
+    const DIFF_LINE_CAP: usize = 2000;
+    if orig_lines.len() + mod_lines.len() > DIFF_LINE_CAP {
+        println!("\x1B[33m(diff truncated: {} lines exceed {} cap — simple +/- fallback)\x1B[0m", orig_lines.len() + mod_lines.len(), DIFF_LINE_CAP);
+        for l in &orig_lines { println!("\x1B[31m- {}\x1B[0m", l); }
+        for l in &mod_lines { println!("\x1B[32m+ {}\x1B[0m", l); }
+        return;
+    }
 
     let n = orig_lines.len();
     let m = mod_lines.len();
@@ -323,7 +332,7 @@ fn cmd_code(root: &str, args: &[String]) {
         std::process::exit(2);
     }
 
-    if !common::port_up(8000) {
+    if !common::port_up(common::gateway_port()) {
         eprintln!("{} (gateway :8000 down). Start with: lac route --daemon", NO_BACKEND_HINT);
         std::process::exit(1);
     }
@@ -573,7 +582,7 @@ fn opencode_model(root: &str) -> String {
 
 /// Active backend according to the router (best-effort, empty when down).
 fn router_active() -> String {
-    common::http_get(8000, "/lac/status", 1200)
+    common::http_get(common::gateway_port(), "/lac/status", 1200)
         .filter(|(code, _)| *code == 200)
         .and_then(|(_, body)| {
             let p = body.find("\"active\"")?;
@@ -589,11 +598,11 @@ fn router_active() -> String {
 
 fn cmd_status(root: &str, args: &[String]) {
     let json = args.iter().any(|a| a == "--json");
-    let gw = common::port_up(8000);
+    let gw = common::port_up(common::gateway_port());
     let mlx_port = common::mlx_port();
     let mlx = common::port_up(mlx_port);
-    let llama = common::port_up(8081);
-    let ollama = common::port_up(11434);
+    let llama = common::port_up(common::llama_port());
+    let ollama = common::port_up(common::ollama_port());
     let ram = common::free_ram_gib();
     let total = common::total_ram_gib();
     let thermal = common::thermal_state();
@@ -813,11 +822,14 @@ fn cmd_doctor(root: &str, args: &[String]) -> i32 {
         });
     }
 
-    for (name, rel) in [("opencode_config", "opencode.jsonc"), ("agent_rules", "AGENTS.md")] {
+    for (name, rel) in [("opencode_config", "opencode.jsonc"), ("agent_rules", "docs/AGENTS.md")] {
         let p = format!("{}/{}", root, rel);
+        // Back-compat: pre-move checkouts kept AGENTS.md at root.
+        let fallback = format!("{}/AGENTS.md", root);
+        let ok = fs::metadata(&p).is_ok() || fs::metadata(&fallback).is_ok();
         checks.push(Check {
             name,
-            level: if fs::metadata(&p).is_ok() { "ok" } else { "fail" },
+            level: if ok { "ok" } else { "fail" },
             detail: p,
         });
     }
@@ -839,13 +851,13 @@ fn cmd_doctor(root: &str, args: &[String]) -> i32 {
 
     // Live service probes (informational unless everything is down).
     // Intel Macs do not support MLX: omit svc_mlx to never advertise it.
-    let gw_up = common::port_up(8000);
+    let gw_up = common::port_up(common::gateway_port());
     let mut backends: Vec<(&'static str, u16)> = Vec::new();
     if common::mlx_supported() {
         backends.push(("mlx", common::mlx_port()));
     }
-    backends.push(("llama", 8081));
-    backends.push(("ollama", 11434));
+    backends.push(("llama", common::llama_port()));
+    backends.push(("ollama", common::ollama_port()));
     let mut any_backend = false;
     for (name, port) in backends {
         let up = common::http_ready(port, 1200);
@@ -893,6 +905,35 @@ fn cmd_doctor(root: &str, args: &[String]) -> i32 {
             if worker_ld { "loaded" } else { "not loaded" }
         ),
     });
+
+    // Remote-bind fail-closed mirror: non-loopback bind without a token
+    // refuses to start at the router; surface it here before launchd does.
+    {
+        let bind = env::var("LAC_BIND_ADDR")
+            .or_else(|_| env::var("LAC_ROUTER_HOST"))
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|_| "127.0.0.1".to_string());
+        let loopback = bind == "127.0.0.1" || bind == "localhost" || bind == "::1";
+        let token_set = env::var("LAC_API_TOKEN")
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false);
+        if !loopback && !token_set {
+            checks.push(Check {
+                name: "remote_auth",
+                level: "fail",
+                detail: format!(
+                    "LAC_BIND_ADDR={} without LAC_API_TOKEN — router will refuse to start; set a token",
+                    bind
+                ),
+            });
+        } else if !loopback {
+            checks.push(Check {
+                name: "remote_auth",
+                level: "ok",
+                detail: format!("bind {} with Bearer token (redacted)", bind),
+            });
+        }
+    }
 
     let fails = checks.iter().filter(|c| c.level == "fail").count();
     let warns = checks.iter().filter(|c| c.level == "warn").count();
@@ -996,10 +1037,66 @@ struct Probe {
     toks: Option<f64>,
 }
 
-fn probe_chat(port: u16, read_timeout: Duration) -> Option<Probe> {
+/// Tunable probe shape: `lac bench --tokens 128 --temp 0.2`,
+/// `lac tune --apply --tokens 64 --temp 0.0`. Env fallback
+/// LAC_BENCH_TOKENS / LAC_BENCH_TEMP keeps scripts stable.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ProbeOpts {
+    tokens: u32,
+    temp: f64,
+}
+
+fn parse_probe_opts(args: &[String]) -> ProbeOpts {
+    let mut tokens = env::var("LAC_BENCH_TOKENS")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(64u32);
+    let mut temp = env::var("LAC_BENCH_TEMP")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(0.0f64);
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--tokens" | "--max-tokens" | "--max_tokens" => {
+                if let Some(v) = args.get(i + 1).and_then(|s| s.parse::<u32>().ok()) {
+                    tokens = v;
+                    i += 1;
+                }
+            }
+            s if s.starts_with("--tokens=") || s.starts_with("--max-tokens=") => {
+                if let Some(v) = s.split('=').nth(1).and_then(|x| x.parse::<u32>().ok()) {
+                    tokens = v;
+                }
+            }
+            "--temp" | "--temperature" => {
+                if let Some(v) = args.get(i + 1).and_then(|s| s.parse::<f64>().ok()) {
+                    temp = v;
+                    i += 1;
+                }
+            }
+            s if s.starts_with("--temp=") || s.starts_with("--temperature=") => {
+                if let Some(v) = s.split('=').nth(1).and_then(|x| x.parse::<f64>().ok()) {
+                    temp = v;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    ProbeOpts {
+        tokens: tokens.clamp(8, 4096),
+        temp: if temp.is_finite() { temp.clamp(0.0, 2.0) } else { 0.0 },
+    }
+}
+
+fn probe_chat(port: u16, read_timeout: Duration, opts: ProbeOpts) -> Option<Probe> {
     let addr = format!("127.0.0.1:{}", port);
     let sa: std::net::SocketAddr = addr.parse().ok()?;
-    let body = r#"{"model":"qwen3.8-27b","messages":[{"role":"user","content":"Respond with exactly three lines of text about high performance computing."}],"max_tokens":64,"temperature":0.0}"#;
+    let body = format!(
+        "{{\"model\":\"qwen3.8-27b\",\"messages\":[{{\"role\":\"user\",\"content\":\"Respond with exactly three lines of text about high performance computing.\"}}],\"max_tokens\":{},\"temperature\":{}}}",
+        opts.tokens, opts.temp
+    );
     let post_req = format!(
         "POST /v1/chat/completions HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         addr, body.len(), body
@@ -1037,8 +1134,12 @@ fn probe_chat(port: u16, read_timeout: Duration) -> Option<Probe> {
     })
 }
 
-fn cmd_bench(port: u16) {
-    println!("=== LAC Benchmark Probe (http://127.0.0.1:{}) ===", port);
+fn cmd_bench(port: u16, args: &[String]) {
+    let opts = parse_probe_opts(args);
+    println!(
+        "=== LAC Benchmark Probe (http://127.0.0.1:{}) [tokens={} temp={}] ===",
+        port, opts.tokens, opts.temp
+    );
 
     let addr = format!("127.0.0.1:{}", port);
     let sa: Option<std::net::SocketAddr> = addr.parse().ok();
@@ -1061,7 +1162,7 @@ fn cmd_bench(port: u16) {
 
             if status.contains("200") {
                 println!("\nRunning inference benchmark (chat completion test)...");
-                match probe_chat(port, Duration::from_secs(300)) {
+                match probe_chat(port, Duration::from_secs(300), opts) {
                     Some(p) => {
                         if let Some(t) = p.ttft_s {
                             println!("  - TTFT (first byte): {:.2} s", t);
@@ -1092,11 +1193,15 @@ fn cmd_bench(port: u16) {
 /// speed, the operator keeps the quality vote.
 fn cmd_tune(args: &[String]) {
     let apply = args.iter().any(|a| a == "--apply");
-    println!("=== LAC Lane Tune (all live backends, 60s probe budget each) ===");
+    let opts = parse_probe_opts(args);
+    println!(
+        "=== LAC Lane Tune (all live backends, 60s probe budget each) [tokens={} temp={}] ===",
+        opts.tokens, opts.temp
+    );
     let lanes = [
         ("mlx", common::mlx_port()),
-        ("llama", 8081),
-        ("ollama", 11434),
+        ("llama", common::llama_port()),
+        ("ollama", common::ollama_port()),
     ];
     let mut results: Vec<(&str, u16, Probe)> = Vec::new();
     for (name, port) in lanes {
@@ -1107,7 +1212,7 @@ fn cmd_tune(args: &[String]) {
         print!("  {:<7} :{:<5} probing... ", name, port);
         use std::io::Write as _;
         let _ = std::io::stdout().flush();
-        match probe_chat(port, Duration::from_secs(60)) {
+        match probe_chat(port, Duration::from_secs(60), opts) {
             Some(p) => {
                 println!(
                     "TTFT {:.2}s total {:.2}s tok/s {}",
@@ -1149,14 +1254,17 @@ fn cmd_tune(args: &[String]) {
     let winner = results[0].0;
     println!("Winner (throughput): {}", winner);
     if apply {
-        let _ = common::atomic_write(
+        if !common::persist_or_warn(
             &format!("{}/.lac/router-backend", common::home_dir()),
             winner,
-        );
+            "tune_persist",
+        ) {
+            eprintln!("tune winner '{}' not persisted; re-run with --apply.", winner);
+        }
         // Hot-swap a live gateway; a down gateway picks the file up later.
-        if common::port_up(8000) {
+        if common::port_up(common::gateway_port()) {
             let url = format!("/lac/switch?target={}", winner);
-            match common::http_get(8000, &url, 2000) {
+            match common::http_get(common::gateway_port(), &url, 2000) {
                 Some((200, _)) => println!("Router hot-swapped to {} (persisted).", winner),
                 _ => println!("Persisted {}; gateway switch unconfirmed.", winner),
             }
@@ -1200,8 +1308,9 @@ fn cmd_cap(args: &[String]) {
         let cap = &args[1];
         match cap.parse::<u64>() {
             Ok(n) => {
-                let _ = common::atomic_write(&cap_path(), &n.to_string());
-                println!("Persisted active context cap: {} tokens ({}).", n, cap_path());
+                if common::persist_or_warn(&cap_path(), &n.to_string(), "context_cap") {
+                    println!("Persisted active context cap: {} tokens ({}).", n, cap_path());
+                }
             }
             Err(_) => println!("Invalid cap '{}': expected integer tokens.", cap),
         }
@@ -1219,42 +1328,37 @@ fn cmd_cap(args: &[String]) {
 }
 
 // ------------------------------------------------------------------ hermes -
+// Native Hermes orchestrator: judgment-augmented task selection over the
+// same queue the 24/7 worker drains. There is no external Python process —
+// `lac hermes status` reports native state and `lac hermes run` delegates
+// to cmd_worker, which picks tasks via judge_next() (LLM judgment with a
+// deterministic fallback, never less reliable than file order).
 
-fn hermes_dir() -> Option<String> {
-    let mut cands = Vec::new();
-    if let Ok(p) = env::var("HERMES_AGENT") {
-        cands.push(p);
-    }
-    cands.push("../hermes-agent".to_string());
-    cands.push(format!("{}/hermes-agent", common::home_dir()));
-    cands.into_iter().find(|p| fs::metadata(p).is_ok())
-}
-
-fn cmd_hermes(args: &[String]) {
+fn cmd_hermes(root: &str, args: &[String]) {
     let sub = args.first().map(|s| s.as_str()).unwrap_or("status");
     match sub {
         "status" => {
-            println!("=== Hermes Orchestrator Bridge ===");
-            match hermes_dir() {
-                Some(p) => {
-                    println!("  [ok] Hermes Agent at: {}", p);
-                    println!("  - Gateway Endpoint: http://127.0.0.1:8000/v1");
-                    println!("  - Task Queue: ~/todo/lac-tasks.yaml");
-                    println!("  - Loops Directory: ~/todo/lac-loops");
-                }
-                None => println!("  [!] Hermes Agent not found (set HERMES_AGENT=... or place at ~/hermes-agent)"),
-            }
+            println!("=== Hermes Orchestrator (native) ===");
+            let home = common::home_dir();
+            let tasks_file = common::tasks_file();
+            let content = fs::read_to_string(&tasks_file).unwrap_or_default();
+            let (pending, dead) = count_pending(&content);
+            let total = parse_tasks(&content).len();
+            println!("  Queue   : {} ({} total, {} retryable pending, {} dead-letter)", tasks_file, total, pending, dead);
+            println!("  Gateway : http://127.0.0.1:8000/v1 ({})", if common::port_up(common::gateway_port()) { "online" } else { "offline" });
+            println!("  Thermal : {}", common::thermal_state());
+            println!("  Model   : {}", opencode_model(root));
+            println!("  Loops   : {}/todo/lac-loops", home);
+            println!("  Worker  : lac worker [--drain] (judgment-augmented selection; deterministic fallback)");
         }
-        "run" => match hermes_dir() {
-            Some(p) => {
-                println!("Dispatching task queue through Hermes Orchestrator...");
-                let _ = Command::new("python3")
-                    .args([&format!("{}/cli.py", p), "--help"])
-                    .status();
-            }
-            None => println!("Hermes Agent directory missing."),
-        },
-        _ => println!("Usage: lac hermes [status|run]"),
+        "run" | "drain" | "worker" => {
+            // Native dispatch: same loop as `lac worker`. Pass through
+            // --drain/--once when present; bare `lac hermes run` runs the
+            // continuous 24/7 watch, exactly like bare `lac worker`.
+            let rest: Vec<String> = args.iter().skip(1).cloned().collect();
+            cmd_worker(root, &rest);
+        }
+        _ => println!("Usage: lac hermes [status|run [--drain|--once]]"),
     }
 }
 
@@ -1262,8 +1366,7 @@ fn cmd_hermes(args: &[String]) {
 
 fn cmd_loop(root: &str, args: &[String]) {
     let sub = args.first().map(|s| s.as_str()).unwrap_or("list");
-    let home = common::home_dir();
-    let loops_dir = format!("{}/todo/lac-loops", home);
+    let loops_dir = common::loops_dir();
 
     match sub {
         "init" => {
@@ -1283,7 +1386,7 @@ fn cmd_loop(root: &str, args: &[String]) {
                 }
             }
             let task_template = format!("{}/templates/tasks/lac-tasks.yaml", root);
-            let task_dest = format!("{}/todo/lac-tasks.yaml", home);
+            let task_dest = common::tasks_file();
             if fs::metadata(&task_dest).is_err() && fs::metadata(&task_template).is_ok() {
                 let _ = fs::copy(&task_template, &task_dest);
                 println!("  Installed task queue: {}", task_dest);
@@ -1375,8 +1478,7 @@ fn cmd_loop(root: &str, args: &[String]) {
 }
 
 fn cmd_loop_run(root: &str, target: Option<&str>, dry_run: bool) {
-    let home = common::home_dir();
-    let tasks_file = format!("{}/todo/lac-tasks.yaml", home);
+    let tasks_file = common::tasks_file();
 
     println!("\x1b[1;36m=== LAC Autonomous Loop Runner ===\x1b[0m");
 
@@ -1410,7 +1512,7 @@ fn cmd_loop_run(root: &str, target: Option<&str>, dry_run: bool) {
     // Phase 1: Preflight & Hygiene
     // -----------------------------------------------------------------
     println!("\x1b[1;34m[1/5 PREFLIGHT]\x1b[0m Verifying resident model, context cap & thermals...");
-    let gateway_up = common::port_up(8000);
+    let gateway_up = common::port_up(common::gateway_port());
     if gateway_up {
         println!("  ✓ Gateway :8000 online");
     } else {
@@ -1497,8 +1599,9 @@ fn cmd_loop_run(root: &str, target: Option<&str>, dry_run: bool) {
     // Update tasks file if the task was from the queue
     if from_queue {
         let updated = update_task(&tasks_content, &task_id, "complete", false);
-        let _ = common::atomic_write(&tasks_file, &updated);
-        println!("  ✓ Task [{}] transitioned to 'complete' in {}", task_id, tasks_file);
+        if common::persist_or_warn(&tasks_file, &updated, "task_complete") {
+            println!("  ✓ Task [{}] transitioned to 'complete' in {}", task_id, tasks_file);
+        }
     }
 }
 
@@ -1848,7 +1951,7 @@ fn update_task(content: &str, id: &str, new_status: &str, bump_attempts: bool) -
             }
         }
     }
-    inserts.sort_by(|a, b| b.0.cmp(&a.0));
+    inserts.sort_by_key(|a| std::cmp::Reverse(a.0));
     for (at, text) in inserts {
         out.insert(at.min(out.len()), text);
     }
@@ -1859,10 +1962,315 @@ fn update_task(content: &str, id: &str, new_status: &str, bump_attempts: bool) -
     s
 }
 
+/// Deterministic fallback order: first retryable pending task in file
+/// order. Judgment (`judge_next`) falls back to exactly this on any
+/// model/gateway failure, so the daemon is never less reliable with
+/// judgment enabled than without it.
+#[allow(dead_code)]
 fn next_pending(content: &str) -> Option<Task> {
     parse_tasks(content)
         .into_iter()
         .find(|t| t.status == "pending" && t.attempts < MAX_TASK_ATTEMPTS)
+}
+
+/// Retryable candidates in file order. Split out so judgment and the
+/// deterministic fallback share one source of truth.
+fn pending_candidates(content: &str) -> Vec<Task> {
+    parse_tasks(content)
+        .into_iter()
+        .filter(|t| t.status == "pending" && t.attempts < MAX_TASK_ATTEMPTS)
+        .collect()
+}
+
+/// Compact judgment prompt: candidate ids + short descriptions + thermal
+/// state. Descriptions are truncated so a long queue cannot blow the
+/// context window of the judging call itself.
+fn judge_prompt(candidates: &[Task], thermal: &str) -> String {
+    let mut s = String::from(
+        "You are the Hermes task selector for a local autonomous coding worker. Pick the single most urgent task to run next.\n",
+    );
+    s.push_str(&format!("Thermal state: {}. ", thermal));
+    s.push_str("Critical means prefer tiny safe tasks; otherwise pick by urgency described in each task.\nCandidates:\n");
+    for t in candidates {
+        let short: String = t.desc.chars().take(200).collect();
+        s.push_str(&format!("- ID: {} | attempts: {} | task: {}\n", t.id, t.attempts, short));
+    }
+    s.push_str("Reply with exactly two lines, no extra text:\nTASK_ID: <one of the IDs above>\nREASON: <one short line>\n");
+    s
+}
+
+/// Parse the line-based judgment format. Returns the matching candidate
+/// on an exact id hit, else None (caller falls back to file order).
+/// Line-based on purpose: no JSON crate in this std-only binary.
+fn parse_judge_decision(output: &str, candidates: &[Task]) -> Option<Task> {
+    for line in output.lines() {
+        let t = line.trim();
+        let rest = match t.strip_prefix("TASK_ID:") {
+            Some(r) => r,
+            None => continue,
+        };
+        let mut id = rest.trim().trim_matches('"').trim_matches('\'').trim();
+        // Take the first whitespace-separated token so trailing
+        // commentary ("b-2 because ...") cannot corrupt the match.
+        if let Some(tok) = id.split_whitespace().next() {
+            id = tok.trim_matches('"').trim_matches('\'');
+        }
+        if id.is_empty() {
+            continue;
+        }
+        if let Some(hit) = candidates.iter().find(|c| c.id == id) {
+            return Some(hit.clone());
+        }
+        // Unknown id: keep scanning further TASK_ID lines, if any.
+    }
+    None
+}
+
+/// Fold a judgment result onto the candidate list. Any failure —
+/// gateway down, timeout, garbage output, unknown id — resolves to the
+/// deterministic first-pending task, so judgment can never make the
+/// daemon less reliable than file order.
+fn judge_select(candidates: Vec<Task>, judged: Option<Task>) -> Option<Task> {
+    match judged {
+        Some(t) if candidates.iter().any(|c| c.id == t.id) => Some(t),
+        _ => candidates.into_iter().next(),
+    }
+}
+
+/// Judgment-aware task selection for the worker loop. Single-candidate
+/// (or empty) queues skip the model call entirely; multi-candidate
+/// queues ask the gateway via post_chat() and fall back to
+/// next_pending()'s file order on any failure. Set LAC_JUDGE=0/off to
+/// force deterministic file order without a model call.
+fn judge_next(content: &str, thermal: &str, root: &str) -> Option<Task> {
+    let candidates = pending_candidates(content);
+    if candidates.len() <= 1 {
+        return candidates.into_iter().next();
+    }
+    if env::var("LAC_JUDGE")
+        .map(|v| v == "0" || v.eq_ignore_ascii_case("off") || v.eq_ignore_ascii_case("false"))
+        .unwrap_or(false)
+    {
+        return candidates.into_iter().next();
+    }
+    // Fast path: no gateway means post_chat() can only fail. Skip the
+    // multi-second connect timeout and stay on deterministic order.
+    if !common::port_up(common::gateway_port()) {
+        return candidates.into_iter().next();
+    }
+    let prompt = judge_prompt(&candidates, thermal);
+    let model = env::var("LAC_CHAT_MODEL")
+        .ok()
+        .filter(|m| !m.trim().is_empty())
+        .unwrap_or_else(|| opencode_model(root));
+    let body = format!(
+        "{{\"model\":\"{}\",\"messages\":[{{\"role\":\"user\",\"content\":\"{}\"}}],\"temperature\":0.0}}",
+        common::json_escape(&model),
+        common::json_escape(&prompt)
+    );
+    let judged = match post_chat(&body) {
+        Some((200, reply)) => match extract_json_string(&reply, "content") {
+            Some(text) => parse_judge_decision(&text, &candidates),
+            None => None,
+        },
+        _ => None,
+    };
+    judge_select(candidates, judged)
+}
+
+// ------------------------------------------------- reviewer gate ----------
+// Worker review pass (Finding 4 fix): implement → review → apply, max 2
+// rounds per AGENTS.md. Pure std Rust: the diff is collected with git,
+// judged through the existing post_chat() gateway call, parsed
+// line-based (no JSON crate). Tests stay the fail-closed gate; review is
+// fail-open on infra failure (gateway down, timeout, garbage output) so
+// the daemon is never less reliable with review enabled than without.
+
+/// Max review rounds per task. Round 3+ means the requirement is
+/// ambiguous — the worker commits the task branch flagged for the human
+/// instead of hot-looping (AGENTS.md round-3 rule, adapted: work is
+/// preserved on the branch, the queue keeps moving).
+const MAX_REVIEW_ROUNDS: u32 = 2;
+/// Diff bytes fed to the reviewer prompt. Truncation is disclosed
+/// in-prompt so the model cannot mistake a cut diff for a clean one.
+const REVIEW_DIFF_LIMIT: usize = 12_000;
+/// Per-file cap for untracked-file contents included in the review.
+const REVIEW_FILE_LIMIT: usize = 2_000;
+/// Max untracked files swept into the review prompt.
+const REVIEW_FILES_MAX: usize = 10;
+
+/// LAC_REVIEW=0/off/false forces deterministic skip (tests, ops).
+fn review_enabled() -> bool {
+    !env::var("LAC_REVIEW")
+        .map(|v| v == "0" || v.eq_ignore_ascii_case("off") || v.eq_ignore_ascii_case("false"))
+        .unwrap_or(false)
+}
+
+/// Working-tree diff vs HEAD (tracked mods, staged or not) plus capped
+/// contents of small text untracked files. Read-only: never stages.
+/// Empty string when the tree is clean vs HEAD.
+fn worker_diff(root: &str) -> String {
+    let mut out = String::new();
+    if let Ok(o) = Command::new("git")
+        .current_dir(root)
+        .args(["diff", "HEAD", "--", "."])
+        .output()
+    {
+        out.push_str(&String::from_utf8_lossy(&o.stdout));
+    }
+    if let Ok(o) = Command::new("git")
+        .current_dir(root)
+        .args(["status", "-s"])
+        .output()
+    {
+        let mut n = 0;
+        for line in String::from_utf8_lossy(&o.stdout).lines() {
+            let path = match line.strip_prefix("??") {
+                Some(p) => p.trim(),
+                None => continue,
+            };
+            if path.is_empty() || n >= REVIEW_FILES_MAX {
+                continue;
+            }
+            n += 1;
+            let full = format!("{}/{}", root, path);
+            match fs::read(&full) {
+                Ok(bytes) if bytes.len() > 100_000 || bytes.contains(&0) => {
+                    out.push_str(&format!("\n--- untracked (binary/large, name only): {} ---\n", path));
+                }
+                Ok(bytes) => {
+                    let text = String::from_utf8_lossy(&bytes);
+                    let capped: String = text.chars().take(REVIEW_FILE_LIMIT).collect();
+                    out.push_str(&format!("\n--- untracked file: {} ---\n{}\n", path, capped));
+                    if text.chars().count() > REVIEW_FILE_LIMIT {
+                        out.push_str("[truncated]\n");
+                    }
+                }
+                Err(_) => {
+                    out.push_str(&format!("\n--- untracked (unreadable, name only): {} ---\n", path));
+                }
+            }
+        }
+        if n >= REVIEW_FILES_MAX {
+            out.push_str("[untracked file list truncated]\n");
+        }
+    }
+    out
+}
+
+/// Reviewer prompt. The verdict is DERIVED from finding markers by
+/// parse_review_findings (robust against verdict/findings mismatch), but
+/// the model is still asked for VERDICT so its output stays structured.
+fn review_prompt(task_desc: &str, diff: &str) -> String {
+    let short_task: String = task_desc.chars().take(300).collect();
+    let (shown, truncated) = if diff.chars().count() > REVIEW_DIFF_LIMIT {
+        (diff.chars().take(REVIEW_DIFF_LIMIT).collect::<String>(), true)
+    } else {
+        (diff.to_string(), false)
+    };
+    let mut s = String::from(
+        "You are LAC Reviewer, a read-only code auditor. Audit ONLY the diff below against the task. Report one finding per line:\n",
+    );
+    s.push_str("- [critical] file:line — description  (security hole, data loss, broken invariant, test bypass)\n");
+    s.push_str("- [major] file:line — description  (likely bug, wrong behavior, missing error handling, scope creep)\n");
+    s.push_str("- [minor] file:line — description  (style, nits — informational only)\n");
+    s.push_str("Rules: no refactors beyond the task; minor findings never block. If clean, reply exactly: NO_FINDINGS\n");
+    s.push_str("End with exactly one line — VERDICT: approve  (zero critical/major)  or  VERDICT: fix  (any critical/major).\n");
+    s.push_str(&format!("Task: {}\n", short_task));
+    if truncated {
+        s.push_str(&format!("(Diff truncated to {} chars — audit what is shown; do not assume the hidden tail is clean.)\n", REVIEW_DIFF_LIMIT));
+    }
+    s.push_str("Diff:\n");
+    s.push_str(&shown);
+    if truncated {
+        s.push_str("\n[truncated]");
+    }
+    s.push('\n');
+    s
+}
+
+/// Critical/major finding lines. Verdict is derived from these markers —
+/// never from the model's VERDICT line — so a mismatched verdict cannot
+/// smuggle findings past the gate or block on prose. Minor/suggestion
+/// lines are dropped here (report-only, never applied).
+fn parse_review_findings(output: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in output.lines() {
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        let low = t.to_lowercase();
+        if low.contains("[critical]") || low.contains("[major]") {
+            out.push(t.to_string());
+        }
+    }
+    out
+}
+
+/// Disposition after review round `round` (1-based) with `has_findings`.
+/// Pure policy, unit-tested: the loop below can never exceed
+/// MAX_REVIEW_ROUNDS reviews no matter what the model returns.
+fn review_disposition(round: u32, has_findings: bool) -> &'static str {
+    if !has_findings {
+        "commit"
+    } else if round < MAX_REVIEW_ROUNDS {
+        "fix"
+    } else {
+        "commit-flagged"
+    }
+}
+
+enum ReviewOutcome {
+    Approve,
+    Fix(Vec<String>),
+    Unavailable(String),
+}
+
+/// One review pass over the current working tree. Fail-open on infra
+/// failure: gateway down, timeout, non-200, missing content, or
+/// LAC_REVIEW=off all yield Unavailable (commit proceeds on the test
+/// gate, event logged). A clean diff is Approve without a model call.
+fn review_diff(root: &str, task_desc: &str, logpath: &str) -> ReviewOutcome {
+    if !review_enabled() {
+        return ReviewOutcome::Unavailable("LAC_REVIEW=off".to_string());
+    }
+    if !common::port_up(common::gateway_port()) {
+        return ReviewOutcome::Unavailable("gateway :8000 down".to_string());
+    }
+    let diff = worker_diff(root);
+    if diff.trim().is_empty() {
+        return ReviewOutcome::Approve;
+    }
+    let prompt = review_prompt(task_desc, &diff);
+    let model = env::var("LAC_CHAT_MODEL")
+        .ok()
+        .filter(|m| !m.trim().is_empty())
+        .unwrap_or_else(|| opencode_model(root));
+    let body = format!(
+        "{{\"model\":\"{}\",\"messages\":[{{\"role\":\"system\",\"content\":\"{}\"}},{{\"role\":\"user\",\"content\":\"{}\"}}],\"temperature\":0.0}}",
+        common::json_escape(&model),
+        common::json_escape("You are LAC Reviewer, a read-only code auditor. Reply only in the requested finding-line format."),
+        common::json_escape(&prompt)
+    );
+    let text = match post_chat(&body) {
+        Some((200, reply)) => match extract_json_string(&reply, "content") {
+            Some(t) => t,
+            None => return ReviewOutcome::Unavailable("200 without chat content".to_string()),
+        },
+        Some((code, _)) => return ReviewOutcome::Unavailable(format!("gateway HTTP {}", code)),
+        None => return ReviewOutcome::Unavailable("gateway unreachable/timeout".to_string()),
+    };
+    // Transcript the raw review for 3am debugging (best-effort).
+    if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(logpath) {
+        let _ = writeln!(f, "\n===== reviewer @ {} =====\n{}", common::now_unix(), text);
+    }
+    let findings = parse_review_findings(&text);
+    if findings.is_empty() {
+        ReviewOutcome::Approve
+    } else {
+        ReviewOutcome::Fix(findings)
+    }
 }
 
 fn count_pending(content: &str) -> (usize, usize) {
@@ -2037,7 +2445,7 @@ fn worker_current_path() -> String {
 fn cmd_worker(root: &str, args: &[String]) {
     let continuous = !args.iter().any(|a| a == "--drain" || a == "--once");
     let home = common::home_dir();
-    let tasks_file = format!("{}/todo/lac-tasks.yaml", home);
+    let tasks_file = common::tasks_file();
 
     // Single-flight: two workers (launchd + terminal) must never drain
     // the same queue concurrently.
@@ -2064,7 +2472,7 @@ fn cmd_worker(root: &str, args: &[String]) {
     }
 
     // Pre-flight 1: router on :8000.
-    if !common::port_up(8000) {
+    if !common::port_up(common::gateway_port()) {
         let router_bin = common::bin(root, "lac-router");
         if fs::metadata(&router_bin).is_ok() {
             println!("Starting LAC Unified Gateway on :8000 in background...");
@@ -2074,14 +2482,15 @@ fn cmd_worker(root: &str, args: &[String]) {
                 .spawn()
             {
                 Ok(child) => {
-                    let _ = common::atomic_write(
+                    common::persist_or_warn(
                         &format!("{}/.lac/router.pid", home),
                         &child.id().to_string(),
+                        "router_pid",
                     );
                 }
                 Err(e) => println!("  [!] Router spawn failed: {}", e),
             }
-            if common::wait_for_port(8000, Duration::from_secs(10)) {
+            if common::wait_for_port(common::gateway_port(), Duration::from_secs(10)) {
                 println!("  [ok] LAC Gateway online on http://127.0.0.1:8000/v1");
             } else {
                 println!("  [!] Gateway did not come up; worker continues, backends probed directly.");
@@ -2092,7 +2501,7 @@ fn cmd_worker(root: &str, args: &[String]) {
     }
 
     // Pre-flight 2: backends (MLX port follows serve-mlx drift).
-    if !common::port_up(common::mlx_port()) && !common::port_up(8081) && !common::port_up(11434) {
+    if !common::port_up(common::mlx_port()) && !common::port_up(common::llama_port()) && !common::port_up(common::ollama_port()) {
         println!("Notice: no inference engine on MLX/llama/Ollama ports.");
         let hint = if common::mlx_supported() { "lac serve mlx" } else { "lac serve llama" };
         println!("The worker will idle until one appears ('{}').", hint);
@@ -2148,7 +2557,11 @@ fn cmd_worker(root: &str, args: &[String]) {
             }
         };
 
-        let task = match next_pending(&content) {
+        // Judgment-aware selection: LLM picks among pending tasks, with a
+        // fail-closed fallback to deterministic file order (next_pending).
+        // Hygiene gates above (thermal) and below (KV checkpoint, tests)
+        // are unchanged — judgment only affects *which* task runs next.
+        let task = match judge_next(&content, &thermal, root) {
             Some(t) => t,
             None => {
                 let (p, d) = count_pending(&content);
@@ -2178,7 +2591,7 @@ fn cmd_worker(root: &str, args: &[String]) {
         let survived = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         println!("\nProcessing queued task [{}]: \"{}\" (attempt {}/{})", task.id, task.desc, task.attempts + 1, MAX_TASK_ATTEMPTS);
         common::log_event("task_start", &format!("[{}] {}", task.id, task.desc));
-        let _ = common::atomic_write(&worker_current_path(), &format!("id: {}\nbase: {}\n", task.id, base_branch));
+        common::persist_or_warn(&worker_current_path(), &format!("id: {}\nbase: {}\n", task.id, base_branch), "worker_current");
 
         if kv_ok {
             println!("  [1/4] KV hygiene checkpoint...");
@@ -2215,7 +2628,7 @@ fn cmd_worker(root: &str, args: &[String]) {
         );
         let timeout = task_timeout();
         let logpath = task_log_path(&task.id);
-        let impl_ok = run_logged(
+        let mut impl_ok = run_logged(
             "opencode2",
             &["run", &prompt],
             root,
@@ -2225,7 +2638,7 @@ fn cmd_worker(root: &str, args: &[String]) {
         )
         .unwrap_or(false);
 
-        let test_ok = if impl_ok {
+        let mut test_ok = if impl_ok {
             println!("  [3b/4] Reliability gate: project tests...");
             // Fail-closed: a test runner that cannot even spawn must never
             // count as "tests passed" (that would commit untested code).
@@ -2235,17 +2648,81 @@ fn cmd_worker(root: &str, args: &[String]) {
             false
         };
 
+        // Reviewer gate: implement → review → apply, max 2 rounds.
+        // Tests stay fail-closed; review is fail-open on infra failure.
+        // A fix round that breaks tests falls back into the failure path
+        // below (reset + attempt bump), exactly like a fresh failure.
+        let mut review_flagged = false;
         if impl_ok && test_ok {
-            println!("  [4/4] Tests passed.");
+            let mut round: u32 = 0;
+            loop {
+                round += 1;
+                match review_diff(root, &task.desc, &logpath) {
+                    ReviewOutcome::Approve => {
+                        println!("  [3c/4] Reviewer round {}: approve.", round);
+                        common::log_event("review_approve", &format!("[{}] round {}", task.id, round));
+                        break;
+                    }
+                    ReviewOutcome::Unavailable(reason) => {
+                        println!("  [3c/4] Reviewer unavailable ({}); proceeding on test gate.", reason);
+                        common::log_event("review_unavailable", &format!("[{}] {}", task.id, reason));
+                        break;
+                    }
+                    ReviewOutcome::Fix(findings) => {
+                        match review_disposition(round, true) {
+                            "fix" => {
+                                println!("  [3c/4] Reviewer round {}: {} critical/major finding(s) — back to @coder...", round, findings.len());
+                                common::log_event("review_fix", &format!("[{}] round {} findings {}", task.id, round, findings.len()));
+                                let fix_prompt = format!(
+                                    "Task: {}. Address these review findings (critical and major ONLY; leave minor/suggestions untouched):\n{}\nRe-run project tests and ensure zero failures.",
+                                    task.desc,
+                                    findings.join("\n")
+                                );
+                                impl_ok = run_logged(
+                                    "opencode2",
+                                    &["run", &fix_prompt],
+                                    root,
+                                    timeout,
+                                    &logpath,
+                                    &format!("opencode2 fix {} r{}", task.id, round),
+                                )
+                                .unwrap_or(false);
+                                test_ok = if impl_ok {
+                                    println!("  [3b/4] Reliability gate (post-fix): project tests...");
+                                    run_logged("make", &["test"], root, Duration::from_secs(600), &logpath, "make test")
+                                        .unwrap_or(false)
+                                } else {
+                                    false
+                                };
+                                if !(impl_ok && test_ok) {
+                                    break;
+                                }
+                                // Loop re-reviews (round 2). review_disposition
+                                // caps this: round 2 findings commit flagged.
+                            }
+                            _ => {
+                                println!("  [3c/4] Reviewer round {}: still {} critical/major finding(s) after {} rounds — committing to task branch FLAGGED for human merge review.", round, findings.len(), round);
+                                common::log_event("review_unresolved", &format!("[{}] {} finding(s) after {} rounds", task.id, findings.len(), round));
+                                review_flagged = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if impl_ok && test_ok {
+            println!("  [4/4] Tests passed{}.", if review_flagged { " (review findings unresolved — flagged)" } else { "" });
             if has_commits {
                 git_in(root, &["add", "-A"]);
                 let msg = format!("feat({}): {}", task.id, task.desc.chars().take(120).collect::<String>());
                 git_in(root, &["commit", "-m", &msg]);
             }
             println!("  Task [{}] complete.", task.id);
-            common::log_event("task_complete", &format!("[{}]", task.id));
+            common::log_event("task_complete", &format!("[{}] review_flagged={}", task.id, review_flagged));
             if let Ok(c) = fs::read_to_string(&tasks_file) {
-                let _ = common::atomic_write(&tasks_file, &update_task(&c, &task.id, "complete", false));
+                common::persist_or_warn(&tasks_file, &update_task(&c, &task.id, "complete", false), "task_complete");
             }
         } else {
             println!("  Task [{}] failed reliability gate.", task.id);
@@ -2268,7 +2745,7 @@ fn cmd_worker(root: &str, args: &[String]) {
                 } else {
                     "pending"
                 };
-                let _ = common::atomic_write(&tasks_file, &update_task(&c, &task.id, status, true));
+                common::persist_or_warn(&tasks_file, &update_task(&c, &task.id, status, true), "task_attempt_bump");
             }
         }
 
@@ -2295,7 +2772,7 @@ fn cmd_worker(root: &str, args: &[String]) {
                 } else {
                     "pending"
                 };
-                let _ = common::atomic_write(&tasks_file, &update_task(&c, &task_id, status, true));
+                common::persist_or_warn(&tasks_file, &update_task(&c, &task_id, status, true), "task_panic_bump");
             }
         }
 
@@ -2363,7 +2840,7 @@ fn cmd_ps() {
         "  {:<8} :{}  {}",
         "gateway",
         8000,
-        if common::port_up(8000) { "LISTENING" } else { "-" }
+        if common::port_up(common::gateway_port()) { "LISTENING" } else { "-" }
     );
     println!(
         "  {:<8} :{}  {}",
@@ -2375,7 +2852,7 @@ fn cmd_ps() {
             "-"
         }
     );
-    for (name, port) in [("llama", 8081), ("ollama", 11434)] {
+    for (name, port) in [("llama", common::llama_port()), ("ollama", common::ollama_port())] {
         println!(
             "  {:<8} :{}  {}",
             name,
@@ -2409,6 +2886,15 @@ fn cmd_config(root: &str) {
     println!("  root         : {}", root);
     println!("  gateway      : {}", e("LAC_GATEWAY_URL", "http://127.0.0.1:8000/v1"));
     println!("  router_port  : {}", e("LAC_ROUTER_PORT", "8000"));
+    println!("  bind_addr    : {}", e("LAC_BIND_ADDR", &e("LAC_ROUTER_HOST", "127.0.0.1")));
+    println!(
+        "  auth         : {}",
+        if env::var("LAC_API_TOKEN").map(|s| !s.trim().is_empty()).unwrap_or(false) {
+            "Bearer remote, open loopback (token set, redacted)"
+        } else {
+            "none (loopback only)"
+        }
+    );
     println!("  backend_pref : {}", e("LAC_BACKEND", "auto"));
     println!("  primary      : {}", e("PRIMARY_MODEL", "qwen3.8-27b"));
     println!("  mlx_model    : {}", e("MLX_MODEL", "mlx-community/Qwen3.8-27B-4bit"));
@@ -2446,14 +2932,19 @@ fn main() {
         }
         "thermal" => cmd_thermal(),
         "cap" => cmd_cap(&args[1..]),
-        "hermes" => cmd_hermes(&args[1..]),
+        "hermes" => cmd_hermes(&root, &args[1..]),
         "stop" => cmd_stop(),
         "ps" => cmd_ps(),
         "logs" => cmd_logs(&args[1..]),
         "config" => cmd_config(&root),
         "bench" => {
-            let port = args.get(1).and_then(|p| p.parse().ok()).unwrap_or(8000);
-            cmd_bench(port);
+            let port = args
+                .iter()
+                .skip(1)
+                .find(|a| !a.starts_with("--"))
+                .and_then(|p| p.parse().ok())
+                .unwrap_or(8000);
+            cmd_bench(port, &args[1..]);
         }
         "tune" => cmd_tune(&args[1..]),
         "serve" => {
@@ -2700,6 +3191,139 @@ mod tests {
     }
 
     #[test]
+    fn judge_prompt_lists_candidates_and_thermal() {
+        let cands = pending_candidates(SAMPLE);
+        assert_eq!(cands.len(), 2);
+        let p = judge_prompt(&cands, "Nominal");
+        assert!(p.contains("Nominal"), "thermal in prompt:\n{}", p);
+        assert!(p.contains("a-1"), "candidate a-1 in prompt:\n{}", p);
+        assert!(p.contains("b-2"), "candidate b-2 in prompt:\n{}", p);
+        assert!(p.contains("TASK_ID:"), "format instructions in prompt:\n{}", p);
+    }
+
+    #[test]
+    fn judge_parses_non_first_pick() {
+        // Fixture queue: file order is routine first, urgent last. A
+        // judgment for the urgent task must differ from next_pending().
+        const URGENT_LAST: &str = "\
+- id: \"t-routine\"\n  task: \"routine: tidy comments in docs\"\n  status: pending\n\n- id: \"t-normal\"\n  task: \"normal: add a unit test for tail_file\"\n  status: pending\n\n- id: \"t-urgent\"\n  task: \"URGENT: production auth bypass — fix login check in lac.rs now\"\n  status: pending\n";
+        let cands = pending_candidates(URGENT_LAST);
+        assert_eq!(cands.len(), 3);
+        let first = next_pending(URGENT_LAST).expect("pending").id;
+        assert_eq!(first, "t-routine");
+        let judged = parse_judge_decision("TASK_ID: t-urgent\nREASON: production auth bypass outranks tidy-up\n", &cands)
+            .expect("valid id parses");
+        assert_eq!(judged.id, "t-urgent");
+        assert_ne!(judged.id, first, "judgment differs from file order");
+        // Folded through judge_select, the judged task is what runs.
+        let picked = judge_select(cands, Some(judged)).expect("pick");
+        assert_eq!(picked.id, "t-urgent");
+    }
+
+    #[test]
+    fn judge_falls_back_to_file_order_on_failure() {
+        const URGENT_LAST: &str = "\
+- id: \"t-routine\"\n  task: \"routine: tidy comments in docs\"\n  status: pending\n\n- id: \"t-urgent\"\n  task: \"URGENT: production auth bypass\"\n  status: pending\n";
+        let cands = pending_candidates(URGENT_LAST);
+        let expected = next_pending(URGENT_LAST).expect("pending").id;
+        // Garbage output parses to None...
+        assert!(parse_judge_decision("ACTION: dispatch_loop\nno task id here\n", &cands).is_none());
+        // ...and both garbage and unknown ids fold back to file order.
+        let garbage = parse_judge_decision("hello world", &cands);
+        assert_eq!(judge_select(cands.clone(), garbage).expect("pick").id, expected);
+        let unknown = parse_judge_decision("TASK_ID: nope-missing\nREASON: hallucinated\n", &cands);
+        assert!(unknown.is_none());
+        assert_eq!(judge_select(cands.clone(), unknown).expect("pick").id, expected);
+        // Total failure (gateway down / timeout / non-200) is None too.
+        assert_eq!(judge_select(cands, None).expect("pick").id, expected);
+    }
+
+    #[test]
+    fn judge_next_single_candidate_skips_model() {
+        const ONE: &str = "- id: \"solo-1\"\n  task: \"only task\"\n  status: pending\n";
+        // No gateway needed: single-candidate queues never call post_chat.
+        let picked = judge_next(ONE, "Nominal", "/tmp").expect("solo");
+        assert_eq!(picked.id, "solo-1");
+        assert!(judge_next("nothing here", "Nominal", "/tmp").is_none());
+    }
+
+    #[test]
+    fn review_parses_critical_and_major_only() {
+        let out = "- [critical] lac.rs:42 — unsanitized id reaches git branch\n- [major] lac.rs:90 — missing error handling on router spawn\n- [minor] lac.rs:12 — typo in comment\n- [suggestion] consider renaming\nNO_FINDINGS is absent\nVERDICT: fix";
+        let f = parse_review_findings(out);
+        assert_eq!(f.len(), 2, "only critical+major survive: {:?}", f);
+        assert!(f[0].contains("lac.rs:42"));
+        assert!(f[1].contains("lac.rs:90"));
+        // Case-insensitive markers, different bullets.
+        let out2 = "* [Critical] a.rs:1 — x\n[MAJOR] b.rs:2 — y";
+        assert_eq!(parse_review_findings(out2).len(), 2);
+    }
+
+    #[test]
+    fn review_approves_clean_output() {
+        for clean in [
+            "NO_FINDINGS\nVERDICT: approve",
+            "- [minor] x.rs:1 — nit\nVERDICT: approve",
+            "",
+            "Looks fine, no issues.",
+            "VERDICT: fix", // verdict line alone is NOT a finding marker
+        ] {
+            assert!(parse_review_findings(clean).is_empty(), "must approve: {:?}", clean);
+        }
+    }
+
+    #[test]
+    fn review_disposition_caps_rounds() {
+        // Clean at any round commits.
+        assert_eq!(review_disposition(1, false), "commit");
+        assert_eq!(review_disposition(2, false), "commit");
+        // Findings on round 1 go back to the coder...
+        assert_eq!(review_disposition(1, true), "fix");
+        // ...but round 2 findings commit flagged — the loop can never
+        // reach round 3 no matter what the model returns.
+        assert_eq!(review_disposition(2, true), "commit-flagged");
+        assert_eq!(review_disposition(99, true), "commit-flagged");
+    }
+
+    #[test]
+    fn review_prompt_truncates_and_discloses() {
+        let big = "x".repeat(REVIEW_DIFF_LIMIT + 100);
+        let p = review_prompt("fix login check", &big);
+        assert!(p.contains("fix login check"), "task in prompt");
+        assert!(p.contains("truncated"), "truncation disclosed:\n{}", &p[..500]);
+        assert!(p.len() < big.len() + 2000, "prompt bounded");
+        let small = "diff --git a/x b/x";
+        let p2 = review_prompt("t", small);
+        assert!(!p2.contains("truncated"), "no false truncation note");
+        assert!(p2.contains(small));
+    }
+
+    #[test]
+    fn review_disabled_flag() {
+        let saved = env::var("LAC_REVIEW").ok();
+        // env mutation is process-global; this is the only test that
+        // touches LAC_REVIEW, and it restores the prior value.
+        unsafe {
+            env::set_var("LAC_REVIEW", "off");
+        }
+        assert!(!review_enabled());
+        unsafe {
+            env::set_var("LAC_REVIEW", "0");
+        }
+        assert!(!review_enabled());
+        unsafe {
+            env::set_var("LAC_REVIEW", "1");
+        }
+        assert!(review_enabled());
+        unsafe {
+            match saved {
+                Some(v) => env::set_var("LAC_REVIEW", v),
+                None => env::remove_var("LAC_REVIEW"),
+            }
+        }
+    }
+
+    #[test]
     fn model_parsed_through_comments() {
         let jsonc = "{\n// comment\n\"model\": \"lac/qwen-test\", /* block */\n}";
         let stripped = strip_jsonc_comments(jsonc);
@@ -2756,6 +3380,32 @@ mod tests {
     }
 
     #[test]
+    fn line_indent_basic() {
+        assert_eq!(line_indent(""), 0);
+        assert_eq!(line_indent("   "), 3);
+        assert_eq!(line_indent("\t\t"), 2);
+        assert_eq!(line_indent("abc"), 0);
+        assert_eq!(line_indent("  abc"), 2);
+    }
+
+    #[test]
+    fn block_key_indent_basic() {
+        let block = "- id: task-1\n";
+        assert_eq!(block_key_indent(block), 2);
+        let block2 = "- id:task-1\n";
+        assert_eq!(block_key_indent(block2), 2);
+    }
+
+    #[test]
+    fn block_field_simple() {
+        let block = "- id: my-task\n  task: do it\n  status: pending\n  attempts: 0";
+        assert_eq!(block_field(block, "task:").as_deref(), Some("do it"));
+        assert_eq!(block_field(block, "status:").as_deref(), Some("pending"));
+        assert_eq!(block_field(block, "attempts:").as_deref(), Some("0"));
+        assert_eq!(block_field(block, "nonexistent:").as_deref(), None);
+    }
+
+    #[test]
     fn pull_target_detection() {
         let is_hf = |m: &str| m.contains('/') || m.starts_with("mlx-") || m.contains("MLX") || m.ends_with(".gguf");
         assert!(is_hf("mlx-community/Qwen3.8-27B-4bit"));
@@ -2763,5 +3413,21 @@ mod tests {
         assert!(is_hf("unsloth/Qwen3.6-27B-MTP-GGUF"));
         assert!(!is_hf("qwen3.8-27b"));
         assert!(!is_hf("llama3"));
+    }
+
+    #[test]
+    fn probe_opts_parse_and_clamp() {
+        let d: Vec<String> = vec![];
+        let o = parse_probe_opts(&d);
+        assert_eq!((o.tokens, o.temp), (64, 0.0));
+        let a = ["--tokens".to_string(), "128".to_string(), "--temp".to_string(), "0.7".to_string()];
+        let o = parse_probe_opts(&a);
+        assert_eq!((o.tokens, o.temp), (128, 0.7));
+        let b = ["--max-tokens=4099".to_string(), "--temp=9.0".to_string()];
+        let o = parse_probe_opts(&b);
+        assert_eq!((o.tokens, o.temp), (4096, 2.0));
+        let c = ["--tokens".to_string(), "1".to_string()];
+        let o = parse_probe_opts(&c);
+        assert_eq!(o.tokens, 8);
     }
 }

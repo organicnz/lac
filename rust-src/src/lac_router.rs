@@ -1,4 +1,10 @@
-//! lac-router v2.7 — adaptive unified gateway on :8000.
+//! lac-router v2.8 — adaptive unified gateway on :8000.
+//!
+//! v2.8 over v2.7:
+//! - Response framing: Content-Length early-close (no hold-open stall),
+//!   chunked terminal detection, SSE-only keep-alives (never JSON).
+//! - Remote Bearer gate: LAC_BIND_ADDR + LAC_API_TOKEN, fail-closed on
+//!   non-loopback bind without a token, 401 for remote without Bearer.
 //!
 //! v2.7 learning layer over v2.6:
 //! - Per-backend EWMA first-byte latency + outcome/error counters, exposed
@@ -422,7 +428,7 @@ fn handle_lac_status(
 
     let body = format!(
         concat!(
-            "{{\n  \"status\": \"ok\",\n  \"router\": \"lac-router v2.7\",\n",
+            "{{\n  \"status\": \"ok\",\n  \"router\": \"lac-router v2.8\",\n",
             "  \"preferred\": \"{}\",\n  \"active\": \"{}\",\n  \"target_port\": {},\n",
             "  \"uptime_secs\": {},\n  \"inflight\": {},\n  \"models_mapped\": {},\n",
             "  \"usage_log\": \"{}\",\n",
@@ -807,10 +813,127 @@ fn parse_content_length(headers: &[u8]) -> Option<usize> {
     None
 }
 
-/// Borrowed-client forward: on `Connect` failure the caller still owns
-/// the client socket and may retry the next backend. Mid-stream
-/// failures return `Stream` (response already partial — no retry).
-/// Ok carries (request bytes, response bytes, first-byte latency).
+/// Remote auth: tailnet-only Bearer gate (fail closed).
+/// Loopback stays token-less for local dev; any non-loopback peer must
+/// present `Authorization: Bearer <LAC_API_TOKEN>`, compared constant-time.
+fn bind_host() -> String {
+    env::var("LAC_BIND_ADDR")
+        .or_else(|_| env::var("LAC_ROUTER_HOST"))
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|_| "127.0.0.1".to_string())
+}
+
+fn api_token() -> String {
+    env::var("LAC_API_TOKEN")
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default()
+}
+
+fn is_loopback_host(h: &str) -> bool {
+    let t = h.trim().to_lowercase();
+    t == "127.0.0.1" || t == "localhost" || t == "::1"
+}
+
+fn is_loopback_peer(addr: &SocketAddr) -> bool {
+    addr.ip().is_loopback()
+}
+
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    let ab = a.as_bytes();
+    let bb = b.as_bytes();
+    if ab.len() != bb.len() {
+        return false;
+    }
+    let mut diff: u8 = 0;
+    for i in 0..ab.len() {
+        diff |= ab[i] ^ bb[i];
+    }
+    diff == 0
+}
+
+/// Extract `Bearer <token>` from raw request headers (case-insensitive).
+fn bearer_from(headers: &[u8]) -> Option<String> {
+    let head = String::from_utf8_lossy(headers);
+    for line in head.lines() {
+        let t = line.trim();
+        if t.is_empty() {
+            break;
+        }
+        if let Some((name, val)) = t.split_once(':') {
+            if name.trim().eq_ignore_ascii_case("authorization") {
+                let v = val.trim();
+                if let Some(tok) = v.strip_prefix("Bearer ").or_else(|| v.strip_prefix("bearer ")) {
+                    return Some(tok.trim().to_string());
+                }
+                return None;
+            }
+        }
+    }
+    None
+}
+
+fn unauthorized(stream: &mut TcpStream) -> io::Result<()> {
+    json_response(
+        stream,
+        "401 Unauthorized",
+        "{\"error\":{\"message\":\"missing or invalid Bearer token (set LAC_API_TOKEN)\",\"type\":\"lac_router_auth\",\"code\":401}}",
+    )
+}
+/// Keep-alive tick for SSE streams. Env-overridable for tests
+/// (`LAC_ROUTER_KEEPALIVE_SECS=1`); defaults to 15s in prod.
+fn keepalive_secs() -> u64 {
+    env::var("LAC_ROUTER_KEEPALIVE_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&n| (1..=60).contains(&n))
+        .unwrap_or(15)
+}
+
+/// Parse response framing: (content-length, is_chunked, is_sse).
+fn parse_resp_headers(head: &[u8]) -> (Option<usize>, bool, bool) {
+    let s = String::from_utf8_lossy(head).to_lowercase();
+    let mut cl: Option<usize> = None;
+    let mut chunked = false;
+    let mut sse = false;
+    for line in s.lines() {
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        if let Some((name, val)) = t.split_once(':') {
+            match name.trim() {
+                "content-length" => {
+                    if cl.is_none() {
+                        if let Ok(n) = val.trim().parse::<usize>() {
+                            cl = Some(n);
+                        }
+                    }
+                }
+                "transfer-encoding" => {
+                    if val.contains("chunked") {
+                        chunked = true;
+                    }
+                }
+                "content-type" => {
+                    if val.contains("text/event-stream") {
+                        sse = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    // Chunked wins over Content-Length per RFC 7230 §3.3.3.
+    if chunked {
+        cl = None;
+    }
+    (cl, chunked, sse)
+}
+
+/// True when the trailing bytes complete a chunked body (`0\r\n\r\n`).
+fn chunk_term(tail: &[u8]) -> bool {
+    tail.len() >= 5 && &tail[tail.len() - 5..] == b"0\r\n\r\n"
+}
 fn try_forward(
     client: &TcpStream,
     target_port: u16,
@@ -833,7 +956,8 @@ fn try_forward(
     let _ = client.set_nodelay(true);
     let _ = server.set_nodelay(true);
     let _ = client.set_read_timeout(Some(STREAM_BUDGET));
-    let _ = server.set_read_timeout(Some(Duration::from_secs(15)));
+    let ka = keepalive_secs();
+    let _ = server.set_read_timeout(Some(Duration::from_secs(ka)));
     let _ = client.set_write_timeout(Some(Duration::from_secs(60)));
     let _ = server.set_write_timeout(Some(Duration::from_secs(60)));
 
@@ -901,6 +1025,23 @@ fn try_forward(
     let mut buf = [0u8; 16384];
     let mut down_total = 0u64;
     let mut ttfb: Option<f64> = None;
+    // Response framing: parse headers incrementally so we can end a
+    // complete Content-Length body early (hold-open backends) and only
+    // inject SSE keep-alives into event-streams (never JSON).
+    let mut head_buf: Vec<u8> = Vec::with_capacity(4096);
+    let mut headers_done = false;
+    let mut resp_cl: Option<usize> = None;
+    let mut resp_chunked = false;
+    let mut resp_sse = false;
+    let mut resp_body: usize = 0;
+    let mut tail: Vec<u8> = Vec::new();
+    let push_tail = |data: &[u8], tail: &mut Vec<u8>| {
+        tail.extend_from_slice(data);
+        if tail.len() > 16 {
+            let excess = tail.len() - 16;
+            tail.drain(..excess);
+        }
+    };
     loop {
         match server_read.read(&mut buf) {
             Ok(0) => break,
@@ -908,14 +1049,48 @@ fn try_forward(
                 if ttfb.is_none() {
                     ttfb = Some(t_start.elapsed().as_secs_f64() * 1000.0);
                 }
+                let chunk = &buf[..n];
                 down_total += n as u64;
-                if client_write.write_all(&buf[..n]).is_err() {
+                if client_write.write_all(chunk).is_err() {
                     break;
+                }
+                if !headers_done {
+                    head_buf.extend_from_slice(chunk);
+                    if head_buf.len() > MAX_HEADERS {
+                        // Pathological headers: fall back to opaque relay.
+                        headers_done = true;
+                    } else if let Some(h_end) = find_headers_end(&head_buf) {
+                        let (cl, chunked, sse) = parse_resp_headers(&head_buf[..h_end]);
+                        resp_cl = cl;
+                        resp_chunked = chunked;
+                        resp_sse = sse;
+                        resp_body = head_buf.len().saturating_sub(h_end);
+                        push_tail(&head_buf, &mut tail);
+                        headers_done = true;
+                        if let Some(len) = resp_cl {
+                            if resp_body >= len {
+                                break;
+                            }
+                        } else if resp_chunked && chunk_term(&tail) {
+                            break;
+                        }
+                    }
+                } else {
+                    resp_body += n;
+                    push_tail(chunk, &mut tail);
+                    if let Some(len) = resp_cl {
+                        if resp_body >= len {
+                            break;
+                        }
+                    } else if resp_chunked && chunk_term(&tail) {
+                        break;
+                    }
                 }
             }
             Err(e) if (e.kind() == io::ErrorKind::TimedOut || e.kind() == io::ErrorKind::WouldBlock) && t_start.elapsed() < STREAM_BUDGET => {
-                // If response headers already delivered to client, emit SSE comment keep-alive to maintain transport
-                if ttfb.is_some() {
+                // Only SSE streams get comment keep-alives, and only after
+                // headers so JSON bodies stay byte-clean.
+                if headers_done && resp_sse {
                     let _ = client_write.write_all(b": keep-alive\n\n");
                 }
                 continue;
@@ -953,6 +1128,7 @@ fn handle_connection(
     inflight: Arc<AtomicUsize>,
     rid: Arc<AtomicUsize>,
     started: Instant,
+    expected_token: Arc<String>,
 ) {
     // Adopt the accept loop's reservation (see main); the guard releases
     // it on every return below — accounting stays exact under bursts.
@@ -971,6 +1147,25 @@ fn handle_connection(
     if method == "OPTIONS" {
         let _ = handle_options(client);
         return;
+    }
+
+    // Remote Bearer gate: loopback is token-less; any non-loopback peer
+    // without the exact token gets 401 and is never routed nor status-read.
+    let peer_loopback = client
+        .peer_addr()
+        .map(|a| is_loopback_peer(&a))
+        .unwrap_or(false);
+    if !peer_loopback {
+        let ok = !expected_token.is_empty()
+            && bearer_from(&initial)
+                .map(|t| constant_time_eq(&t, &expected_token))
+                .unwrap_or(false);
+        if !ok {
+            let mut c = client;
+            let _ = unauthorized(&mut c);
+            eprintln!("[lac-router rid={}] {} {} -> 401 remote-auth", rid_n, method, path);
+            return;
+        }
     }
 
     if path == "/lac/status" || path == "/lac/health" || path == "/v1/status" || path == "/v1/health" {
@@ -1131,7 +1326,20 @@ fn main() {
         preferred.store(load_persisted_backend(), Ordering::SeqCst);
     }
 
-    let bind_addr = format!("127.0.0.1:{}", port);
+    let host = bind_host();
+    let token = api_token();
+    // Fail closed: a non-loopback bind without a token would expose the
+    // gateway unauthenticated — refuse to start instead.
+    if !is_loopback_host(&host) && token.is_empty() {
+        eprintln!(
+            "Refusing to bind lac-router to {} without LAC_API_TOKEN (remote would be open). Set LAC_API_TOKEN.",
+            host
+        );
+        std::process::exit(1);
+    }
+    let expected_token: Arc<String> = Arc::new(token);
+
+    let bind_addr = format!("{}:{}", host, port);
     let listener = match TcpListener::bind(&bind_addr) {
         Ok(l) => l,
         Err(e) => {
@@ -1148,8 +1356,16 @@ fn main() {
     let started = Instant::now();
 
     eprintln!("========================================================");
-    eprintln!("  LAC Unified Intelligent Router v2.7 (Rust native)");
+    eprintln!("  LAC Unified Intelligent Router v2.8 (Rust native)");
     eprintln!("  Listening on http://{}", bind_addr);
+    eprintln!(
+        "  Remote auth: {}",
+        if is_loopback_host(&host) {
+            "loopback open (local dev)"
+        } else {
+            "Bearer required for non-loopback (fail-closed)"
+        }
+    );
     eprintln!(
         "  Proxying /v1/* -> MLX :{} | llama :{} | Ollama :{}",
         port_mlx(),
@@ -1193,9 +1409,10 @@ fn main() {
                 let routes = Arc::clone(&routes);
                 let inflight = Arc::clone(&inflight);
                 let rid = Arc::clone(&rid);
+                let tok = Arc::clone(&expected_token);
                 thread::spawn(move || {
                     let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        handle_connection(client, pref, hc, stats, routes, inflight, rid, started);
+                        handle_connection(client, pref, hc, stats, routes, inflight, rid, started, tok);
                     }));
                     if let Err(e) = res {
                         eprintln!("[lac-router] recovered safely from thread panic in connection handler: {:?}", e);
@@ -1305,5 +1522,49 @@ mod tests {
         assert_eq!(parse_content_length(req), Some(42));
         let get = b"GET /v1/models HTTP/1.1\r\nHost: localhost\r\n\r\n";
         assert_eq!(parse_content_length(get), None);
+    }
+
+    #[test]
+    fn resp_framing_parsed() {
+        let json = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 48\r\nConnection: keep-alive\r\n\r\n";
+        assert_eq!(
+            parse_resp_headers(json),
+            (Some(48), false, false)
+        );
+        let sse = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n";
+        assert_eq!(parse_resp_headers(sse), (None, true, true));
+        // Chunked wins over Content-Length per RFC 7230.
+        let both = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 99\r\nContent-Type: text/event-stream\r\n\r\n";
+        assert_eq!(parse_resp_headers(both), (None, true, true));
+    }
+
+    #[test]
+    fn chunk_terminal_detected() {
+        assert!(chunk_term(b"data: A\n\n\r\n0\r\n\r\n"));
+        assert!(chunk_term(b"0\r\n\r\n"));
+        assert!(!chunk_term(b"data: A\n\n"));
+        assert!(!chunk_term(b""));
+    }
+
+    #[test]
+    fn bearer_gate() {
+        assert!(is_loopback_host("127.0.0.1"));
+        assert!(is_loopback_host("localhost"));
+        assert!(is_loopback_host("::1"));
+        assert!(!is_loopback_host("0.0.0.0"));
+        assert!(!is_loopback_host("100.64.0.5"));
+        assert!(constant_time_eq("abc", "abc"));
+        assert!(!constant_time_eq("abc", "abd"));
+        assert!(!constant_time_eq("abc", "abcd"));
+        let req = b"GET /v1/models HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer sekrit\r\n\r\n";
+        assert_eq!(bearer_from(req).as_deref(), Some("sekrit"));
+        let noauth = b"GET /v1/models HTTP/1.1\r\nHost: x\r\n\r\n";
+        assert_eq!(bearer_from(noauth), None);
+        let bad = b"GET /x HTTP/1.1\r\nAuthorization: Basic abc\r\n\r\n";
+        assert_eq!(bearer_from(bad), None);
+        let peer_lo: SocketAddr = "127.0.0.1:8000".parse().unwrap();
+        let peer_remote: SocketAddr = "100.64.0.5:1234".parse().unwrap();
+        assert!(is_loopback_peer(&peer_lo));
+        assert!(!is_loopback_peer(&peer_remote));
     }
 }
