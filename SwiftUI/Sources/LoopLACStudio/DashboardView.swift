@@ -26,19 +26,17 @@ struct DashboardView: View {
                 lastRefresh = Date()
             }
         }
-        .task {
+.task {
             // Adaptive auto-refresh: polls every 3s when healthy, every 4s when
             // disconnected or recovering. Resumes automatically as soon as the
             // router comes back online without requiring manual intervention.
+            var interval: Duration = .seconds(3)
             while !Task.isCancelled {
-                let interval: Duration = (network.lastError != nil) ? .seconds(4) : .seconds(3)
-                try? await Task.sleep(for: interval)
-                if Task.isCancelled { break }
-                await MainActor.run {
-                    if !network.isChecking && !network.autoRefreshPaused {
-                        network.fetch()
-                    }
+                if !network.isChecking && !network.autoRefreshPaused {
+                    network.fetch()
                 }
+                try? await Task.sleep(for: interval)
+                interval = interval == .seconds(3) ? .seconds(4) : .seconds(3)
             }
         }
     }
@@ -110,6 +108,7 @@ struct DashboardView: View {
                 ScrollView(showsIndicators: false) {
                     VStack(spacing: 20) {
                         statusSummary
+                        ConnectionSettingsView(connection: LACConnectionStore.shared)
                         backendsGrid
                         statsOverview
                         controlPanel

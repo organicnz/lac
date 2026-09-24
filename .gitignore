@@ -34,6 +34,13 @@ models/
 # OpenCode & IDE artifacts
 .opencode/logs/
 .opencode/cache/
+*.bak
+*.bak2
+*.orig
+*.swp
+*.swo
+*.ws
+*~
 
 # SwiftPM build output
 .build/

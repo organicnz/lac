@@ -7,6 +7,8 @@ description: Simple job queue processor for autonomous task batches
 
 Processes queued coding tasks one by one without manual intervention per task. Reads `~/todo/lac-tasks.yaml`, pops first `pending` entry, runs it via `loop-orchestrator`, marks `complete` or `failed`, moves to next. Enables "process these 5 tickets overnight and stop" autonomy.
 
+> NOTE: `lac worker` / `lac hermes run` is the native queue drain (judgment-augmented, see `hermes-orchestrator`). This skill is the OpenCode-side batch equivalent for model-driven drains. Human merge review stays mandatory in both paths (native commits to `task/<id>` branches; this skill drains to "ready for human review").
+
 Lower priority than loop safety, but essential for true non-stop operation where human queues work and machine drains queue.
 
 ## Workflow

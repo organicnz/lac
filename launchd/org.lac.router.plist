@@ -30,6 +30,11 @@
     <dict>
         <key>LAC_ROUTER_PORT</key>
         <string>8000</string>
+        <!-- Loopback by default. For Tailscale remote set to 0.0.0.0 AND set
+             LAC_API_TOKEN via `launchctl setenv LAC_API_TOKEN "$(openssl rand -hex 32)"`
+             then `lac daemon install` again. Never commit a token here. -->
+        <key>LAC_BIND_ADDR</key>
+        <string>127.0.0.1</string>
         <key>PATH</key>
         <string>/opt/homebrew/bin:/Users/organic/.cargo/bin:/Users/organic/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     </dict>

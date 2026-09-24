@@ -168,11 +168,8 @@ impl<T: Copy, const N: usize> RingBuffer<T, N> {
 }
 """
 
-    private let port: Int = {
-        if let raw = ProcessInfo.processInfo.environment["LAC_ROUTER_PORT"],
-           let p = Int(raw), p > 0 { return p }
-        return 8000
-    }()
+    private var connection: LACConnectionStore { LACConnectionStore.shared }
+    private var port: Int { connection.port }
 
     private var streamTask: Task<Void, Never>?
 
@@ -385,7 +382,7 @@ Task: \(instruction)
     // MARK: Streaming Network Client
 
     private func streamCompletion(prompt: String) async throws -> String {
-        guard let url = URL(string: "http://127.0.0.1:\(port)/v1/chat/completions") else {
+        guard let url = connection.url(path: "/v1/chat/completions") else {
             throw URLError(.badURL)
         }
 
@@ -406,6 +403,7 @@ Task: \(instruction)
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        connection.authorize(&req)
         req.timeoutInterval = 300
         req.httpBody = try JSONEncoder().encode(WireRequest(
             model: model,

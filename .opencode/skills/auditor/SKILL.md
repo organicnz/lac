@@ -28,9 +28,9 @@ The skill will:
    - Rust (Backend Suite): `cargo test --manifest-path rust-src/Cargo.toml`, `cargo clippy`
    - General: `git diff --stat` vs last commit, `tokei` LoC counts
 3. **Scan for antipatterns** using regex + language-specific rules
-4. **Output** `AUDIT_REPORT.md` at project root
+4. **Output** `docs/AUDIT_REPORT.md` at project root docs/
 
-## Output format (`AUDIT_REPORT.md`)
+## Output format (`docs/AUDIT_REPORT.md`)
 
 ```markdown
 # Code Audit — <timestamp>
@@ -72,7 +72,7 @@ Customize antipatterns per language in `opencode.jsonc`:
 "agents": {
   "auditor": {
     "system": "Focus on Swift correctness, Liquid Glass HIG compliance, and Rust std idioms.",
-    "permissions": [{ "action": "edit", "resource": "*", "effect": "deny" }]
+    "permission": { "edit": "deny", "bash": "allow", "skill": "allow" }
   }
 }
 ```

@@ -29,7 +29,7 @@ struct BackendStats: Codable {
     }
 }
 
-/// Decodes every router generation: v2.7 fields (uptime, inflight,
+/// Decodes every router generation: v2.7+ fields (uptime, inflight,
 /// models_mapped, usage_log, stats) default when absent, so an older
 /// gateway (e.g. v2.0) still renders instead of blanking the dashboard.
 struct RouterStatusResponse: Codable {
@@ -94,11 +94,13 @@ class NetworkManager: ObservableObject {
     @Published var pullProgress: Double?
     private var pullProcess: Process?
 
-    let port: Int = {
-        if let raw = ProcessInfo.processInfo.environment["LAC_ROUTER_PORT"],
-           let p = Int(raw), p > 0 { return p }
-        return 8000
-    }()
+    /// Shared tailnet-ready connection (local 127.0.0.1 default, remote
+    /// Tailscale IP/MagicDNS + Keychain Bearer token). All URLs flow here.
+    var connection: LACConnectionStore { LACConnectionStore.shared }
+
+    var port: Int { connection.port }
+    var displayHost: String { connection.displayName }
+    var isRemote: Bool { connection.isRemote }
 
     init() {
         checkDaemonStatus()
@@ -130,18 +132,21 @@ class NetworkManager: ObservableObject {
         // Coalesce overlapping polls (3s dashboard ticker + manual refresh).
         guard !isChecking else { return }
         isChecking = true
-        Task {
+        Task { @MainActor in
             do {
-                guard let url = URL(string: "http://127.0.0.1:\(port)/lac/status") else {
+                guard let url = connection.url(path: "/lac/status") else {
                     await MainActor.run {
-                        self.lastError = "Invalid router URL (port \(port))"
-                        self.isChecking = false
+                        self.lastError = "Invalid router URL (\(connection.displayName))"
                     }
                     return
                 }
                 var req = URLRequest(url: url)
                 req.timeoutInterval = 5
-                let (data, _) = try await URLSession.shared.data(for: req)
+                connection.authorize(&req)
+                let (data, resp) = try await URLSession.shared.data(for: req)
+                if let http = resp as? HTTPURLResponse, http.statusCode == 401 {
+                    throw NSError(domain: "LAC", code: 401, userInfo: [NSLocalizedDescriptionKey: "401 Unauthorized — set the gateway token (Tailscale remote)."])
+                }
                 let decoded = try JSONDecoder().decode(RouterStatusResponse.self, from: data)
                 await MainActor.run {
                     self.response = decoded
@@ -157,7 +162,6 @@ class NetworkManager: ObservableObject {
                         self.hasAutoStartedRouter = true
                         Task { await self.startRouter() }
                     }
-                    // Keep autoRefresh running so self-healing loop can reconnect when online
                 }
             }
             await fetchHostFacts()
@@ -240,6 +244,7 @@ class NetworkManager: ObservableObject {
     }
 
     func startMLX() async {
+        guard !isRemote else { lastAction = "Remote tailnet: start backends on the Mac, not here."; return }
         spawnDetachedLac(["serve", "mlx"])
         for _ in 0..<10 {
             try? await Task.sleep(nanoseconds: 500_000_000)
@@ -249,6 +254,7 @@ class NetworkManager: ObservableObject {
     }
 
     func startLlama() async {
+        guard !isRemote else { lastAction = "Remote tailnet: start backends on the Mac, not here."; return }
         spawnDetachedLac(["serve", "llama"])
         for _ in 0..<10 {
             try? await Task.sleep(nanoseconds: 500_000_000)
@@ -258,6 +264,7 @@ class NetworkManager: ObservableObject {
     }
 
     func startOllama() async {
+        guard !isRemote else { lastAction = "Remote tailnet: start backends on the Mac, not here."; return }
         spawnDetachedLac(["serve", "ollama"])
         for _ in 0..<10 {
             try? await Task.sleep(nanoseconds: 500_000_000)
@@ -267,14 +274,31 @@ class NetworkManager: ObservableObject {
     }
 
     func checkPortHealth(_ targetPort: Int) async -> Bool {
-        guard let url = URL(string: "http://127.0.0.1:\(targetPort)/v1/models") else { return false }
+        if isRemote {
+            let url = connection.url(path: "/v1/models")
+            guard let url else { return false }
+            var req = URLRequest(url: url)
+            req.timeoutInterval = 3
+            connection.authorize(&req)
+            do {
+                let (_, resp) = try await URLSession.shared.data(for: req)
+                guard let http = resp as? HTTPURLResponse, http.statusCode == 200 else { return false }
+                return true
+            } catch {
+                return false
+            }
+        }
+        let url = URL(string: "http://127.0.0.1:\(targetPort)/v1/models")
+        guard let url else { return false }
         var req = URLRequest(url: url)
         req.timeoutInterval = 1
-        guard let (_, resp) = try? await URLSession.shared.data(for: req),
-              let http = resp as? HTTPURLResponse, http.statusCode == 200 else {
+        do {
+            let (_, resp) = try await URLSession.shared.data(for: req)
+            guard let http = resp as? HTTPURLResponse, http.statusCode == 200 else { return false }
+            return true
+        } catch {
             return false
         }
-        return true
     }
 
     /// Free bytes on the home volume (for pull disk preflight).
@@ -324,7 +348,8 @@ class NetworkManager: ObservableObject {
         p.standardError = pipe
 
         let fileHandle = pipe.fileHandleForReading
-        fileHandle.readabilityHandler = { handle in
+        fileHandle.readabilityHandler = { [weak self] handle in
+            guard let self else { return }
             let data = handle.availableData
             if !data.isEmpty, let str = String(data: data, encoding: .utf8) {
                 DispatchQueue.main.async { [weak self, str] in
@@ -413,12 +438,13 @@ class NetworkManager: ObservableObject {
     /// - Parameter clearLastError: if false, `fetch()` won't nil the
     ///   switch error so the user can see what went wrong.
     func switchBackend(_ target: String, clearLastError: Bool = true) async {
-        guard let url = URL(string: "http://127.0.0.1:\(port)/lac/switch?target=\(target)") else {
-            lastError = "Invalid router URL (port \(port)) — cannot switch to \(target)"
+        guard let url = connection.url(path: "/lac/switch?target=\(target)") else {
+            lastError = "Invalid router URL (\(connection.displayName)) — cannot switch to \(target)"
             return
         }
         var req = URLRequest(url: url)
         req.timeoutInterval = 8
+        connection.authorize(&req)
         do {
             let (_, resp) = try await URLSession.shared.data(for: req)
             guard let http = resp as? HTTPURLResponse, http.statusCode == 200 else {
@@ -435,6 +461,7 @@ class NetworkManager: ObservableObject {
     /// Install/uninstall the launchd daemons, record the first output
     /// line, then refresh from real status (never assume success).
     func setDaemon(enabled: Bool) async {
+        guard !isRemote else { lastAction = "Remote tailnet: manage daemons on the Mac."; return }
         let out = await runLac(["daemon", enabled ? "install" : "uninstall"])
         lastAction = out.split(separator: "\n").first.map(String.init)
         checkDaemonStatus()
@@ -442,7 +469,9 @@ class NetworkManager: ObservableObject {
     }
 
     /// Start the gateway in the background, poll until responsive, then refresh.
+    /// No-op on remote tailnet (the Mac owns the router there).
     func startRouter() async {
+        guard !isRemote else { return }
         await MainActor.run {
             self.lastAction = "Starting lac-router on :\(port)..."
             self.isChecking = true
@@ -501,9 +530,10 @@ class NetworkManager: ObservableObject {
     }
 
     func checkRouterHealth() async -> Bool {
-        guard let url = URL(string: "http://127.0.0.1:\(port)/lac/status") else { return false }
+        guard let url = connection.url(path: "/lac/status") else { return false }
         var req = URLRequest(url: url)
         req.timeoutInterval = 2
+        connection.authorize(&req)
         guard let (data, resp) = try? await URLSession.shared.data(for: req),
               let http = resp as? HTTPURLResponse, http.statusCode == 200,
               let _ = try? JSONDecoder().decode(RouterStatusResponse.self, from: data) else {

@@ -7,6 +7,8 @@ description: Run defined agentic loops (implement-review-apply) with safety gate
 
 Orchestrates multi-step agentic coding loops with safety gates between phases. Prevents infinite implement↔review ping-pong (cap at 2 rounds per research). Each phase calls appropriate skills for state, context, and thermal safety.
 
+> Queue semantics (judge/select, task branches, review markers, dead-letter) are normative in `hermes-orchestrator/SKILL.md` + `docs/ARCHITECTURE.md §5`. This skill defines the single-task implement→review→apply→gate shape only.
+
 Implements the proven pattern from cmaven dual-model review research:
 ```
 Round 1: implement → review → apply  (most real problems surface here)

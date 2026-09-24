@@ -175,11 +175,8 @@ public class LoopsStore: ObservableObject {
     @Published public var isGateAwaitingApproval: Bool = false
     @Published public var selectedModel: String = "mlx-community/Qwen3.8-27B-4bit"
 
-    private let port: Int = {
-        if let raw = ProcessInfo.processInfo.environment["LAC_ROUTER_PORT"],
-           let p = Int(raw), p > 0 { return p }
-        return 8000
-    }()
+    private var connection: LACConnectionStore { LACConnectionStore.shared }
+    private var port: Int { connection.port }
 
     private var runTask: Task<Void, Never>?
 
@@ -338,7 +335,7 @@ public class LoopsStore: ObservableObject {
     // MARK: - Gateway Client
 
     private func queryGateway(prompt: String, system: String) async throws -> String {
-        guard let url = URL(string: "http://127.0.0.1:\(port)/v1/chat/completions") else {
+        guard let url = connection.url(path: "/v1/chat/completions") else {
             throw URLError(.badURL)
         }
         struct WireMessage: Encodable { var role: String; var content: String }
@@ -351,6 +348,7 @@ public class LoopsStore: ObservableObject {
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        connection.authorize(&req)
         req.timeoutInterval = 20
         let modelName = selectedModel.isEmpty ? "mlx-community/Qwen3.8-27B-4bit" : selectedModel
         req.httpBody = try JSONEncoder().encode(WireRequest(

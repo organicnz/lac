@@ -275,9 +275,11 @@ struct SidebarView: View {
                     Circle()
                         .fill(network.response != nil ? Color.green : Color.red)
                         .frame(width: 6, height: 6)
-                    Text("Gateway :\(network.port)")
+                    Text(network.displayHost)
                         .font(.system(size: 10, weight: .medium))
                         .foregroundColor(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
                 }
             }
 
@@ -694,8 +696,10 @@ struct SidebarView: View {
                     Circle()
                         .fill(network.response != nil ? Color.green : Color.red)
                         .frame(width: 7, height: 7)
-                    Text("Gateway :\(network.port)")
+                    Text(network.displayHost)
                         .font(.system(size: 11, weight: .semibold))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
                     Spacer()
                     Text(network.response?.preferred.uppercased() ?? "LOCAL")
                         .font(.system(size: 9, weight: .bold))

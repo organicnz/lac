@@ -1,7 +1,7 @@
 # LAC — Local Agentic Coding Makefile
 # Target: Apple Silicon Macs (best on high-RAM Studio) | Qwen 3.8 27B
 
-.PHONY: all default build release test status doctor route route-daemon serve-mlx serve-llama tui studio dashboard bench tune loop-init loop-list worker worker-drain daemon-install daemon-uninstall daemon-status stop ps logs config scripts bootstrap install clean help
+.PHONY: all default build test status doctor route route-daemon serve-mlx serve-llama tui studio dashboard bench tune loop-init loop-list worker worker-drain daemon-install daemon-uninstall daemon-status stop ps logs config scripts bootstrap install clean help
 
 .DEFAULT_GOAL := default
 
@@ -99,10 +99,10 @@ loop-init:
 loop-list:
 	@$(LAC_BIN) loop list
 
-worker: build
+worker: | build
 	@$(LAC_BIN) worker
 
-worker-drain: build
+worker-drain: | build
 	@$(LAC_BIN) worker --drain
 
 daemon-install: install
@@ -134,6 +134,7 @@ install: build
 
 clean:
 	@cd rust-src && cargo clean
+	@rm -rf SwiftUI/.build SwiftUI/.swiftpm scripts/bin
 	@echo "🧹 Clean complete."
 
 help:
@@ -157,8 +158,12 @@ help:
 	@echo "  make ps             List lac processes + port table"
 	@echo "  make logs           Tail router log"
 	@echo "  make config         Print effective configuration"
-	@echo "  make scripts        Compile standalone Rust launchers (scripts/*.rs)"
-	@echo "  make bootstrap      Build suite + run idempotent machine bootstrap"
-	@echo "  make build          Build release binaries"
-	@echo "  make install        Install binaries to ~/.local/bin"
-	@echo "  make test           Run cargo unit tests"
+  @echo "  make scripts        Compile standalone Rust launchers (scripts/*.rs)"
+  @echo "  make bootstrap      Build suite + run idempotent machine bootstrap"
+  @echo "  make build          Build release binaries"
+  @echo "  make install        Install binaries to ~/.local/bin"
+  @echo "  make test           Run cargo unit tests"
+  @echo "  make clean          Remove Rust + Swift build outputs + scripts/bin"
+  @echo "  make app            Package LAC Studio macOS app"
+  @echo "  make loop-init      Install Kanban queue + loop templates to ~/todo"
+  @echo "  make loop-list      List available loop workflows"

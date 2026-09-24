@@ -47,7 +47,8 @@ opencode2 run 'Use the permissions-trust skill --revoke "cargo test *"'
 
 ```bash
 opencode2 run 'Use the permissions-trust skill --sync'
-# Merges trusted rules into opencode.jsonc permissions[] (trusted first, then project rules)
+# Merges trusted rules into opencode.jsonc `permission` (trusted first, then project rules)
+# NOTE: opencode.jsonc uses singular `permission: {edit,bash,skill}` (not `permissions[]`).
 ```
 
 ## Safety rules (never trust these)

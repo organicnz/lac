@@ -28,11 +28,15 @@ pub fn home_dir() -> String {
 /// peer returns EPIPE instead of abruptly aborting the process with a signal.
 #[cfg(unix)]
 pub fn ignore_sigpipe() {
+    const SIGPIPE: std::ffi::c_int = 13;
+    // SIG_IGN = 1 on Darwin/Linux; typed as fn pointer, not usize.
+    type Sighandler = unsafe extern "C" fn(std::ffi::c_int);
     unsafe extern "C" {
-        fn signal(sig: std::ffi::c_int, handler: usize) -> usize;
+        fn signal(sig: std::ffi::c_int, handler: Sighandler) -> Sighandler;
     }
+    unsafe extern "C" fn ignore(_: std::ffi::c_int) {}
     unsafe {
-        signal(13, 1); // 13 = SIGPIPE, 1 = SIG_IGN
+        signal(SIGPIPE, ignore);
     }
 }
 
@@ -68,6 +72,54 @@ pub fn project_root() -> String {
 /// Absolute path to a sibling release binary.
 pub fn bin(root: &str, name: &str) -> String {
     format!("{}/rust-src/target/release/{}", root, name)
+}
+
+/// Centralized ports — env-overridable, single source of truth.
+/// lac.rs / lac-tui.rs must call these instead of hardcoding 8000/8081/11434.
+pub fn gateway_port() -> u16 {
+    env::var("LAC_ROUTER_PORT")
+        .ok()
+        .and_then(|p| p.trim().parse().ok())
+        .unwrap_or(8000)
+}
+
+pub fn llama_port() -> u16 {
+    env::var("LAC_LLAMA_PORT")
+        .ok()
+        .and_then(|p| p.trim().parse().ok())
+        .unwrap_or(8081)
+}
+
+pub fn ollama_port() -> u16 {
+    env::var("LAC_OLLAMA_PORT")
+        .ok()
+        .and_then(|p| p.trim().parse().ok())
+        .unwrap_or(11434)
+}
+
+/// Canonical Kanban queue + loops paths (single copy — lac.rs had 4).
+pub fn tasks_file() -> String {
+    format!("{}/todo/lac-tasks.yaml", home_dir())
+}
+
+pub fn loops_dir() -> String {
+    format!("{}/todo/lac-loops", home_dir())
+}
+
+/// Persist-or-warn: queue/state writes must never silently drop.
+/// Returns true on success; logs to stderr + event log on failure.
+pub fn persist_or_warn(path: &str, contents: &str, ctx: &str) -> bool {
+    match atomic_write(path, contents) {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("warning: {} write to {} failed: {}", ctx, path, e);
+            append_jsonl(
+                &format!("{}/.lac/event.log", home_dir()),
+                &format!("{{\"ts\":{},\"level\":\"warn\",\"ctx\":\"{}\",\"err\":\"{}\"}}", now_unix(), ctx, e),
+            );
+            false
+        }
+    }
 }
 
 /// Retarget a launchd plist template at THIS machine: baked-in prior-home
@@ -285,6 +337,9 @@ pub fn http_post(port: u16, path: &str, body: &str, timeout_ms: u64) -> Option<(
 /// Blocking HTTP POST to a specific socket address with total deadline budget.
 pub fn http_post_addr(addr: &str, path: &str, body: &str, budget: Duration) -> Option<(u16, String)> {
     use std::io::{Read, Write};
+    if budget.is_zero() {
+        return None;
+    }
     let start = Instant::now();
     let sa: std::net::SocketAddr = addr.parse().ok()?;
     let req = format!(
@@ -294,8 +349,14 @@ pub fn http_post_addr(addr: &str, path: &str, body: &str, budget: Duration) -> O
         body.len(),
         body
     );
-    let mut s = TcpStream::connect_timeout(&sa, Duration::from_secs(5)).ok()?;
-    s.write_all(req.as_bytes()).ok()?;
+    // Connect budget never exceeds the total budget: a 2s caller budget
+    // must not block 5s in connect (hung-backend test would flake).
+    let connect_budget = Duration::from_secs(5).min(budget.max(Duration::from_millis(50)));
+    let mut s = TcpStream::connect_timeout(&sa, connect_budget).ok()?;
+    let _ = s.set_write_timeout(Some(Duration::from_secs(5).min(budget)));
+    if s.write_all(req.as_bytes()).is_err() {
+        return None;
+    }
     let mut buf: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 16384];
     loop {

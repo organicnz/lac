@@ -1,6 +1,6 @@
 import Foundation
 
-// MARK: - Chat persistence + gateway client (localhost only, no API keys)
+// MARK: - Chat persistence + gateway client (local or Tailscale remote via LACConnectionStore)
 
 public struct MessageVariant: Codable, Identifiable, Hashable, Sendable {
     public var id: UUID
@@ -144,11 +144,8 @@ class ChatStore: ObservableObject {
     @Published var thinkingMode: Bool = false
     @Published var customSystemPrompt: String = "You are LAC Assistant, a world-class local agentic AI running on Apple Silicon. You are concise, precise, memory-efficient, and generate clean, robust solutions."
 
-    public let port: Int = {
-        if let raw = ProcessInfo.processInfo.environment["LAC_ROUTER_PORT"],
-           let p = Int(raw), p > 0 { return p }
-        return 8000
-    }()
+    var connection: LACConnectionStore { LACConnectionStore.shared }
+    public var port: Int { connection.port }
 
     private var streamTask: Task<Void, Never>?
 
@@ -188,6 +185,17 @@ class ChatStore: ObservableObject {
     }
 
     func select(_ id: String) {
+        // Select first, then prune *other* empty threads (never the selected one).
+        // Deleting the selected id leaves a dangling activeThreadId.
+        threads.removeAll(where: { $0.id != id && $0.messages.isEmpty })
+        guard threads.contains(where: { $0.id == id }) else {
+            // Selected thread no longer exists — fall back to most recent.
+            activeThreadId = threads.first?.id
+            if activeThreadId == nil { _ = newThread() }
+            streamText = ""
+            errorText = nil
+            return
+        }
         activeThreadId = id
         streamText = ""
         errorText = nil
@@ -218,10 +226,28 @@ class ChatStore: ObservableObject {
     func clearActiveThread() {
         guard let tid = activeThreadId,
               let idx = threads.firstIndex(where: { $0.id == tid }) else { return }
+        
+        // Remove messages and empty thread
         threads[idx].messages.removeAll()
+        
+        // Remove empty threads (like frontier LLM companies do)
+        if threads[idx].messages.isEmpty {
+            threads.remove(at: idx)
+            // Re-point selection when the active thread was removed;
+            // otherwise activeThread resolves to nil and the UI blanks.
+            if activeThreadId == tid {
+                activeThreadId = threads.first?.id
+            }
+        }
+        
         rewriteAllThreads()
         errorText = nil
         streamText = ""
+        
+        // If no threads left, create a new one
+        if threads.isEmpty {
+            _ = newThread()
+        }
     }
 
     func deleteMessage(id: UUID) {
@@ -374,6 +400,33 @@ class ChatStore: ObservableObject {
         }
     }
 
+    /// Derive a meaningful thread title from message content
+    private func deriveThreadTitle(from messages: [ChatMessage]) -> String {
+        // Strategy 1: Look for a concise user prompt (preferred)
+        if let firstUser = messages.first(where: { $0.role == "user" && !$0.content.isEmpty }) {
+            let truncated = firstUser.content.prefix(45).trimmingCharacters(in: .whitespacesAndNewlines)
+            if !truncated.isEmpty && truncated.count > 3 {
+                return truncated + (firstUser.content.count > 45 ? "..." : "")
+            }
+        }
+        
+        // Strategy 2: Use the most recent substantial message (any role)
+        if let lastMsg = messages.last, !lastMsg.content.isEmpty {
+            let truncated = lastMsg.content.prefix(40).trimmingCharacters(in: .whitespacesAndNewlines)
+            if !truncated.isEmpty {
+                return truncated + (lastMsg.content.count > 40 ? "..." : "")
+            }
+        }
+        
+        // Strategy 3: Shorten to first 20 chars of any content
+        if !messages.isEmpty, let firstMsg = messages.first, !firstMsg.content.isEmpty {
+            let truncated = firstMsg.content.prefix(20).trimmingCharacters(in: .whitespacesAndNewlines)
+            return truncated + (firstMsg.content.count > 20 ? "..." : "")
+        }
+        
+        return "Chat"
+    }
+
     private func loadTitles() -> [String: String] {
         guard let data = try? Data(contentsOf: Self.titlesFile()),
               let map = try? JSONDecoder().decode([String: String].self, from: data)
@@ -384,16 +437,41 @@ class ChatStore: ObservableObject {
     // MARK: persistence (one JSONL line per message)
 
     func load() {
-        guard let data = try? Data(contentsOf: Self.threadsFile()),
-              let text = String(data: data, encoding: .utf8) else { return }
+        let file = Self.threadsFile()
+        let exists = FileManager.default.fileExists(atPath: file.path)
+        
+        // Robustness: gracefully handle missing or corrupted file
+        guard exists,
+              let data = try? Data(contentsOf: file),
+              let text = String(data: data, encoding: .utf8) else {
+            // No file or corrupted - start fresh with new thread
+            threads = []
+            activeThreadId = nil
+            _ = newThread()
+            return
+        }
+        
+        // Quick exit for empty files
+        if text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            threads = []
+            activeThreadId = nil
+            _ = newThread()
+            return
+        }
+        
         var grouped: [String: [ChatMessage]] = [:]
         var order: [String] = []
         let dec = JSONDecoder()
+        
         for line in text.split(separator: "\n") {
-            guard let d = line.data(using: .utf8),
+            // Skip truly empty lines
+            guard !line.isEmpty,
+                  let d = line.data(using: .utf8),
                   let s = try? dec.decode(StoredLine.self, from: d) else { continue }
+            
+            // Track thread appearance order (first-seen recency)
             if grouped[s.thread] == nil { order.append(s.thread) }
-
+            
             let loadedVariants = s.variants ?? (s.role == "assistant" ? [
                 MessageVariant(id: s.id ?? UUID(), content: s.content, model: s.model, durationSeconds: s.durationSeconds, tokensPerSecond: s.tokensPerSecond, ts: s.ts)
             ] : [])
@@ -412,22 +490,32 @@ class ChatStore: ObservableObject {
                 )
             )
         }
-        threads = order.map { tid in
+        
+        // Messages ascending (oldest→newest) for transcript + title derivation;
+        // threads newest-activity-first for sidebar.
+        let saved = loadTitles()
+        var built = order.compactMap { tid -> ChatThread? in
             let msgs = (grouped[tid] ?? []).sorted { $0.ts < $1.ts }
-            let title = msgs.first { $0.role == "user" }
-                .map { String($0.content.prefix(40)) } ?? "Chat"
+            guard !msgs.isEmpty else { return nil }
+            let title = saved[tid] ?? self.deriveThreadTitle(from: msgs)
             return ChatThread(id: tid, title: title, messages: msgs)
         }
-        // Overlay renamed titles (persisted sidecar beats re-derived titles).
-        let savedTitles = loadTitles()
-        if !savedTitles.isEmpty {
-            for i in threads.indices {
-                if let t = savedTitles[threads[i].id], !t.isEmpty {
-                    threads[i].title = t
-                }
-            }
+        built.sort { ($0.messages.last?.ts ?? 0) > ($1.messages.last?.ts ?? 0) }
+        threads = built
+        
+        // If no valid threads remain, start fresh
+        if threads.isEmpty {
+            threads = []
+            activeThreadId = nil
+            _ = newThread()
+            return
         }
-        activeThreadId = threads.first?.id
+        
+        // Intelligence: set active thread to most recently active,
+        // but preserve user-selected thread if it still exists
+        if activeThreadId == nil || !threads.contains(where: { $0.id == activeThreadId }) {
+            activeThreadId = threads.first?.id  // Most recent
+        }
     }
 
     private func persist(_ threadId: String, _ msg: ChatMessage) {
@@ -465,9 +553,10 @@ class ChatStore: ObservableObject {
     // MARK: models
 
     func fetchModels() async {
-        guard let url = URL(string: "http://127.0.0.1:\(port)/v1/models") else { return }
+        guard let url = connection.url(path: "/v1/models") else { return }
         var req = URLRequest(url: url)
         req.timeoutInterval = 8
+        connection.authorize(&req)
         do {
             let (data, _) = try await URLSession.shared.data(for: req)
             let decoded = try JSONDecoder().decode(ModelsResponse.self, from: data)
@@ -491,7 +580,13 @@ class ChatStore: ObservableObject {
     func send(_ prompt: String) {
         let text = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty, !isSending else { return }
-        if activeThreadId == nil { _ = newThread() }
+        if activeThreadId == nil || !threads.contains(where: { $0.id == activeThreadId }) {
+            if let first = threads.first(where: { !$0.messages.isEmpty }) ?? threads.first {
+                activeThreadId = first.id
+            } else {
+                activeThreadId = newThread().id
+            }
+        }
         guard let tid = activeThreadId,
               let idx = threads.firstIndex(where: { $0.id == tid }) else { return }
         errorText = nil
@@ -514,7 +609,7 @@ class ChatStore: ObservableObject {
         isSending = true
         streamText = ""
         let tStart = CFAbsoluteTimeGetCurrent()
-        streamTask = Task { [weak self, tid] in
+        streamTask = Task { @MainActor [weak self, tid] in
             guard let self else { return }
             defer {
                 self.isSending = false
@@ -643,9 +738,9 @@ class ChatStore: ObservableObject {
     private func streamChat(
         model: String,
         history: [ChatMessage],
-        onPiece: @escaping (String) -> Void
+        onPiece: @MainActor @Sendable @escaping (String) -> Void
     ) async throws -> String {
-        guard let url = URL(string: "http://127.0.0.1:\(port)/v1/chat/completions") else {
+        guard let url = connection.url(path: "/v1/chat/completions") else {
             throw ChatError.transport("bad gateway URL")
         }
         struct WireMessage: Encodable { var role: String; var content: String }
@@ -671,6 +766,7 @@ class ChatStore: ObservableObject {
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        connection.authorize(&req)
         req.timeoutInterval = 300
         req.httpBody = try JSONEncoder().encode(WireRequest(
             model: model,
