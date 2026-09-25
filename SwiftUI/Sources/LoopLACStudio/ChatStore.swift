@@ -237,10 +237,10 @@ class ChatStore: ObservableObject {
     func clearActiveThread() {
         guard let tid = activeThreadId,
               let idx = threads.firstIndex(where: { $0.id == tid }) else { return }
-        
+
         // Remove messages and empty thread
         threads[idx].messages.removeAll()
-        
+
         // Remove empty threads (like frontier LLM companies do)
         if threads[idx].messages.isEmpty {
             threads.remove(at: idx)
@@ -250,11 +250,11 @@ class ChatStore: ObservableObject {
                 activeThreadId = threads.first?.id
             }
         }
-        
+
         rewriteAllThreads()
         errorText = nil
         streamText = ""
-        
+
         // If no threads left, create a new one
         if threads.isEmpty {
             _ = newThread()
@@ -289,7 +289,7 @@ class ChatStore: ObservableObject {
         guard !isSending else { return }
         guard let tid = activeThreadId,
               let idx = threads.firstIndex(where: { $0.id == tid }) else { return }
-        
+
         var replaceId: UUID? = nil
         if let last = threads[idx].messages.last, last.role == "assistant" {
             replaceId = last.id
@@ -420,7 +420,7 @@ class ChatStore: ObservableObject {
                 return truncated + (firstUser.content.count > 45 ? "..." : "")
             }
         }
-        
+
         // Strategy 2: Use the most recent substantial message (any role)
         if let lastMsg = messages.last, !lastMsg.content.isEmpty {
             let truncated = lastMsg.content.prefix(40).trimmingCharacters(in: .whitespacesAndNewlines)
@@ -428,13 +428,13 @@ class ChatStore: ObservableObject {
                 return truncated + (lastMsg.content.count > 40 ? "..." : "")
             }
         }
-        
+
         // Strategy 3: Shorten to first 20 chars of any content
         if !messages.isEmpty, let firstMsg = messages.first, !firstMsg.content.isEmpty {
             let truncated = firstMsg.content.prefix(20).trimmingCharacters(in: .whitespacesAndNewlines)
             return truncated + (firstMsg.content.count > 20 ? "..." : "")
         }
-        
+
         return "Chat"
     }
 
@@ -450,7 +450,7 @@ class ChatStore: ObservableObject {
     func load() {
         let file = threadsFileURL
         let exists = FileManager.default.fileExists(atPath: file.path)
-        
+
         // Robustness: gracefully handle missing or corrupted file
         guard exists,
               let data = try? Data(contentsOf: file),
@@ -461,7 +461,7 @@ class ChatStore: ObservableObject {
             _ = newThread()
             return
         }
-        
+
         // Quick exit for empty files
         if text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             threads = []
@@ -469,20 +469,20 @@ class ChatStore: ObservableObject {
             _ = newThread()
             return
         }
-        
+
         var grouped: [String: [ChatMessage]] = [:]
         var order: [String] = []
         let dec = JSONDecoder()
-        
+
         for line in text.split(separator: "\n") {
             // Skip truly empty lines
             guard !line.isEmpty,
                   let d = line.data(using: .utf8),
                   let s = try? dec.decode(StoredLine.self, from: d) else { continue }
-            
+
             // Track thread appearance order (first-seen recency)
             if grouped[s.thread] == nil { order.append(s.thread) }
-            
+
             let loadedVariants = s.variants ?? (s.role == "assistant" ? [
                 MessageVariant(id: s.id ?? UUID(), content: s.content, model: s.model, durationSeconds: s.durationSeconds, tokensPerSecond: s.tokensPerSecond, ts: s.ts)
             ] : [])
@@ -501,7 +501,7 @@ class ChatStore: ObservableObject {
                 )
             )
         }
-        
+
         // Messages ascending (oldest→newest) for transcript + title derivation;
         // threads newest-activity-first for sidebar.
         let saved = loadTitles()
@@ -513,7 +513,7 @@ class ChatStore: ObservableObject {
         }
         built.sort { ($0.messages.last?.ts ?? 0) > ($1.messages.last?.ts ?? 0) }
         threads = built
-        
+
         // If no valid threads remain, start fresh
         if threads.isEmpty {
             threads = []
@@ -521,7 +521,7 @@ class ChatStore: ObservableObject {
             _ = newThread()
             return
         }
-        
+
         // Intelligence: set active thread to most recently active,
         // but preserve user-selected thread if it still exists
         if activeThreadId == nil || !threads.contains(where: { $0.id == activeThreadId }) {
