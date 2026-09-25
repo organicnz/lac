@@ -14,6 +14,7 @@ struct Fixture {
     port: u16,
     stop: Arc<AtomicBool>,
     requests: Arc<AtomicUsize>,
+    saw_authorization: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -24,16 +25,19 @@ impl Fixture {
         let port = listener.local_addr().expect("fixture address").port();
         let stop = Arc::new(AtomicBool::new(false));
         let requests = Arc::new(AtomicUsize::new(0));
+        let saw_authorization = Arc::new(AtomicBool::new(false));
         let thread = {
             let stop = Arc::clone(&stop);
             let requests = Arc::clone(&requests);
+            let saw_authorization = Arc::clone(&saw_authorization);
             thread::spawn(move || {
                 while !stop.load(Ordering::Acquire) {
                     match listener.accept() {
                         Ok((stream, _)) => {
                             let requests = Arc::clone(&requests);
+                            let saw_authorization = Arc::clone(&saw_authorization);
                             thread::spawn(move || {
-                                serve(stream, requests);
+                                serve(stream, requests, saw_authorization);
                             });
                         }
                         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -48,6 +52,7 @@ impl Fixture {
             port,
             stop,
             requests,
+            saw_authorization,
             thread: Some(thread),
         }
     }
@@ -62,7 +67,7 @@ impl Drop for Fixture {
     }
 }
 
-fn serve(mut stream: TcpStream, requests: Arc<AtomicUsize>) {
+fn serve(mut stream: TcpStream, requests: Arc<AtomicUsize>, saw_authorization: Arc<AtomicBool>) {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
     let mut request = Vec::new();
     let mut buffer = [0u8; 4096];
@@ -82,6 +87,17 @@ fn serve(mut stream: TcpStream, requests: Arc<AtomicUsize>) {
         }
     };
     let head = String::from_utf8_lossy(&request[..head_end]).to_lowercase();
+    if head.lines().any(|line| {
+        line.split_once(':')
+            .map(|(name, _)| {
+                let name = name.trim();
+                name.eq_ignore_ascii_case("authorization")
+                    || name.eq_ignore_ascii_case("proxy-authorization")
+            })
+            .unwrap_or(false)
+    }) {
+        saw_authorization.store(true, Ordering::Release);
+    }
     let content_length = head
         .lines()
         .find_map(|line| line.strip_prefix("content-length:"))
@@ -417,6 +433,10 @@ fn process_level_gateway_and_cli_smoke() {
     );
     assert!(ok, "authenticated lac chat failed: {output}");
     assert!(output.contains("E2E_SENTINEL"));
+    assert!(
+        !fixture.saw_authorization.load(Ordering::Acquire),
+        "router authorization must not reach the backend"
+    );
     drop(token_router);
 
     drop(fixture);

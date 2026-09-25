@@ -345,6 +345,36 @@ fn header_contains(headers: &[u8], name: &str) -> bool {
         .any(|(key, _)| key.trim().eq_ignore_ascii_case(name))
 }
 
+fn sanitize_upstream_request(request: &[u8]) -> Vec<u8> {
+    let Some(header_len) = find_headers_end(request) else {
+        return request.to_vec();
+    };
+    let mut sanitized = Vec::with_capacity(request.len());
+    for line in request[..header_len].split_inclusive(|byte| *byte == b'\n') {
+        let trimmed = line.strip_suffix(b"\n").unwrap_or(line);
+        let trimmed = trimmed.strip_suffix(b"\r").unwrap_or(trimmed);
+        if trimmed.is_empty() {
+            sanitized.extend_from_slice(b"\r\n");
+            continue;
+        }
+        let sensitive = trimmed
+            .iter()
+            .position(|byte| *byte == b':')
+            .map(|colon| {
+                let name = String::from_utf8_lossy(&trimmed[..colon]);
+                let name = name.trim();
+                name.eq_ignore_ascii_case("authorization")
+                    || name.eq_ignore_ascii_case("proxy-authorization")
+            })
+            .unwrap_or(false);
+        if !sensitive {
+            sanitized.extend_from_slice(line);
+        }
+    }
+    sanitized.extend_from_slice(&request[header_len..]);
+    sanitized
+}
+
 fn read_request_body(client: &TcpStream, initial: &[u8]) -> Result<Vec<u8>, ()> {
     let mut client = client;
     let header_len = find_headers_end(initial).ok_or(())?;
@@ -1480,6 +1510,7 @@ fn handle_connection(
             return;
         }
     };
+    let initial = sanitize_upstream_request(&initial);
 
     let candidates = pick_backends(pref, &hc, &stats, model_hint);
     if candidates.is_empty() {
@@ -1747,6 +1778,26 @@ mod tests {
         let req = b"POST /v1/chat HTTP/1.1\r\nHost: x\r\n\r\n{}";
         assert_eq!(find_headers_end(req), Some(req.len() - 2));
         assert_eq!(find_headers_end(b"GET / HTTP/1.1\r\n"), None);
+    }
+
+    #[test]
+    fn strips_auth_headers_before_forwarding() {
+        let request = b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\n Authorization: Bearer secret\r\nauthorization: Bearer duplicate\r\nProxy-Authorization: Basic secret\r\n proxy-authorization: Basic duplicate\r\nX-Trace: keep\r\n\r\nauthorization-body";
+        let sanitized = sanitize_upstream_request(request);
+        let text = String::from_utf8(sanitized.clone()).expect("sanitized request is UTF-8");
+        let head_end = find_headers_end(&sanitized).expect("headers");
+        let headers = String::from_utf8_lossy(&sanitized[..head_end]);
+        assert!(!headers.lines().any(|line| {
+            line.split_once(':')
+                .map(|(name, _)| {
+                    let name = name.trim();
+                    name.eq_ignore_ascii_case("authorization")
+                        || name.eq_ignore_ascii_case("proxy-authorization")
+                })
+                .unwrap_or(false)
+        }));
+        assert!(text.contains("X-Trace: keep"));
+        assert!(text.ends_with("\r\n\r\nauthorization-body"));
     }
 
     #[test]
