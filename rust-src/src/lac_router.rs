@@ -83,6 +83,9 @@ const MAX_HEADERS: usize = 65536;
 const MAX_BODY: usize = 16 * 1024 * 1024;
 const MAX_INFLIGHT: usize = 128;
 const STREAM_BUDGET: Duration = Duration::from_secs(600);
+const HEADER_READ_BUDGET: Duration = Duration::from_secs(10);
+const BODY_READ_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_INTERIM_RESPONSES: usize = 8;
 
 fn backend_name(id: usize) -> &'static str {
     match id {
@@ -118,6 +121,7 @@ fn backend_port(id: usize) -> u16 {
 struct HealthCache {
     inner: Mutex<HashMap<u16, (bool, Instant)>>,
     ttl: Duration,
+    negative_ttl: Duration,
 }
 
 impl HealthCache {
@@ -125,6 +129,7 @@ impl HealthCache {
         Self {
             inner: Mutex::new(HashMap::new()),
             ttl,
+            negative_ttl: Duration::from_millis(2500),
         }
     }
 
@@ -132,17 +137,18 @@ impl HealthCache {
     /// window instead of 3× TCP connects on every request.
     fn ready(&self, port: u16) -> bool {
         if let Ok(guard) = self.inner.lock() {
-            if let Some((v, t)) = guard.get(&port) {
-                if t.elapsed() < self.ttl {
-                    return *v;
+            if let Some((value, timestamp)) = guard.get(&port) {
+                let window = if *value { self.ttl } else { self.negative_ttl };
+                if timestamp.elapsed() < window {
+                    return *value;
                 }
             }
         }
-        let v = common::http_ready(port, 1500);
+        let value = common::http_ready(port, 1500);
         if let Ok(mut guard) = self.inner.lock() {
-            guard.insert(port, (v, Instant::now()));
+            guard.insert(port, (value, Instant::now()));
         }
-        v
+        value
     }
 }
 
@@ -308,41 +314,246 @@ fn read_headers(client: &TcpStream) -> io::Result<Vec<u8>> {
     // Owned handle: bytes consumed here are the client's already-sent
     // headers; the caller forwards them explicitly and streams the rest.
     let mut stream = client.try_clone()?;
-    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    let deadline = Instant::now() + HEADER_READ_BUDGET;
     let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
     let mut buf: Vec<u8> = Vec::with_capacity(8192);
     let mut chunk = [0u8; 8192];
     loop {
-        let n = stream.read(&mut chunk)?;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "incomplete request headers",
+            ));
+        }
+        stream.set_read_timeout(Some(remaining))?;
+        let n = stream.read(&mut chunk).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("incomplete request headers: {error}"),
+            )
+        })?;
         if n == 0 {
             break;
         }
         buf.extend_from_slice(&chunk[..n]);
+        if let Some(end) = find_headers_end(&buf) {
+            if end > MAX_HEADERS {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "request headers exceed 64 KiB",
+                ));
+            }
+            break;
+        }
         if buf.len() > MAX_HEADERS {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "request headers exceed 64 KiB",
             ));
         }
-        if find_headers_end(&buf).is_some() {
-            break;
-        }
     }
-    if buf.is_empty() {
+    if find_headers_end(&buf).is_none() {
         return Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "empty request",
+            io::ErrorKind::InvalidData,
+            "incomplete request headers",
         ));
     }
     Ok(buf)
 }
 
-fn header_contains(headers: &[u8], name: &str) -> bool {
-    String::from_utf8_lossy(headers)
-        .lines()
-        .take_while(|line| !line.trim().is_empty())
-        .filter_map(|line| line.split_once(':'))
-        .any(|(key, _)| key.trim().eq_ignore_ascii_case(name))
+fn has_queued_bytes(mut client: &TcpStream) -> bool {
+    if client.set_nonblocking(true).is_err() {
+        return false;
+    }
+    let mut buffer = [0u8; 4096];
+    let mut queued = false;
+    let mut drained = 0usize;
+    loop {
+        match client.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(n) => {
+                queued = true;
+                drained += n;
+                if drained >= MAX_BODY {
+                    break;
+                }
+            }
+            Err(error)
+                if error.kind() == io::ErrorKind::WouldBlock
+                    || error.kind() == io::ErrorKind::TimedOut =>
+            {
+                break;
+            }
+            Err(_) => break,
+        }
+    }
+    let reset = client.set_nonblocking(false).is_ok();
+    queued || !reset
+}
+
+fn valid_header_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' | b'+' | b'-'
+                        | b'.' | b'^' | b'_' | b'`' | b'|' | b'~'
+                )
+        })
+}
+
+fn strict_header_lines(headers: &[u8]) -> Result<Vec<String>, ()> {
+    for (index, byte) in headers.iter().enumerate() {
+        if *byte == b'\n' && (index == 0 || headers[index - 1] != b'\r') {
+            return Err(());
+        }
+        if *byte == b'\r'
+            && (index + 1 >= headers.len() || headers[index + 1] != b'\n')
+        {
+            return Err(());
+        }
+    }
+    let text = String::from_utf8_lossy(headers);
+    Ok(text.split("\r\n").map(str::to_string).collect())
+}
+
+fn parse_header_line(line: &str) -> Result<(&str, &str), ()> {
+    if line.is_empty() {
+        return Err(());
+    }
+    if line
+        .as_bytes()
+        .first()
+        .is_some_and(|byte| matches!(byte, b' ' | b'\t'))
+    {
+        return Err(());
+    }
+    let (name, value) = line.split_once(':').ok_or(())?;
+    if !valid_header_name(name)
+        || value
+            .bytes()
+            .any(|byte| byte.is_ascii_control() && byte != b'\t')
+    {
+        return Err(());
+    }
+    Ok((name, value))
+}
+
+fn parse_response_header_line(line: &str) -> Result<(&str, &str), ()> {
+    if line.is_empty()
+        || line
+            .as_bytes()
+            .first()
+            .is_some_and(|byte| matches!(byte, b' ' | b'\t'))
+    {
+        return Err(());
+    }
+    let (name, value) = line.split_once(':').ok_or(())?;
+    let name = name.trim_matches(|character| matches!(character, ' ' | '\t'));
+    if !valid_header_name(name)
+        || value
+            .bytes()
+            .any(|byte| byte.is_ascii_control() && byte != b'\t')
+    {
+        return Err(());
+    }
+    Ok((name, value))
+}
+
+fn transfer_encoding_tokens(headers: &[u8], response: bool) -> Result<Vec<String>, ()> {
+    let lines = strict_header_lines(headers).map_err(|_| ())?;
+    let mut tokens = Vec::new();
+    for (index, line) in lines.iter().enumerate() {
+        if line.is_empty() {
+            break;
+        }
+        if index == 0 {
+            continue;
+        }
+        let (name, value) = if response {
+            let (name, value) = parse_response_header_line(line).map_err(|_| ())?;
+            if matches!(
+                name.to_ascii_lowercase().as_str(),
+                "content-length"
+                    | "transfer-encoding"
+                    | "content-type"
+                    | "content-encoding"
+                    | "trailer"
+            ) {
+                parse_header_line(line).map_err(|_| ())?
+            } else {
+                (name, value)
+            }
+        } else {
+            parse_header_line(line).map_err(|_| ())?
+        };
+        if name.eq_ignore_ascii_case("transfer-encoding") {
+            tokens.extend(value.split(',').map(|token| {
+                token
+                    .trim_matches(|character| matches!(character, ' ' | '\t'))
+                    .to_string()
+            }));
+        }
+    }
+    if tokens
+        .iter()
+        .any(|token| token.is_empty() || !token.bytes().all(is_token_byte))
+    {
+        return Err(());
+    }
+    Ok(tokens)
+}
+
+fn chunked_result(tokens: Vec<String>) -> Result<bool, ()> {
+    if tokens.is_empty() {
+        return Ok(false);
+    }
+    if tokens.last().is_some_and(|token| token.eq_ignore_ascii_case("chunked"))
+        && tokens.iter().filter(|token| token.eq_ignore_ascii_case("chunked")).count() == 1
+    {
+        return Ok(true);
+    }
+    Err(())
+}
+
+fn expect_continue(headers: &[u8]) -> bool {
+    let Ok(lines) = strict_header_lines(headers) else {
+        return false;
+    };
+    lines.iter().skip(1).any(|line| {
+        if line.is_empty() {
+            return false;
+        }
+        let Ok((name, value)) = parse_header_line(line) else {
+            return false;
+        };
+        name.eq_ignore_ascii_case("expect")
+            && value.split(',').any(|token| {
+                token
+                    .trim_matches(|character| matches!(character, ' ' | '\t'))
+                    .eq_ignore_ascii_case("100-continue")
+            })
+    })
+}
+
+fn has_chunked_transfer_encoding(headers: &[u8]) -> Result<bool, ()> {
+    chunked_result(transfer_encoding_tokens(headers, false)?)
+}
+
+fn has_chunked_response_transfer_encoding(headers: &[u8]) -> Result<bool, ()> {
+    chunked_result(transfer_encoding_tokens(headers, true)?)
+}
+
+fn plain_chunked_transfer_encoding(headers: &[u8]) -> Result<Option<bool>, ()> {
+    let tokens = transfer_encoding_tokens(headers, true)?;
+    if tokens.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(
+        tokens.len() == 1 && tokens[0].eq_ignore_ascii_case("chunked"),
+    ))
 }
 
 fn sanitize_upstream_request(request: &[u8]) -> Vec<u8> {
@@ -375,58 +586,132 @@ fn sanitize_upstream_request(request: &[u8]) -> Vec<u8> {
     sanitized
 }
 
-fn read_request_body(client: &TcpStream, initial: &[u8]) -> Result<Vec<u8>, ()> {
-    let mut client = client;
-    let header_len = find_headers_end(initial).ok_or(())?;
+enum BodyError {
+    TooLarge,
+    Invalid,
+}
+
+struct RequestFrame {
+    wire: Vec<u8>,
+    has_following: bool,
+}
+
+fn read_body_bytes(
+    mut client: &TcpStream,
+    buffer: &mut [u8],
+    started: Instant,
+) -> Result<usize, BodyError> {
+    let remaining = STREAM_BUDGET
+        .saturating_sub(started.elapsed())
+        .min(BODY_READ_IDLE_TIMEOUT);
+    if remaining.is_zero() {
+        return Err(BodyError::Invalid);
+    }
+    client
+        .set_read_timeout(Some(remaining))
+        .map_err(|_| BodyError::Invalid)?;
+    client.read(buffer).map_err(|_| BodyError::Invalid)
+}
+
+fn read_request_body(
+    client: &TcpStream,
+    initial: &[u8],
+) -> Result<RequestFrame, BodyError> {
+    let header_len = find_headers_end(initial).ok_or(BodyError::Invalid)?;
     let mut request = initial.to_vec();
     let mut buffer = [0u8; 16384];
-    let _ = client.set_read_timeout(Some(STREAM_BUDGET));
-    if let Some(content_len) = parse_content_length_strict(initial).map_err(|_| ())? {
-        let target = header_len.checked_add(content_len).ok_or(())?;
+    let body_started = Instant::now();
+    if let Some(content_len) =
+        parse_content_length_strict(&initial[..header_len]).map_err(|_| BodyError::Invalid)?
+    {
+        let target = header_len.checked_add(content_len).ok_or(BodyError::Invalid)?;
         if target > header_len.saturating_add(MAX_BODY) {
-            return Err(());
+            return Err(BodyError::TooLarge);
         }
         while request.len() < target {
-            let n = client.read(&mut buffer).map_err(|_| ())?;
+            let remaining = target - request.len();
+            let to_read = buffer.len().min(remaining);
+            let n = read_body_bytes(client, &mut buffer[..to_read], body_started)?;
             if n == 0 {
-                return Err(());
+                return Err(BodyError::Invalid);
             }
             request.extend_from_slice(&buffer[..n]);
         }
+        let mut has_following = request.len() > target;
+        if !has_following {
+            has_following = has_queued_bytes(client);
+        }
         request.truncate(target);
-        return Ok(request);
+        return Ok(RequestFrame {
+            wire: request,
+            has_following,
+        });
     }
-    if header_contains(&initial[..header_len], "transfer-encoding")
-        && String::from_utf8_lossy(&initial[..header_len])
-            .to_ascii_lowercase()
-            .contains("chunked")
-    {
-        let max_request = header_len.saturating_add(MAX_BODY);
+    if has_chunked_transfer_encoding(&initial[..header_len]).map_err(|_| BodyError::Invalid)? {
+        let max_request = header_len.saturating_add(MAX_BODY + MAX_HEADERS);
         if request.len() > max_request {
-            return Err(());
+            return Err(BodyError::TooLarge);
         }
         let mut detector = ChunkedDetector::default();
         let mut fed = header_len;
-        if !detector.feed(&request[header_len..]) {
-            loop {
-                let n = client.read(&mut buffer).map_err(|_| ())?;
-                if n == 0 {
-                    return Err(());
+        loop {
+            match detector.feed(&request[fed..]).map_err(|_| BodyError::Invalid)? {
+                ChunkProgress::Complete { consumed } => {
+                    let end = fed + consumed;
+                    let mut has_following = end < request.len();
+                    if !has_following {
+                        has_following = has_queued_bytes(client);
+                    }
+                    return Ok(RequestFrame {
+                        wire: request[..end].to_vec(),
+                        has_following,
+                    });
                 }
-                request.extend_from_slice(&buffer[..n]);
-                if request.len() > max_request {
-                    return Err(());
-                }
-                let next = &request[fed..];
-                fed = request.len();
-                if detector.feed(next) {
-                    break;
+                ChunkProgress::NeedMore => {
+                    let n = read_body_bytes(client, &mut buffer, body_started)?;
+                    if n == 0 {
+                        return Err(BodyError::Invalid);
+                    }
+                    fed = request.len();
+                    request.extend_from_slice(&buffer[..n]);
+                    if request.len() > max_request {
+                        return Err(BodyError::TooLarge);
+                    }
                 }
             }
         }
-        return Ok(request);
     }
-    Ok(request)
+    let mut has_following = request.len() > header_len;
+    if !has_following {
+        has_following = has_queued_bytes(client);
+    }
+    Ok(RequestFrame {
+        wire: request[..header_len].to_vec(),
+        has_following,
+    })
+}
+
+fn valid_request_line(line: &str) -> bool {
+    let bytes = line.as_bytes();
+    let Some(first_space) = bytes.iter().position(|byte| *byte == b' ') else {
+        return false;
+    };
+    let Some(second_space) = bytes[first_space + 1..]
+        .iter()
+        .position(|byte| *byte == b' ')
+        .map(|index| index + first_space + 1)
+    else {
+        return false;
+    };
+    let method = &line[..first_space];
+    let target = &line[first_space + 1..second_space];
+    let version = &line[second_space + 1..];
+    valid_header_name(method)
+        && !target.is_empty()
+        && target
+            .bytes()
+            .all(|byte| (0x21..=0x7e).contains(&byte))
+        && matches!(version, "HTTP/1.0" | "HTTP/1.1")
 }
 
 fn request_line(buf: &[u8]) -> (String, String) {
@@ -537,7 +822,7 @@ fn handle_lac_status(
         started.elapsed().as_secs(),
         inflight,
         models_mapped,
-        usage_log_path(),
+        common::json_escape(&usage_log_path()),
         mlx_port,
         mlx_up,
         llama_port,
@@ -824,7 +1109,11 @@ enum ForwardError {
     /// Backend returned a retryable HTTP response before headers were forwarded.
     HttpStatus(u16),
     /// Stream broke mid-proxy: the response is already partial, do not retry.
-    Stream,
+    Stream { down: u64, ttfb: Option<f64> },
+    BadResponse { down: u64, ttfb: Option<f64> },
+    ClientGone { down: u64, ttfb: Option<f64> },
+    /// Backend requested a protocol upgrade that this HTTP relay does not support.
+    UnsupportedUpgrade { up: u64, ttfb: Option<f64> },
 }
 
 /// Ordered candidate backends. Default policy is tier order
@@ -889,27 +1178,32 @@ fn pick_backends(
 }
 
 fn parse_content_length_strict(headers: &[u8]) -> Result<Option<usize>, ()> {
-    let head = String::from_utf8_lossy(headers);
+    let lines = strict_header_lines(headers)?;
     let mut value = None;
-    for line in head.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
+    for (index, line) in lines.iter().enumerate() {
+        if line.is_empty() {
             break;
         }
-        let mut parts = trimmed.splitn(2, ':');
-        if let (Some(name), Some(raw)) = (parts.next(), parts.next()) {
-            if name.trim().eq_ignore_ascii_case("content-length") {
-                let parsed = raw.trim().parse::<usize>().map_err(|_| ())?;
-                if value.is_some_and(|existing| existing != parsed) {
-                    return Err(());
-                }
-                value = Some(parsed);
+        if index == 0 {
+            continue;
+        }
+        let (name, raw) = parse_header_line(line)?;
+        if name.eq_ignore_ascii_case("content-length") {
+            let digits = raw.trim_matches(|character| matches!(character, ' ' | '\t'));
+            if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err(());
             }
+            let parsed = digits.parse::<usize>().map_err(|_| ())?;
+            if value.is_some_and(|existing| existing != parsed) {
+                return Err(());
+            }
+            value = Some(parsed);
         }
     }
     Ok(value)
 }
 
+#[cfg(test)]
 fn parse_content_length(headers: &[u8]) -> Option<usize> {
     parse_content_length_strict(headers).ok().flatten()
 }
@@ -1014,54 +1308,108 @@ fn keepalive_secs() -> u64 {
 }
 
 fn response_status(headers: &[u8]) -> Option<u16> {
-    String::from_utf8_lossy(headers)
-        .lines()
-        .next()?
-        .split_whitespace()
-        .nth(1)?
-        .parse()
-        .ok()
+    let line_end = headers
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .unwrap_or(headers.len());
+    let line = headers[..line_end].strip_suffix(b"\r").unwrap_or(&headers[..line_end]);
+    let prefix_len = if line.starts_with(b"HTTP/1.1 ") || line.starts_with(b"HTTP/1.0 ") {
+        9
+    } else {
+        return None;
+    };
+    if line.len() < prefix_len + 3 {
+        return None;
+    }
+    let code = &line[prefix_len..prefix_len + 3];
+    if !code.iter().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    if line.len() > prefix_len + 3 {
+        if line[prefix_len + 3] != b' '
+            || line[prefix_len + 4..]
+                .iter()
+                .any(|byte| (*byte < 0x20 && *byte != b'\t') || *byte == 0x7f)
+        {
+            return None;
+        }
+    }
+    std::str::from_utf8(code).ok()?.parse().ok()
 }
 
-/// Parse response framing: (content-length, is_chunked, is_sse).
-fn parse_resp_headers(head: &[u8]) -> Result<(Option<usize>, bool, bool), ()> {
-    let s = String::from_utf8_lossy(head).to_lowercase();
+/// Parse response framing: (content-length, is_chunked, is_sse, sse_keepalive).
+fn parse_resp_headers(head: &[u8]) -> Result<(Option<usize>, bool, bool, bool), ()> {
+    let lines = strict_header_lines(head).map_err(|_| ())?;
     let mut cl: Option<usize> = None;
-    let mut chunked = false;
     let mut sse = false;
-    for line in s.lines() {
-        let t = line.trim();
-        if t.is_empty() {
+    let mut content_type: Option<String> = None;
+    let mut content_encoding_identity = true;
+    for (index, line) in lines.iter().enumerate() {
+        if line.is_empty() {
+            break;
+        }
+        if index == 0 {
             continue;
         }
-        if let Some((name, val)) = t.split_once(':') {
-            match name.trim() {
-                "content-length" => {
-                    let n = val.trim().parse::<usize>().map_err(|_| ())?;
-                    if cl.is_some_and(|existing| existing != n) {
-                        return Err(());
-                    }
-                    cl = Some(n);
+        let (name, val) = parse_response_header_line(line).map_err(|_| ())?;
+        let (name, val) = if matches!(
+            name.to_ascii_lowercase().as_str(),
+            "content-length"
+                | "transfer-encoding"
+                | "content-type"
+                | "content-encoding"
+                | "trailer"
+        ) {
+            parse_header_line(line).map_err(|_| ())?
+        } else {
+            (name, val)
+        };
+        match name.to_ascii_lowercase().as_str() {
+            "content-length" => {
+                let digits = val.trim_matches(|character| matches!(character, ' ' | '\t'));
+                if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+                    return Err(());
                 }
-                "transfer-encoding" => {
-                    if val.contains("chunked") {
-                        chunked = true;
-                    }
+                let n = digits.parse::<usize>().map_err(|_| ())?;
+                if cl.is_some_and(|existing| existing != n) {
+                    return Err(());
                 }
-                "content-type" => {
-                    if val.contains("text/event-stream") {
-                        sse = true;
-                    }
-                }
-                _ => {}
+                cl = Some(n);
             }
+            "content-type" => {
+                let normalized = val.trim_matches(|character| matches!(character, ' ' | '\t'));
+                if content_type
+                    .as_ref()
+                    .is_some_and(|existing| existing != normalized)
+                {
+                    return Err(());
+                }
+                content_type = Some(normalized.to_string());
+                if normalized
+                    .split(';')
+                    .next()
+                    .map(str::trim)
+                    .is_some_and(|media| media.eq_ignore_ascii_case("text/event-stream"))
+                {
+                    sse = true;
+                }
+            }
+            "content-encoding" => {
+                let encoding = val.trim_matches(|character| matches!(character, ' ' | '\t'));
+                if !encoding.is_empty() && !encoding.eq_ignore_ascii_case("identity") {
+                    content_encoding_identity = false;
+                }
+            }
+            _ => {}
         }
     }
-    // Chunked wins over Content-Length per RFC 7230 §3.3.3.
-    if chunked {
-        cl = None;
+    let plain_chunked = plain_chunked_transfer_encoding(head).map_err(|_| ())?;
+    let sse_keepalive = sse && content_encoding_identity && plain_chunked != Some(false);
+    let chunked = has_chunked_response_transfer_encoding(head).map_err(|_| ())?;
+    if chunked && cl.is_some() {
+        return Err(());
     }
-    Ok((cl, chunked, sse))
+    Ok((cl, chunked, sse, sse_keepalive))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1074,10 +1422,56 @@ enum ChunkState {
     Invalid,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ChunkProgress {
+    NeedMore,
+    Complete { consumed: usize },
+}
+
+fn update_payload_tail(tail: &mut [u8; 4], len: &mut usize, data: &[u8]) {
+    if data.is_empty() {
+        return;
+    }
+    if data.len() >= tail.len() {
+        let tail_len = tail.len();
+        tail.copy_from_slice(&data[data.len() - tail_len..]);
+        *len = tail_len;
+        return;
+    }
+    let overflow = (*len + data.len()).saturating_sub(tail.len());
+    tail.copy_within(overflow..*len, 0);
+    *len -= overflow;
+    tail[*len..*len + data.len()].copy_from_slice(data);
+    *len += data.len();
+}
+
+fn payload_at_boundary(tail: &[u8; 4], len: usize) -> bool {
+    debug_assert!(len <= tail.len());
+    if len == 0 {
+        return true;
+    }
+    if len < 2 {
+        return false;
+    }
+    let last = tail[len - 1];
+    let previous = tail[len - 2];
+    if last == b'\n' && previous == b'\n' {
+        return true;
+    }
+    if last == b'\r' && previous == b'\r' {
+        return true;
+    }
+    len >= 3 && last == b'\n' && previous == b'\r' && tail[len - 3] == b'\n'
+}
+
 struct ChunkedDetector {
     state: ChunkState,
     line: Vec<u8>,
     remaining: u64,
+    control_bytes: usize,
+    payload_tail: [u8; 4],
+    payload_len: usize,
+    track_payload: bool,
 }
 
 impl Default for ChunkedDetector {
@@ -1086,16 +1480,30 @@ impl Default for ChunkedDetector {
             state: ChunkState::Size,
             line: Vec::with_capacity(32),
             remaining: 0,
+            control_bytes: 0,
+            payload_tail: [0; 4],
+            payload_len: 0,
+            track_payload: false,
         }
     }
 }
 
 impl ChunkedDetector {
-    fn at_boundary(&self) -> bool {
-        matches!(self.state, ChunkState::Size | ChunkState::Trailers)
+    fn can_inject_keepalive(&self) -> bool {
+        self.state == ChunkState::Size && self.line.is_empty()
     }
 
-    fn feed(&mut self, data: &[u8]) -> bool {
+    fn payload_at_sse_boundary(&self) -> bool {
+        self.track_payload && payload_at_boundary(&self.payload_tail, self.payload_len)
+    }
+
+    fn note_payload(&mut self, data: &[u8]) {
+        if self.track_payload {
+            update_payload_tail(&mut self.payload_tail, &mut self.payload_len, data);
+        }
+    }
+
+    fn feed(&mut self, data: &[u8]) -> Result<ChunkProgress, ()> {
         let mut i = 0;
         while i < data.len() {
             match self.state {
@@ -1103,7 +1511,7 @@ impl ChunkedDetector {
                     if self.line.last() == Some(&b'\r') {
                         if data[i] != b'\n' {
                             self.state = ChunkState::Invalid;
-                            return false;
+                            return Err(());
                         }
                         let line = std::mem::replace(&mut self.line, Vec::with_capacity(32));
                         let state = self.state;
@@ -1114,67 +1522,249 @@ impl ChunkedDetector {
                                     self.remaining = size;
                                     self.state = ChunkState::Data;
                                 }
-                                Some(_) => self.state = ChunkState::Trailers,
+                                Some(_) => {
+                                    self.control_bytes = 0;
+                                    self.state = ChunkState::Trailers;
+                                }
                                 None => {
                                     self.state = ChunkState::Invalid;
-                                    return false;
+                                    return Err(());
                                 }
                             },
                             ChunkState::DataEnd if line == b"\r" => self.state = ChunkState::Size,
                             ChunkState::DataEnd => {
                                 self.state = ChunkState::Invalid;
-                                return false;
+                                return Err(());
                             }
                             ChunkState::Trailers if line == b"\r" => {
                                 self.state = ChunkState::Done;
-                                return true;
+                                return Ok(ChunkProgress::Complete { consumed: i });
                             }
-                            ChunkState::Trailers => {}
+                            ChunkState::Trailers => {
+                                let line = line.strip_suffix(b"\r").unwrap_or(&line);
+                                if !valid_trailer_line(line) {
+                                    self.state = ChunkState::Invalid;
+                                    return Err(());
+                                }
+                            }
                             _ => unreachable!(),
                         }
                     } else if data[i] == b'\n' {
                         self.state = ChunkState::Invalid;
-                        return false;
+                        return Err(());
                     } else {
+                        if self.state == ChunkState::Trailers {
+                            if self.control_bytes >= MAX_HEADERS {
+                                self.state = ChunkState::Invalid;
+                                return Err(());
+                            }
+                            self.control_bytes += 1;
+                        } else if self.line.len() >= MAX_HEADERS {
+                            self.state = ChunkState::Invalid;
+                            return Err(());
+                        }
                         self.line.push(data[i]);
                         i += 1;
                     }
                 }
                 ChunkState::Data => {
                     let take = self.remaining.min((data.len() - i) as u64) as usize;
+                    self.note_payload(&data[i..i + take]);
                     i += take;
                     self.remaining -= take as u64;
                     if self.remaining == 0 {
                         self.state = ChunkState::DataEnd;
                     }
                 }
-                ChunkState::Done => return true,
-                ChunkState::Invalid => return false,
+                ChunkState::Done => return Ok(ChunkProgress::Complete { consumed: i }),
+                ChunkState::Invalid => return Err(()),
             }
         }
-        self.state == ChunkState::Done
+        if self.state == ChunkState::Done {
+            Ok(ChunkProgress::Complete { consumed: i })
+        } else {
+            Ok(ChunkProgress::NeedMore)
+        }
     }
 }
 
-fn parse_size_line(line: &[u8]) -> Option<u64> {
-    let line = String::from_utf8_lossy(line);
-    let size = line.split(';').next()?.trim();
-    if size.is_empty() {
+fn is_token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' | b'+' | b'-' | b'.'
+                | b'^' | b'_' | b'`' | b'|' | b'~'
+        )
+}
+
+fn skip_bws(mut data: &[u8]) -> &[u8] {
+    while data.first().is_some_and(|byte| matches!(byte, b' ' | b'\t')) {
+        data = &data[1..];
+    }
+    data
+}
+
+fn trim_bws(mut data: &[u8]) -> &[u8] {
+    while data.last().is_some_and(|byte| matches!(byte, b' ' | b'\t')) {
+        data = &data[..data.len() - 1];
+    }
+    data
+}
+
+fn consume_quoted_value(mut data: &[u8]) -> Option<&[u8]> {
+    if data.first() != Some(&b'"') {
         return None;
     }
-    u64::from_str_radix(size, 16).ok()
+    data = &data[1..];
+    let mut index = 0;
+    while index < data.len() {
+        match data[index] {
+            b'"' => return Some(&data[index + 1..]),
+            b'\\' => {
+                if index + 1 >= data.len()
+                    || !matches!(data[index + 1], b'\t' | b' ' | 0x21..=0x7e | 0x80..=0xff)
+                {
+                    return None;
+                }
+                index += 2;
+            }
+            b'\t' | b' ' | 0x21..=0x7e | 0x80..=0xff => index += 1,
+            _ => return None,
+        }
+    }
+    None
+}
+
+fn valid_chunk_extensions(data: &[u8]) -> bool {
+    let mut data = skip_bws(data);
+    let mut found = false;
+    loop {
+        data = skip_bws(data);
+        if data.is_empty() {
+            return found;
+        }
+        if data[0] != b';' {
+            return false;
+        }
+        data = skip_bws(&data[1..]);
+        let name_end = data.iter().position(|byte| !is_token_byte(*byte)).unwrap_or(data.len());
+        if name_end == 0 {
+            return false;
+        }
+        data = &data[name_end..];
+        data = skip_bws(data);
+        if data.first() == Some(&b'=') {
+            data = skip_bws(&data[1..]);
+            if data.first() == Some(&b'"') {
+                let Some(remaining) = consume_quoted_value(data) else {
+                    return false;
+                };
+                data = remaining;
+            } else {
+                let value_end = data
+                    .iter()
+                    .position(|byte| !is_token_byte(*byte))
+                    .unwrap_or(data.len());
+                if value_end == 0 {
+                    return false;
+                }
+                data = &data[value_end..];
+            }
+            data = skip_bws(data);
+        }
+        if !data.is_empty() && data[0] != b';' {
+            return false;
+        }
+        found = true;
+    }
+}
+
+fn valid_trailer_line(line: &[u8]) -> bool {
+    let Some(colon) = line.iter().position(|byte| *byte == b':') else {
+        return false;
+    };
+    let name = match std::str::from_utf8(&line[..colon]) {
+        Ok(name) => name,
+        Err(_) => return false,
+    };
+    if !valid_header_name(name)
+        || matches!(
+            name.to_ascii_lowercase().as_str(),
+            "authorization"
+                | "proxy-authorization"
+                | "content-length"
+                | "transfer-encoding"
+                | "trailer"
+                | "host"
+                | "cookie"
+                | "set-cookie"
+                | "content-encoding"
+                | "content-type"
+                | "content-range"
+                | "connection"
+                | "upgrade"
+        )
+    {
+        return false;
+    }
+    line[colon + 1..]
+        .iter()
+        .all(|byte| !byte.is_ascii_control() || *byte == b'\t')
+}
+
+fn parse_size_line(line: &[u8]) -> Option<u64> {
+    let line = line.strip_suffix(b"\r").unwrap_or(line);
+    let (size, extensions) = match line.iter().position(|byte| *byte == b';') {
+        Some(separator) => (
+            trim_bws(&line[..separator]),
+            &line[separator..],
+        ),
+        None => (line, &[][..]),
+    };
+    if size.is_empty() || !size.iter().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    if !extensions.is_empty() && !valid_chunk_extensions(extensions) {
+        return None;
+    }
+    u64::from_str_radix(&String::from_utf8_lossy(size), 16).ok()
 }
 
 #[cfg(test)]
 fn chunk_terminal_detected(chunks: &[&[u8]]) -> bool {
     let mut detector = ChunkedDetector::default();
-    chunks.iter().any(|chunk| detector.feed(chunk))
+    for chunk in chunks {
+        if matches!(detector.feed(chunk), Ok(ChunkProgress::Complete { .. })) {
+            return true;
+        }
+    }
+    false
 }
+fn forward_response_bytes(
+    data: &[u8],
+    content_length: Option<usize>,
+    chunked: bool,
+    body_written: &mut usize,
+    detector: &mut ChunkedDetector,
+) -> Result<(usize, bool), ()> {
+    if let Some(length) = content_length {
+        let take = data.len().min(length.saturating_sub(*body_written));
+        *body_written += take;
+        return Ok((take, *body_written >= length));
+    }
+    if chunked {
+        return match detector.feed(data).map_err(|_| ())? {
+            ChunkProgress::Complete { consumed } => Ok((consumed, true)),
+            ChunkProgress::NeedMore => Ok((data.len(), false)),
+        };
+    }
+    Ok((data.len(), false))
+}
+
 fn try_forward(
-    mut client: &TcpStream,
+    client: &TcpStream,
     target_port: u16,
     initial_bytes: &[u8],
-    body_complete: bool,
     head_request: bool,
 ) -> Result<(u64, u64, Option<f64>), ForwardError> {
     let t_start = Instant::now();
@@ -1187,6 +1777,7 @@ fn try_forward(
         Err(_) => return Err(ForwardError::Connect),
     };
 
+    let _ = server.set_write_timeout(Some(Duration::from_secs(60)));
     if server.write_all(initial_bytes).is_err() {
         return Err(ForwardError::Connect);
     }
@@ -1199,130 +1790,136 @@ fn try_forward(
     let _ = client.set_write_timeout(Some(Duration::from_secs(60)));
     let _ = server.set_write_timeout(Some(Duration::from_secs(60)));
 
-    let header_len = find_headers_end(initial_bytes).unwrap_or(initial_bytes.len());
-    let body_in_initial = initial_bytes.len().saturating_sub(header_len);
-    let content_len = parse_content_length(initial_bytes);
-
-    let mut up_extra = 0u64;
-    let mut upload = [0u8; 16384];
-    if let Some(cl) = content_len {
-        let mut remaining = cl.saturating_sub(body_in_initial);
-        while remaining > 0 {
-            let to_read = upload.len().min(remaining);
-            let n = client.read(&mut upload[..to_read]).map_err(|_| ForwardError::Stream)?;
-            if n == 0 {
-                return Err(ForwardError::Stream);
-            }
-            server.write_all(&upload[..n]).map_err(|_| ForwardError::Stream)?;
-            up_extra += n as u64;
-            remaining -= n;
-        }
-    } else if !body_complete {
-        loop {
-            let n = client.read(&mut upload).map_err(|_| ForwardError::Stream)?;
-            if n == 0 {
-                break;
-            }
-            server.write_all(&upload[..n]).map_err(|_| ForwardError::Stream)?;
-            up_extra += n as u64;
-        }
-    }
     let _ = server.shutdown(std::net::Shutdown::Write);
 
-    let mut server_read = server;
-    let mut client_write = client.try_clone().map_err(|_| ForwardError::Stream)?;
-    let mut buf = [0u8; 16384];
     let mut down_total = 0u64;
     let mut ttfb: Option<f64> = None;
+    let mut server_read = server;
+    let mut client_write = client
+        .try_clone()
+        .map_err(|_| ForwardError::ClientGone { down: 0, ttfb: None })?;
+    let mut buf = [0u8; 16384];
     let mut head_buf: Vec<u8> = Vec::with_capacity(4096);
     let mut headers_done = false;
     let mut resp_cl: Option<usize> = None;
     let mut resp_chunked = false;
     let mut resp_sse = false;
-    let mut sse_boundary = true;
+    let mut sse_tail = [0u8; 4];
+    let mut sse_tail_len = 0usize;
     let mut resp_body: usize = 0;
     let mut chunk_detector = ChunkedDetector::default();
     let mut write_failed = false;
+    let mut stream_error = false;
+    let mut interim_responses = 0usize;
 
-    loop {
+    'response: loop {
         match server_read.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
-                if ttfb.is_none() {
-                    ttfb = Some(t_start.elapsed().as_secs_f64() * 1000.0);
-                }
                 let chunk = &buf[..n];
-                down_total += n as u64;
                 if !headers_done {
                     head_buf.extend_from_slice(chunk);
-                    if head_buf.len() > MAX_HEADERS {
-                        if client_write.write_all(&head_buf).is_err() {
-                            write_failed = true;
+                    loop {
+                        let Some(h_end) = find_headers_end(&head_buf) else {
+                            if head_buf.len() > MAX_HEADERS {
+                                return Err(ForwardError::BadResponse { down: down_total, ttfb });
+                            }
                             break;
-                        }
-                        headers_done = true;
-                        head_buf.clear();
-                    } else if let Some(h_end) = find_headers_end(&head_buf) {
-                        let (cl, chunked, sse) = match parse_resp_headers(&head_buf[..h_end]) {
-                            Ok(framing) => framing,
-                            Err(_) => return Err(ForwardError::Stream),
                         };
-                        let status = response_status(&head_buf[..h_end]);
-                        if status.is_some_and(|code| (100..200).contains(&code) && code != 101) {
+                        if h_end > MAX_HEADERS {
+                            return Err(ForwardError::BadResponse { down: down_total, ttfb });
+                        }
+                        let (cl, chunked, _sse, sse_keepalive) =
+                            match parse_resp_headers(&head_buf[..h_end]) {
+                            Ok(framing) => framing,
+                            Err(_) => {
+                                return Err(ForwardError::BadResponse { down: down_total, ttfb })
+                            }
+                        };
+                        let Some(status) = response_status(&head_buf[..h_end]) else {
+                            return Err(ForwardError::BadResponse { down: down_total, ttfb });
+                        };
+                        if !(100..200).contains(&status) && ttfb.is_none() {
+                            ttfb = Some(t_start.elapsed().as_secs_f64() * 1000.0);
+                        }
+                        if status == 101 {
+                            return Err(ForwardError::UnsupportedUpgrade {
+                                up: initial_bytes.len() as u64,
+                                ttfb,
+                            });
+                        }
+                        if (100..200).contains(&status) {
+                            interim_responses += 1;
+                            if interim_responses > MAX_INTERIM_RESPONSES {
+                                return Err(ForwardError::BadResponse { down: down_total, ttfb });
+                            }
                             head_buf.drain(..h_end);
+                            if head_buf.is_empty() {
+                                break;
+                            }
                             continue;
                         }
-                        if let Some(code) = status.filter(|code| *code == 404 || *code >= 500) {
-                            return Err(ForwardError::HttpStatus(code));
+                        if status == 404 || status >= 500 {
+                            return Err(ForwardError::HttpStatus(status));
                         }
-                        let bodyless = head_request || matches!(status, Some(204 | 304));
+                        let bodyless_status = matches!(status, 204 | 205 | 304);
+                        if (matches!(status, 204 | 205 | 304) && chunked)
+                            || (matches!(status, 204 | 205)
+                                && cl.is_some_and(|length| length > 0))
+                        {
+                            return Err(ForwardError::BadResponse { down: down_total, ttfb });
+                        }
+                        let bodyless = head_request || bodyless_status;
                         resp_cl = if bodyless { Some(0) } else { cl };
                         resp_chunked = if bodyless { false } else { chunked };
-                        resp_sse = sse;
+                        resp_sse = sse_keepalive && !bodyless_status && !head_request;
+                        chunk_detector.track_payload = resp_sse && resp_chunked;
                         headers_done = true;
                         if client_write.write_all(&head_buf[..h_end]).is_err() {
                             write_failed = true;
-                            break;
+                            break 'response;
                         }
                         let body = &head_buf[h_end..];
-                        let body_len = if let Some(len) = resp_cl {
-                            body.len().min(len)
-                        } else {
-                            body.len()
-                        };
-                        resp_body = body_len;
-                        if !body[..body_len].is_empty()
-                            && client_write.write_all(&body[..body_len]).is_err()
-                        {
+                        let (body_len, complete) = forward_response_bytes(
+                            body,
+                            resp_cl,
+                            resp_chunked,
+                            &mut resp_body,
+                            &mut chunk_detector,
+                        )
+                        .map_err(|_| ForwardError::Stream { down: down_total, ttfb })?;
+                        if body_len > 0 && client_write.write_all(&body[..body_len]).is_err() {
                             write_failed = true;
-                            break;
+                            break 'response;
                         }
-                        if let Some(len) = resp_cl {
-                            if resp_body >= len {
-                                break;
-                            }
-                        } else if resp_chunked && chunk_detector.feed(body) {
-                            break;
+                        down_total += body_len as u64;
+                        if complete {
+                            break 'response;
                         }
-                        if resp_sse && !resp_chunked && !body.is_empty() {
-                            sse_boundary = body.ends_with(b"\n\n");
+                        if resp_sse && !resp_chunked && body_len > 0 {
+                            update_payload_tail(&mut sse_tail, &mut sse_tail_len, &body[..body_len]);
                         }
+                        break;
                     }
                 } else {
-                    if client_write.write_all(chunk).is_err() {
+                    let (body_len, complete) = forward_response_bytes(
+                        chunk,
+                        resp_cl,
+                        resp_chunked,
+                        &mut resp_body,
+                        &mut chunk_detector,
+                    )
+                    .map_err(|_| ForwardError::Stream { down: down_total, ttfb })?;
+                    if body_len > 0 && client_write.write_all(&chunk[..body_len]).is_err() {
                         write_failed = true;
-                        break;
+                        break 'response;
                     }
-                    resp_body += n;
-                    if let Some(len) = resp_cl {
-                        if resp_body >= len {
-                            break;
-                        }
-                    } else if resp_chunked && chunk_detector.feed(chunk) {
-                        break;
+                    down_total += body_len as u64;
+                    if complete {
+                        break 'response;
                     }
-                    if resp_sse && !resp_chunked {
-                        sse_boundary = chunk.ends_with(b"\n\n");
+                    if resp_sse && !resp_chunked && body_len > 0 {
+                        update_payload_tail(&mut sse_tail, &mut sse_tail_len, &chunk[..body_len]);
                     }
                 }
             }
@@ -1333,36 +1930,52 @@ fn try_forward(
             {
                 if headers_done && resp_sse {
                     if resp_chunked {
-                        if chunk_detector.at_boundary() {
-                            let _ = client_write.write_all(b"E\r\n: keep-alive\n\n\r\n");
+                        if chunk_detector.can_inject_keepalive()
+                            && chunk_detector.payload_at_sse_boundary()
+                            && client_write
+                                .write_all(b"E\r\n: keep-alive\n\n\r\n")
+                                .is_err()
+                        {
+                            write_failed = true;
+                            break;
                         }
-                    } else if resp_cl.is_none() && sse_boundary {
-                        let _ = client_write.write_all(b": keep-alive\n\n");
+                    } else if resp_cl.is_none()
+                        && payload_at_boundary(&sse_tail, sse_tail_len)
+                        && client_write.write_all(b": keep-alive\n\n").is_err()
+                    {
+                        write_failed = true;
+                        break;
                     }
                 }
                 continue;
             }
-            Err(_) => break,
+            Err(_) => {
+                stream_error = true;
+                break;
+            }
         }
     }
 
     if write_failed {
-        return Err(ForwardError::Stream);
+        return Err(ForwardError::ClientGone { down: down_total, ttfb });
     }
     if !headers_done {
-        return Err(ForwardError::Stream);
+        return Err(ForwardError::BadResponse { down: down_total, ttfb });
+    }
+    if stream_error && resp_cl.is_none() && !resp_chunked {
+        return Err(ForwardError::Stream { down: down_total, ttfb });
     }
     if let Some(len) = resp_cl {
         if resp_body < len {
-            return Err(ForwardError::Stream);
+            return Err(ForwardError::Stream { down: down_total, ttfb });
         }
     }
     if resp_chunked && chunk_detector.state != ChunkState::Done {
-        return Err(ForwardError::Stream);
+        return Err(ForwardError::Stream { down: down_total, ttfb });
     }
     let _ = client_write.shutdown(std::net::Shutdown::Write);
     let _ = client.shutdown(std::net::Shutdown::Both);
-    Ok((initial_bytes.len() as u64 + up_extra, down_total, ttfb))
+    Ok((initial_bytes.len() as u64, down_total, ttfb))
 }
 
 struct InflightGuard {
@@ -1397,10 +2010,19 @@ fn handle_connection(
 
     let initial = match read_headers(&client) {
         Ok(b) => b,
-        Err(_) => return,
+        Err(_) => {
+            let mut c = client;
+            let _ = json_response(&mut c, "400 Bad Request", "{\"error\":{\"message\":\"incomplete request\"}}");
+            return;
+        }
     };
     let (method, path) = request_line(&initial);
-
+    let initial_text = String::from_utf8_lossy(&initial);
+    if !valid_request_line(initial_text.lines().next().unwrap_or("")) {
+        let mut c = client;
+        let _ = json_response(&mut c, "400 Bad Request", "{\"error\":{\"message\":\"invalid request line\"}}");
+        return;
+    }
     if method == "OPTIONS" {
         let _ = handle_options(client);
         return;
@@ -1425,6 +2047,42 @@ fn handle_connection(
             eprintln!("[lac-router rid={}] {} {} -> 401 remote-auth", rid_n, method, path);
             return;
         }
+    }
+
+    let initial_headers = find_headers_end(&initial).unwrap_or(initial.len());
+    let request_content_length = match parse_content_length_strict(&initial[..initial_headers]) {
+        Ok(value) => value,
+        Err(_) => {
+            let mut c = client;
+            let _ = json_response(&mut c, "400 Bad Request", "{\"error\":{\"message\":\"invalid request header\"}}");
+            return;
+        }
+    };
+    let chunked_request = match has_chunked_transfer_encoding(&initial[..initial_headers]) {
+        Ok(value) => value,
+        Err(_) => {
+            let mut c = client;
+            let _ = json_response(&mut c, "400 Bad Request", "{\"error\":{\"message\":\"invalid Transfer-Encoding\"}}");
+            return;
+        }
+    };
+    if request_content_length.is_some_and(|length| length > MAX_BODY) {
+        let mut c = client;
+        let _ = json_response(&mut c, "413 Payload Too Large", "{\"error\":{\"message\":\"request body exceeds the 16 MiB limit\"}}");
+        return;
+    }
+    if request_content_length.is_some() && chunked_request {
+        let mut c = client;
+        let _ = json_response(&mut c, "400 Bad Request", "{\"error\":{\"message\":\"ambiguous request framing\"}}");
+        return;
+    }
+    if request_content_length.is_none()
+        && !chunked_request
+        && !matches!(method.as_str(), "GET" | "HEAD" | "OPTIONS")
+    {
+        let mut c = client;
+        let _ = json_response(&mut c, "400 Bad Request", "{\"error\":{\"message\":\"request body requires Content-Length or chunked framing\"}}");
+        return;
     }
 
     if path == "/lac/status" || path == "/lac/health" || path == "/v1/status" || path == "/v1/health" {
@@ -1458,9 +2116,51 @@ fn handle_connection(
     }
 
     let pref = preferred.load(Ordering::SeqCst);
+    if pick_backends(pref, &hc, &stats, None).is_empty() {
+        let err_body = format!(
+            "{{\"error\":{{\"message\":\"No LAC inference backend is serving (MLX :{}, llama :{}, Ollama :{} all down or breaker-tripped). Start one with `lac serve mlx`.\",\"type\":\"lac_router_error\",\"code\":503}}}}",
+            port_mlx(),
+            port_llama(),
+            port_ollama()
+        );
+        let mut c = client;
+        let _ = json_response(&mut c, "503 Service Unavailable", &err_body);
+        eprintln!("[lac-router rid={}] {} {} -> 503 no-backend", rid_n, method, path);
+        return;
+    }
+
+    if expect_continue(&initial[..initial_headers]) {
+        let _ = client.write_all(b"HTTP/1.1 100 Continue\r\n\r\n");
+    }
+    let frame = match read_request_body(&client, &initial) {
+        Ok(frame) => frame,
+        Err(BodyError::TooLarge) => {
+            let mut c = client;
+            let _ = json_response(&mut c, "413 Payload Too Large", "{\"error\":{\"message\":\"request body exceeds the 16 MiB limit\"}}");
+            return;
+        }
+        Err(BodyError::Invalid) => {
+            let mut c = client;
+            let _ = json_response(&mut c, "400 Bad Request", "{\"error\":{\"message\":\"invalid or incomplete request body\"}}");
+            return;
+        }
+    };
+    if frame.has_following {
+        let mut c = client;
+        if request_content_length.is_some()
+            || chunked_request
+            || initial.len() == initial_headers
+        {
+            let _ = json_response(&mut c, "400 Bad Request", "{\"error\":{\"message\":\"pipelined requests are not supported\"}}");
+        } else {
+            let _ = json_response(&mut c, "400 Bad Request", "{\"error\":{\"message\":\"request body requires Content-Length or chunked framing\"}}");
+        }
+        return;
+    }
+
     // Zero-cost model hint: only the bytes already buffered, only in
     // AUTO/FASTEST (an explicit pin always wins over a guess).
-    let model = sniff_model(&initial).unwrap_or_default();
+    let model = sniff_model(&frame.wire[..frame.wire.len().min(8192)]).unwrap_or_default();
     let model_hint: Option<u16> = if pref == BACKEND_AUTO || pref == BACKEND_FASTEST {
         if model.is_empty() {
             None
@@ -1475,42 +2175,7 @@ fn handle_connection(
         None
     };
 
-    let initial_headers = find_headers_end(&initial).unwrap_or(initial.len());
-    let request_content_length = match parse_content_length_strict(&initial) {
-        Ok(value) => value,
-        Err(_) => {
-            let mut c = client;
-            let _ = json_response(&mut c, "400 Bad Request", "{\"error\":{\"message\":\"invalid Content-Length\"}}");
-            return;
-        }
-    };
-    let chunked_request = header_contains(&initial[..initial_headers], "transfer-encoding")
-        && String::from_utf8_lossy(&initial[..initial_headers])
-            .to_ascii_lowercase()
-            .contains("chunked");
-    if request_content_length.is_some() && chunked_request {
-        let mut c = client;
-        let _ = json_response(&mut c, "400 Bad Request", "{\"error\":{\"message\":\"ambiguous request framing\"}}");
-        return;
-    }
-    let body_framed = request_content_length.is_some() || chunked_request;
-    let body_complete = body_framed || matches!(method.as_str(), "GET" | "HEAD" | "OPTIONS");
-    if header_contains(&initial[..initial_headers], "expect")
-        && String::from_utf8_lossy(&initial[..initial_headers])
-            .to_ascii_lowercase()
-            .contains("100-continue")
-    {
-        let _ = client.write_all(b"HTTP/1.1 100 Continue\r\n\r\n");
-    }
-    let initial = match read_request_body(&client, &initial) {
-        Ok(request) => request,
-        Err(_) => {
-            let mut c = client;
-            let _ = json_response(&mut c, "400 Bad Request", "{\"error\":{\"message\":\"incomplete request body\"}}");
-            return;
-        }
-    };
-    let initial = sanitize_upstream_request(&initial);
+    let initial = sanitize_upstream_request(&frame.wire);
 
     let candidates = pick_backends(pref, &hc, &stats, model_hint);
     if candidates.is_empty() {
@@ -1530,17 +2195,13 @@ fn handle_connection(
     let t0 = Instant::now();
     let mut tried: Vec<u16> = Vec::new();
     for (bid, port) in candidates {
-        match try_forward(&client, port, &initial, body_complete, method == "HEAD") {
+        match try_forward(&client, port, &initial, method == "HEAD") {
             Ok((up, down, ttfb)) => {
                 let up_body = up.saturating_sub(header_len as u64);
-                let down_body = down.saturating_sub(200);
+                let down_body = down;
                 let est = (up_body + down_body) / 4;
-                if let Some(ms) = ttfb {
-                    note_success(&stats, port, ms, up_body, down_body);
-                } else {
-                    // Empty reply still counts as served, without latency data.
-                    note_success(&stats, port, ewma_of(&stats, port).min(30_000.0), up_body, down_body);
-                }
+                let ms = ttfb.unwrap_or_else(|| ewma_of(&stats, port).min(30_000.0));
+                note_success(&stats, port, ms, up_body, down_body);
                 log_usage(
                     rid_n,
                     backend_name(bid),
@@ -1574,14 +2235,16 @@ fn handle_connection(
             Err(ForwardError::HttpStatus(status)) => {
                 note_error(&stats, port);
                 tried.push(port);
+                let up_body = initial.len().saturating_sub(header_len) as u64;
+                let est = up_body / 4;
                 log_usage(
                     rid_n,
                     backend_name(bid),
                     port,
                     &model,
+                    up_body,
                     0,
-                    0,
-                    0,
+                    est,
                     None,
                     "http-error",
                 );
@@ -1591,15 +2254,89 @@ fn handle_connection(
                 );
                 continue;
             }
-            Err(ForwardError::Stream) => {
+            Err(ForwardError::UnsupportedUpgrade { up, ttfb }) => {
+                let up_body = up.saturating_sub(header_len as u64);
+                let est = up_body / 4;
+                log_usage(
+                    rid_n,
+                    backend_name(bid),
+                    port,
+                    &model,
+                    up_body,
+                    0,
+                    est,
+                    ttfb,
+                    "unsupported-upgrade",
+                );
+                let mut c = client;
+                let _ = json_response(
+                    &mut c,
+                    "501 Not Implemented",
+                    "{\"error\":{\"message\":\"upstream protocol upgrades are not supported\"}}",
+                );
+                return;
+            }
+            Err(ForwardError::BadResponse { down, ttfb }) => {
                 note_error(&stats, port);
-                log_usage(rid_n, backend_name(bid), port, &model, 0, 0, 0, None, "stream-broke");
+                tried.push(port);
+                let up_body = initial.len().saturating_sub(header_len) as u64;
+                let est = (up_body + down) / 4;
+                log_usage(
+                    rid_n,
+                    backend_name(bid),
+                    port,
+                    &model,
+                    up_body,
+                    down,
+                    est,
+                    ttfb,
+                    "bad-response",
+                );
                 eprintln!(
-                    "[lac-router rid={}] {} {} -> :{} stream-broke ({:.1}s)",
+                    "[lac-router rid={}] {} {} -> :{} invalid-response; trying next",
+                    rid_n, method, path, port
+                );
+                continue;
+            }
+            Err(ForwardError::ClientGone { down, ttfb }) => {
+                let up_body = initial.len().saturating_sub(header_len) as u64;
+                let est = (up_body + down) / 4;
+                log_usage(
+                    rid_n,
+                    backend_name(bid),
+                    port,
+                    &model,
+                    up_body,
+                    down,
+                    est,
+                    ttfb,
+                    "client-gone",
+                );
+                return;
+            }
+            Err(ForwardError::Stream { down, ttfb }) => {
+                note_error(&stats, port);
+                let up_body = initial.len().saturating_sub(header_len) as u64;
+                let est = (up_body + down) / 4;
+                log_usage(
+                    rid_n,
+                    backend_name(bid),
+                    port,
+                    &model,
+                    up_body,
+                    down,
+                    est,
+                    ttfb,
+                    "stream-broke",
+                );
+                eprintln!(
+                    "[lac-router rid={}] {} {} -> :{} stream-broke (up={} down={} {:.1}s)",
                     rid_n,
                     method,
                     path,
                     port,
+                    up_body,
+                    down,
                     t0.elapsed().as_secs_f64()
                 );
                 return;
@@ -1678,7 +2415,7 @@ fn main() {
         .map(|addr| addr.to_string())
         .unwrap_or_else(|_| bind_addr.clone());
 
-    let hc = Arc::new(HealthCache::new(Duration::from_secs(1)));
+    let hc = Arc::new(HealthCache::new(Duration::from_secs(5)));
     let stats: StatsMap = Arc::new(Mutex::new(HashMap::new()));
     let routes: RouteMap = Arc::new(Mutex::new(HashMap::new()));
     let inflight = Arc::new(AtomicUsize::new(0));
@@ -1832,6 +2569,10 @@ mod tests {
         let (m, p) = request_line(b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\n\r\n");
         assert_eq!(m, "POST");
         assert_eq!(p, "/v1/chat/completions");
+        assert!(valid_request_line("POST /v1/chat HTTP/1.1"));
+        assert!(valid_request_line("GET http://example.test/x HTTP/1.1"));
+        assert!(!valid_request_line("POST /v1/chat HTTP/2"));
+        assert!(!valid_request_line("POST  /v1/chat HTTP/1.1"));
     }
 
     #[test]
@@ -1880,6 +2621,10 @@ mod tests {
         assert!(parse_content_length_strict(conflicting).is_err());
         let invalid = b"POST / HTTP/1.1\r\nContent-Length: nope\r\n\r\n";
         assert!(parse_content_length_strict(invalid).is_err());
+        let signed = b"POST / HTTP/1.1\r\nContent-Length: +2\r\n\r\n";
+        assert!(parse_content_length_strict(signed).is_err());
+        let folded = b"POST / HTTP/1.1\r\n Content-Length: 2\r\n\r\n";
+        assert!(parse_content_length_strict(folded).is_err());
     }
 
     #[test]
@@ -1887,15 +2632,39 @@ mod tests {
         let json = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 48\r\nConnection: keep-alive\r\n\r\n";
         assert_eq!(
             parse_resp_headers(json),
-            Ok((Some(48), false, false))
+            Ok((Some(48), false, false, false))
         );
         let sse = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n";
-        assert_eq!(parse_resp_headers(sse), Ok((None, true, true)));
-        // Chunked wins over Content-Length per RFC 7230.
+        assert_eq!(parse_resp_headers(sse), Ok((None, true, true, true)));
+        let encoded_sse = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Encoding: gzip\r\nContent-Length: 3\r\n\r\n";
+        assert_eq!(parse_resp_headers(encoded_sse), Ok((Some(3), false, true, false)));
         let both = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 99\r\nContent-Type: text/event-stream\r\n\r\n";
-        assert_eq!(parse_resp_headers(both), Ok((None, true, true)));
+        assert!(parse_resp_headers(both).is_err());
+        let loose = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: notchunked\r\n\r\n";
+        assert!(parse_resp_headers(loose).is_err());
+        let media = b"HTTP/1.1 200 OK\r\nContent-Type: application/json; note=\"text/event-stream\"\r\nContent-Length: 2\r\n\r\n";
+        assert_eq!(parse_resp_headers(media), Ok((Some(2), false, false, false)));
+        let transfer = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+        assert_eq!(has_chunked_transfer_encoding(transfer), Ok(true));
+        let chained = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\n";
+        assert_eq!(has_chunked_transfer_encoding(chained), Ok(true));
+        let unsupported = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked, gzip\r\n\r\n";
+        assert!(has_chunked_transfer_encoding(unsupported).is_err());
+        let duplicate = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked, chunked\r\n\r\n";
+        assert!(has_chunked_transfer_encoding(duplicate).is_err());
+        let spaced = b"HTTP/1.1 200 OK\r\nTransfer-Encoding : chunked\r\n\r\n";
+        assert!(has_chunked_transfer_encoding(spaced).is_err());
+        assert!(parse_resp_headers(spaced).is_err());
+        let folded = b"HTTP/1.1 200 OK\r\nX-Test: yes\r\n Transfer-Encoding: chunked\r\n\r\n";
+        assert!(has_chunked_transfer_encoding(folded).is_err());
         let conflicting = b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\n";
         assert!(parse_resp_headers(conflicting).is_err());
+        let obs_text = b"HTTP/1.1 200 OK\r\nX-Name: caf\xff\r\nContent-Length: 2\r\n\r\n";
+        assert_eq!(parse_resp_headers(obs_text), Ok((Some(2), false, false, false)));
+        let bws_name = b"HTTP/1.1 200 OK\r\nX-Trace : fine\r\nContent-Length: 2\r\n\r\n";
+        assert_eq!(parse_resp_headers(bws_name), Ok((Some(2), false, false, false)));
+        let duplicate_same = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n";
+        assert_eq!(parse_resp_headers(duplicate_same), Ok((Some(2), false, false, false)));
     }
 
     #[test]
@@ -1911,12 +2680,98 @@ mod tests {
         assert!(chunk_terminal_detected(&[b"0\r\n\r\n"]));
         assert!(!chunk_terminal_detected(&[b"5\r\nhello\r\n"]));
         assert!(!chunk_terminal_detected(&[b"5\r\nhello0\r\n\r\n0\r\n\r\n"]));
+        assert!(!chunk_terminal_detected(&[b"5;bad ext=1\r\nhello\r\n0\r\n\r\n"]));
+        assert!(chunk_terminal_detected(&[b"5 ;foo=\"a;b\"\r\nhello\r\n0\r\n\r\n"]));
+        assert!(!chunk_terminal_detected(&[b"5;bad\x01ext=1\r\nhello\r\n0\r\n\r\n"]));
+        assert!(!chunk_terminal_detected(&[b"0;\r\n\r\n"]));
+        assert!(!chunk_terminal_detected(&[b"5;=x\r\nhello\r\n0\r\n\r\n"]));
+        assert!(!chunk_terminal_detected(&[b"5;foo=\"unterminated\r\nhello\r\n0\r\n\r\n"]));
+        assert!(!chunk_terminal_detected(&[b"0\r\nnot-a-header\r\n\r\n"]));
+        assert!(!chunk_terminal_detected(&[b"0\r\nContent-Length: 4\r\n\r\n"]));
+    }
+
+    #[test]
+    fn chunk_feed_reports_exact_terminal_offset() {
+        let mut detector = ChunkedDetector::default();
+        assert_eq!(
+            detector.feed(b"0\r\n\r\nTRAILING"),
+            Ok(ChunkProgress::Complete { consumed: 5 })
+        );
+    }
+
+    #[test]
+    fn chunk_feed_distinguishes_incomplete_and_invalid() {
+        let mut detector = ChunkedDetector::default();
+        assert_eq!(detector.feed(b"5\r\nhel"), Ok(ChunkProgress::NeedMore));
+        assert_eq!(detector.feed(b"lo\r\n"), Ok(ChunkProgress::NeedMore));
+        assert_eq!(detector.feed(b"0\n"), Err(()));
+    }
+
+    #[test]
+    fn keepalive_is_allowed_only_at_a_complete_size_boundary() {
+        let mut detector = ChunkedDetector::default();
+        assert!(detector.can_inject_keepalive());
+        assert_eq!(detector.feed(b"1"), Ok(ChunkProgress::NeedMore));
+        assert!(!detector.can_inject_keepalive());
+        assert_eq!(detector.feed(b"\r\na\r\n"), Ok(ChunkProgress::NeedMore));
+        assert!(detector.can_inject_keepalive());
+        assert_eq!(detector.feed(b"0\r\n"), Ok(ChunkProgress::NeedMore));
+        assert!(!detector.can_inject_keepalive());
+        assert_eq!(detector.feed(b"\r\n"), Ok(ChunkProgress::Complete { consumed: 2 }));
+    }
+
+    #[test]
+    fn keepalive_requires_a_complete_sse_event_boundary() {
+        let mut detector = ChunkedDetector {
+            track_payload: true,
+            ..ChunkedDetector::default()
+        };
+        assert_eq!(
+            detector.feed(b"a\r\ndata: part\r\n"),
+            Ok(ChunkProgress::NeedMore)
+        );
+        assert!(detector.can_inject_keepalive());
+        assert!(!detector.payload_at_sse_boundary());
+        assert_eq!(detector.feed(b"5\r\nial\n\n\r\n"), Ok(ChunkProgress::NeedMore));
+        assert!(detector.can_inject_keepalive());
+        assert!(
+            detector.payload_at_sse_boundary(),
+            "tail={:?} len={}",
+            detector.payload_tail,
+            detector.payload_len
+        );
+
+        let mut crlf = ChunkedDetector {
+            track_payload: true,
+            ..ChunkedDetector::default()
+        };
+        assert_eq!(crlf.feed(b"4\r\n\r\n\r\n\r\n"), Ok(ChunkProgress::NeedMore));
+        assert!(crlf.can_inject_keepalive());
+        assert!(crlf.payload_at_sse_boundary());
+        assert!(payload_at_boundary(b"\0x\r\r", 4));
+        assert!(payload_at_boundary(b"x\n\r\n", 4));
+        assert!(!payload_at_boundary(b"\0\0x\r", 4));
+        assert!(!payload_at_boundary(b"\0\0x\n", 4));
+        assert!(!payload_at_boundary(b"\0\0\0\0", 1));
+        let mut tiny_tail = [0u8; 4];
+        let mut tiny_len = 0usize;
+        for byte in b"abcd" {
+            update_payload_tail(&mut tiny_tail, &mut tiny_len, &[*byte]);
+        }
+        assert_eq!(tiny_len, 4);
+        assert_eq!(tiny_tail, *b"abcd");
     }
 
     #[test]
     fn response_status_parsed() {
         assert_eq!(response_status(b"HTTP/1.1 200 OK\r\n\r\n"), Some(200));
         assert_eq!(response_status(b"HTTP/1.1 503 Service Unavailable\r\n\r\n"), Some(503));
+        assert_eq!(response_status(b"HTTP/1.1 600 Extension\r\n\r\n"), Some(600));
+        assert_eq!(response_status(b"HTTP/1.1 200\r\n\r\n"), Some(200));
+        assert_eq!(response_status(b"HTTP/1.1 200\tOK\r\n\r\n"), None);
+        assert_eq!(response_status(b"HTTP/1.1 200\x0bOK\r\n\r\n"), None);
+        assert_eq!(response_status(b"HTTP/1.1 +200 OK\r\n\r\n"), None);
+        assert_eq!(response_status(b"garbage 200 OK\r\n\r\n"), None);
         assert_eq!(response_status(b"not-http"), None);
     }
 
