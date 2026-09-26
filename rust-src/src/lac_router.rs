@@ -1179,15 +1179,36 @@ enum ForwardError {
     HttpStatus(u16),
     /// Stream broke mid-proxy: the response is already partial, do not retry.
     Stream { down: u64, ttfb: Option<f64> },
-    /// An EOF-delimited response (no Content-Length, no chunking) stopped
-    /// early — a reset or an expired stream budget. Nothing was truncated
-    /// *within* a frame the backend promised, so this is not a backend
-    /// fault: do not trip the breaker, and do not fail over.
+    /// An EOF-delimited response (no Content-Length, no chunking) was cut
+    /// short by a connection reset: a network event, not proof that this
+    /// backend is unhealthy, so it is neither charged nor failed over.
     StreamCut { down: u64, ttfb: Option<f64> },
     BadResponse { down: u64, ttfb: Option<f64> },
     ClientGone { down: u64, ttfb: Option<f64> },
     /// Backend requested a protocol upgrade that this HTTP relay does not support.
     UnsupportedUpgrade { up: u64, ttfb: Option<f64> },
+}
+
+/// Why a response stopped delivering bytes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum StreamEnd {
+    /// The peer went away mid-body. Networks reset connections; the next
+    /// request on this backend may well succeed, so do not charge it.
+    Reset,
+    /// Silent until the stream budget ran out. The backend is not talking
+    /// and the next request will hang exactly the same way, so this is
+    /// charged — that is what stops traffic piling onto a hung backend
+    /// until every inflight slot is spent.
+    Hung,
+}
+
+/// Split the read errors that end a response. A timeout reaching this point
+/// has already outlived the budget (the keepalive arm handles the rest).
+fn classify_read_error(kind: io::ErrorKind) -> StreamEnd {
+    match kind {
+        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock => StreamEnd::Hung,
+        _ => StreamEnd::Reset,
+    }
 }
 
 /// Ordered candidate backends. Default policy is tier order
@@ -1884,7 +1905,7 @@ fn try_forward(
     let mut resp_body: usize = 0;
     let mut chunk_detector = ChunkedDetector::default();
     let mut write_failed = false;
-    let mut stream_error = false;
+    let mut stream_end: Option<StreamEnd> = None;
     let mut interim_responses = 0usize;
 
     'response: loop {
@@ -2024,8 +2045,8 @@ fn try_forward(
                 }
                 continue;
             }
-            Err(_) => {
-                stream_error = true;
+            Err(e) => {
+                stream_end = Some(classify_read_error(e.kind()));
                 break;
             }
         }
@@ -2037,8 +2058,16 @@ fn try_forward(
     if !headers_done {
         return Err(ForwardError::BadResponse { down: down_total, ttfb });
     }
-    if stream_error && resp_cl.is_none() && !resp_chunked {
-        return Err(ForwardError::StreamCut { down: down_total, ttfb });
+    // Nothing was truncated *inside* a frame the backend promised, so the
+    // only question left is who ended it. A reset is the network's doing;
+    // silence until the budget expired is the backend's.
+    if resp_cl.is_none() && !resp_chunked {
+        if let Some(end) = stream_end {
+            return Err(match end {
+                StreamEnd::Hung => ForwardError::Stream { down: down_total, ttfb },
+                StreamEnd::Reset => ForwardError::StreamCut { down: down_total, ttfb },
+            });
+        }
     }
     if let Some(len) = resp_cl {
         if resp_body < len {
@@ -2392,9 +2421,8 @@ fn handle_connection(
                 return;
             }
             Err(ForwardError::StreamCut { down, ttfb }) => {
-                // No note_error: a reset or an expired budget on an
-                // EOF-delimited response is not the backend misbehaving,
-                // and three such cuts must never open the breaker.
+                // No note_error: a reset is the network's doing, and three
+                // of them must never open the breaker.
                 let up_body = initial.len().saturating_sub(header_len) as u64;
                 let est = (up_body + down) / 4;
                 log_usage(
@@ -2641,6 +2669,33 @@ mod tests {
         }));
         assert!(text.contains("X-Trace: keep"));
         assert!(text.ends_with("\r\n\r\nauthorization-body"));
+    }
+
+    #[test]
+    fn read_errors_split_reset_from_hung() {
+        // Resets are the network's doing: never charged to the backend.
+        assert_eq!(
+            classify_read_error(io::ErrorKind::ConnectionReset),
+            StreamEnd::Reset
+        );
+        assert_eq!(
+            classify_read_error(io::ErrorKind::ConnectionAborted),
+            StreamEnd::Reset
+        );
+        assert_eq!(
+            classify_read_error(io::ErrorKind::BrokenPipe),
+            StreamEnd::Reset
+        );
+        // A timeout past the budget means the backend stopped talking:
+        // charged, so a hung backend leaves rotation.
+        assert_eq!(
+            classify_read_error(io::ErrorKind::TimedOut),
+            StreamEnd::Hung
+        );
+        assert_eq!(
+            classify_read_error(io::ErrorKind::WouldBlock),
+            StreamEnd::Hung
+        );
     }
 
     #[test]

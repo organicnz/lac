@@ -179,6 +179,8 @@ fn spawn_backend() -> u16 {
                     "hold-open"
                 } else if text.contains("eof-json") {
                     "eof-json"
+                } else if text.contains("rst-cut") {
+                    "rst-cut"
                 } else if text.contains("sse-slow") {
                     "sse-slow"
                 } else {
@@ -335,6 +337,19 @@ fn spawn_backend() -> u16 {
                         let _ = s.write_all(
                             b"HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n\r\n{\"eof\":\"ok\"}",
                         );
+                    }
+                    "rst-cut" => {
+                        // A chunked request is never drained by the
+                        // dispatch above, so its body is still queued when
+                        // we close: the kernel sends RST, not FIN. Pause
+                        // before the write so the router has finished
+                        // sending, and after it so the router reads the
+                        // response before the reset lands.
+                        thread::sleep(Duration::from_millis(100));
+                        let _ = s.write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\ndata: rst",
+                        );
+                        thread::sleep(Duration::from_millis(150));
                     }
                     "sse-slow" => {
                         let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n");
@@ -506,7 +521,8 @@ fn probe_paced_oversized_chunked(router_port: u16) -> Vec<u8> {
         Duration::from_secs(5),
     )
     .unwrap();
-    stream.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+    // Generous: a loaded CI runner may need a while to move 16 MiB.
+    stream.set_read_timeout(Some(Duration::from_secs(60))).unwrap();
     stream.write_all(head).unwrap();
     stream.write_all(size_line).unwrap();
     let block = vec![b'a'; 64 * 1024];
@@ -519,6 +535,32 @@ fn probe_paced_oversized_chunked(router_port: u16) -> Vec<u8> {
     thread::sleep(Duration::from_millis(200));
     stream.write_all(b"a").unwrap();
     read_response(&mut stream)
+}
+
+/// Drive the `rst-cut` scenario. The request is chunked, so the fake
+/// backend never drains its body: when the backend closes, unread bytes
+/// are queued and the kernel resets the connection instead of finishing
+/// it. That is a reset, which the router must not charge to the backend.
+fn probe_chunked_reset(router_port: u16) -> (Vec<u8>, f64) {
+    let mut body =
+        "{\"model\":\"qwen3.8-27b\",\"scenario\":\"rst-cut\",\"pad\":\"".to_string();
+    body.push_str(&"a".repeat(16 * 1024));
+    body.push_str("\"}");
+    let request = format!(
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:X}\r\n{}\r\n0\r\n\r\n",
+        body.len(),
+        body
+    );
+    let mut stream = TcpStream::connect_timeout(
+        &format!("127.0.0.1:{}", router_port).parse().unwrap(),
+        Duration::from_secs(5),
+    )
+    .unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(15))).unwrap();
+    let t0 = Instant::now();
+    stream.write_all(request.as_bytes()).unwrap();
+    let response = read_response(&mut stream);
+    (response, t0.elapsed().as_secs_f64())
 }
 
 fn wait_router(port: u16) {
@@ -790,6 +832,18 @@ fn relay_framing_regressions() {
         String::from_utf8_lossy(&eof_json)
     );
 
+    // A reset mid-stream is the network's doing, not a backend fault:
+    // three in a row must leave the backend in rotation.
+    for _ in 0..3 {
+        let (_reset, reset_total) = probe_chunked_reset(router_port);
+        assert!(reset_total < 5.0, "reset must not stall the relay: {reset_total}s");
+    }
+    let (after_resets, _, _) = probe(router_port, "hold-open");
+    assert!(
+        String::from_utf8_lossy(&after_resets).contains("hold-open ok"),
+        "resets must not open the breaker"
+    );
+
     // Strict request-line/header grammar: bare LF, obs-fold, oversized.
     let bare_lf = b"GET /v1/models HTTP/1.1\r\nHost: x\nX-Extra: y\r\n\r\n";
     assert!(probe_raw(router_port, bare_lf).starts_with(b"HTTP/1.1 400"));
@@ -860,6 +914,7 @@ fn relay_framing_regressions() {
     assert_eq!(usage.matches("\"outcome\":\"unsupported-upgrade\"").count(), 1);
     assert_eq!(usage.matches("\"outcome\":\"bad-response\"").count(), 3);
     assert_eq!(usage.matches("\"outcome\":\"client-gone\"").count(), 1);
+    assert_eq!(usage.matches("\"outcome\":\"stream-cut\"").count(), 3);
     assert!(usage.matches("\"outcome\":\"proxied\"").count() >= 1);
 
     // Budgets are env-tunable, so a second router with 1s budgets can prove
@@ -912,8 +967,9 @@ fn relay_framing_regressions() {
     );
     assert!(stalled_total < 4.0, "body idle timeout bounded the wait: {stalled_total}s");
 
-    // Three EOF-delimited streams cut by the budget. Must stay under the
-    // breaker's error threshold, so the backend keeps serving afterwards.
+    // Three streams the backend never finishes. Each is cut by the budget,
+    // and silence for the whole budget IS the backend's fault: three of
+    // them take it out of rotation, so later traffic stops piling onto it.
     let mut cuts_total = 0.0;
     for _ in 0..3 {
         let (raw, _, total) = probe(budget_port, "sse-slow");
@@ -933,14 +989,15 @@ fn relay_framing_regressions() {
 
     let (after_cuts, _, _) = probe(budget_port, "hold-open");
     assert!(
-        String::from_utf8_lossy(&after_cuts).contains("hold-open ok"),
-        "backend still serving after budget cuts (breaker must not open)"
+        String::from_utf8_lossy(&after_cuts).starts_with("HTTP/1.1 503"),
+        "a backend that went silent must leave rotation: {:?}",
+        String::from_utf8_lossy(&after_cuts)
     );
 
     let budget_usage = std::fs::read_to_string(format!("{}/.lac/router-usage.jsonl", budget_home.display()))
         .expect("budget usage log exists");
-    assert_eq!(budget_usage.matches("\"outcome\":\"stream-cut\"").count(), 3);
-    assert_eq!(budget_usage.matches("\"outcome\":\"stream-broke\"").count(), 0);
+    assert_eq!(budget_usage.matches("\"outcome\":\"stream-broke\"").count(), 3);
+    assert_eq!(budget_usage.matches("\"outcome\":\"stream-cut\"").count(), 0);
 
     drop(budget_router);
     drop(router);
