@@ -675,10 +675,22 @@ const MAX_BUFFERED_BODY: usize = 256 * 1024 * 1024;
 
 /// Retryable "the router is full", distinct from the 503 raised when there
 /// is no backend: both are retryable, but only one means try another port.
-const BODY_BUDGET_BUSY: &str = "{\"error\":{\"message\":\"router is already buffering request bodies up to its limit; retry shortly\",\"type\":\"lac_router_busy\",\"code\":503}}";
+const BODY_BUDGET_BUSY: &str =
+    "router is buffering as many request bodies as it will hold; retry once a request finishes";
+
+/// Distinct error types for the two retryable saturation causes, so a client
+/// (or an operator reading its logs) can tell them apart.
+const BUSY_TYPE: &str = "lac_router_busy";
+const BODY_BUDGET_TYPE: &str = "lac_router_body_budget";
 
 /// Env-overridable so tests can drive the cap with a small body. An
 /// out-of-range value is ignored (the startup banner shows what applied).
+///
+/// Note the effective per-request ceiling this implies: a request costs up
+/// to three times its declared body length, so the largest single body that
+/// can always be served is about a third of this. Set it to at least a few
+/// times the largest body you expect, or a mid-sized upload will be refused
+/// as "busy" on an otherwise idle router.
 fn max_buffered_body() -> usize {
     env::var("LAC_ROUTER_MAX_BUFFERED_BODY")
         .ok()
@@ -810,10 +822,18 @@ fn read_request_body(
     // pulling the whole thing into memory first. This only peeks: the real
     // charge happens as the buffer's capacity grows below, so the body is
     // not counted twice.
+    //
+    // Peek the worst case, not the declared length. A request actually costs
+    // up to three times it: the frame buffer (which Vec doubles, so up to
+    // 2x) plus the sanitized copy it is forwarded as. Peeking only the
+    // declared length would let two thirds of an unfittable upload through
+    // to be read and refused afterwards, which is what this check exists to
+    // avoid. The cost of over-peeking is a slightly lower effective ceiling,
+    // which max_buffered_body documents.
     if let Some(declared) =
         parse_content_length_strict(&initial[..header_len]).map_err(|_| BodyError::Invalid)?
     {
-        if !body_budget.fits(declared) {
+        if !body_budget.fits(declared.saturating_mul(3)) {
             return Err(BodyError::Busy);
         }
     }
@@ -876,13 +896,15 @@ fn read_request_body(
                         has_following = has_queued_bytes(client);
                     }
                     let wire = request[..end].to_vec();
-                    // The doubling-grown buffer dies here and only the
-                    // exact-size copy survives, so hand its charge back and
-                    // take the copy's.
-                    body_budget.release(charged);
+                    // Charge the replacement before releasing the old
+                    // buffer's share: `request` is still live here, and a
+                    // release-first transfer would under-count its whole
+                    // capacity for an instant, admitting a connection that
+                    // does not fit.
                     if !body_budget.try_reserve(wire.capacity()) {
                         return Err(BodyError::Busy);
                     }
+                    body_budget.release(charged);
                     return Ok(RequestFrame { wire, has_following });
                 }
                 ChunkProgress::NeedMore => {
@@ -892,6 +914,13 @@ fn read_request_body(
                     }
                     fed = request.len();
                     request.extend_from_slice(&buffer[..n]);
+                    // Per-request limit before budget: a chunked body past
+                    // MAX_BODY is 413 whatever the buffer budget is doing,
+                    // and checking the other way round would report a body
+                    // that is simply too large as "busy".
+                    if request.len() > max_request {
+                        return Err(BodyError::TooLarge);
+                    }
                     let capacity = request.capacity();
                     if capacity > charged {
                         if !body_budget.try_reserve(capacity - charged) {
@@ -899,21 +928,23 @@ fn read_request_body(
                         }
                         charged = capacity;
                     }
-                    if request.len() > max_request {
-                        return Err(BodyError::TooLarge);
-                    }
                 }
             }
         }
     }
+    // No framing at all, which for a routed request means a body-less
+    // GET/HEAD. Only the headers survive, so give the buffer's share back
+    // rather than holding it for the whole relay.
     let mut has_following = request.len() > header_len;
     if !has_following {
         has_following = has_queued_bytes(client);
     }
-    Ok(RequestFrame {
-        wire: request[..header_len].to_vec(),
-        has_following,
-    })
+    let wire = request[..header_len].to_vec();
+    if !body_budget.try_reserve(wire.capacity()) {
+        return Err(BodyError::Busy);
+    }
+    body_budget.release(charged);
+    Ok(RequestFrame { wire, has_following })
 }
 
 fn valid_request_line(line: &str) -> bool {
@@ -964,6 +995,52 @@ fn http_response(status: &str, content_type: &str, body: &str) -> String {
 fn json_response(stream: &mut TcpStream, status: &str, body: &str) -> io::Result<()> {
     let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
     stream.write_all(http_response(status, "application/json", body).as_bytes())
+}
+
+/// A response the caller should retry rather than shrink or give up on.
+/// Carries Retry-After so a client has something to back off against, and a
+/// distinct error type per cause: "too many connections" and "no buffer
+/// room" are both retryable, but an operator debugging them needs to tell
+/// them apart.
+fn retryable_http_response(
+    status: &str,
+    error_type: &str,
+    message: &str,
+    retry_after_secs: u64,
+) -> String {
+    // Take the code from the status rather than hardcoding one, so the body
+    // cannot contradict the status line.
+    let code = status.split_whitespace().next().unwrap_or("503");
+    debug_assert!(
+        code.len() == 3 && code.bytes().all(|byte| byte.is_ascii_digit()),
+        "status must lead with a three-digit code: {status}"
+    );
+    let body = format!(
+        "{{\"error\":{{\"message\":\"{}\",\"type\":\"{}\",\"code\":{}}}}}",
+        common::json_escape(message),
+        common::json_escape(error_type),
+        code
+    );
+    format!(
+        "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nRetry-After: {}\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n{}",
+        status,
+        body.len(),
+        retry_after_secs,
+        body
+    )
+}
+
+fn retryable_response(
+    stream: &mut TcpStream,
+    status: &str,
+    error_type: &str,
+    message: &str,
+    retry_after_secs: u64,
+) -> io::Result<()> {
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
+    stream.write_all(
+        retryable_http_response(status, error_type, message, retry_after_secs).as_bytes(),
+    )
 }
 
 // --------------------------------------------------------------- /lac/* -----
@@ -2423,7 +2500,7 @@ fn handle_connection(
         }
         Err(BodyError::Busy) => {
             let mut c = client;
-            let _ = json_response(&mut c, "503 Service Unavailable", BODY_BUDGET_BUSY);
+            let _ = retryable_response(&mut c, "503 Service Unavailable", BODY_BUDGET_TYPE, BODY_BUDGET_BUSY, 5);
             eprintln!("[lac-router rid={}] {} {} -> 503 body-budget", rid_n, method, path);
             return;
         }
@@ -2469,7 +2546,7 @@ fn handle_connection(
     let sanitized = sanitize_upstream_request(&frame.wire);
     if !body_reservation.try_reserve(sanitized.capacity()) {
         let mut c = client;
-        let _ = json_response(&mut c, "503 Service Unavailable", BODY_BUDGET_BUSY);
+        let _ = retryable_response(&mut c, "503 Service Unavailable", BODY_BUDGET_TYPE, BODY_BUDGET_BUSY, 5);
         eprintln!("[lac-router rid={}] {} {} -> 503 body-budget (relay)", rid_n, method, path);
         return;
     }
@@ -2769,10 +2846,13 @@ fn main() {
     );
     // Print the effective limit: it is env-tunable and silently clamped, and
     // an operator sizing RAM against it needs to see what actually applies.
+    // In bytes, because a MiB-truncated figure would read "0 MiB" for
+    // exactly the small values a test or a careful operator might set.
     eprintln!(
-        "  Request bodies: {} KiB per request, {} MiB buffered in total",
+        "  Request bodies: {} KiB per request, {} bytes buffered in total (~{} KiB body)",
         MAX_BODY / 1024,
-        body_budget.limit / (1024 * 1024)
+        body_budget.limit,
+        body_budget.limit / 3 / 1024
     );
     eprintln!(
         "  Preferred backend: {} (LAC_BACKEND env > ~/.lac/router-backend)",
@@ -2798,10 +2878,12 @@ fn main() {
                 if n > MAX_INFLIGHT {
                     inflight.fetch_sub(1, Ordering::SeqCst);
                     let mut c = client;
-                    let _ = json_response(
+                    let _ = retryable_response(
                         &mut c,
                         "503 Service Unavailable",
-                        "{\"error\":{\"message\":\"router saturated (128 inflight)\",\"type\":\"lac_router_busy\",\"code\":503}}",
+                        BUSY_TYPE,
+                        &format!("router saturated ({} inflight)", MAX_INFLIGHT),
+                        1,
                     );
                     continue;
                 }
@@ -2908,11 +2990,8 @@ mod tests {
     fn body_budget_holds_its_invariants_under_contention() {
         // Drives the concurrent path and checks the two invariants that
         // matter: the counter never passes the cap, and every claim comes
-        // back. Note this does NOT by itself distinguish the compare-exchange
-        // from a naive check-then-add — the window for that race is too
-        // narrow to sample reliably, and a widened one still passed. The CAS
-        // is justified by construction; this test guards against gross
-        // breakage of the accounting, such as a lost or duplicated claim.
+        // back. The 64 KiB claim followed by a 1 MiB one is the window a
+        // naive check-then-add slips through, and it is caught here.
         const LIMIT: usize = 1_000_000;
         const CLAIMS: usize = 4000;
         let budget = BodyBudget {
@@ -2973,6 +3052,49 @@ mod tests {
             0,
             "every reservation was returned"
         );
+    }
+
+    #[test]
+    fn retryable_responses_advertise_a_delay_and_a_distinct_type() {
+        let busy = retryable_http_response(
+            "503 Service Unavailable",
+            BUSY_TYPE,
+            "router saturated (128 inflight)",
+            1,
+        );
+        let budget = retryable_http_response(
+            "503 Service Unavailable",
+            BODY_BUDGET_TYPE,
+            BODY_BUDGET_BUSY,
+            5,
+        );
+        for response in [&busy, &budget] {
+            assert!(response.starts_with("HTTP/1.1 503"), "{response}");
+            assert!(response.contains("Retry-After: "), "{response}");
+            // A wrong Content-Length truncates or hangs the client, so the
+            // header must match the body byte for byte.
+            let head_end = response.find("\r\n\r\n").expect("headers") + 4;
+            let declared: usize = response
+                .lines()
+                .find_map(|line| line.strip_prefix("Content-Length: "))
+                .expect("length")
+                .trim()
+                .parse()
+                .expect("numeric length");
+            assert_eq!(declared, response.len() - head_end, "{response}");
+        }
+        // The body's code must agree with the status line it is served under.
+        assert!(busy.contains("\"code\":503"), "{busy}");
+        // Two retryable causes must be told apart by a client, using the
+        // same constants the call sites use.
+        assert!(busy.contains(BUSY_TYPE) && budget.contains(BODY_BUDGET_TYPE));
+        assert!(!busy.contains(BODY_BUDGET_TYPE), "{busy}");
+        assert!(!budget.contains(BUSY_TYPE), "{budget}");
+        assert_ne!(BUSY_TYPE, BODY_BUDGET_TYPE);
+        // The body budget is held for the life of a relay, not a request,
+        // so a one-second hint would send the client straight back into it.
+        assert!(busy.contains("Retry-After: 1\r\n"), "{busy}");
+        assert!(budget.contains("Retry-After: 5\r\n"), "{budget}");
     }
 
     #[test]

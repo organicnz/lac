@@ -835,6 +835,15 @@ fn relay_framing_regressions() {
     let oversized = b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Length: 16777217\r\nConnection: close\r\n\r\n";
     assert!(probe_raw(router_port, oversized).starts_with(b"HTTP/1.1 413"));
 
+    // A body beyond the router's total buffer allowance is still a
+    // per-request 413, not a "busy" 503: this request is too big, and
+    // retrying it will not help.
+    let oversized_beyond_budget = b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Length: 1073741824\r\nConnection: close\r\n\r\n";
+    assert!(
+        probe_raw(router_port, oversized_beyond_budget).starts_with(b"HTTP/1.1 413"),
+        "over the per-request limit is 413 even when it also exceeds the buffer budget"
+    );
+
     let unframed_body = b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n{\"unframed\":true}";
     let unframed_response = probe_raw(router_port, unframed_body);
     assert!(String::from_utf8_lossy(&unframed_response).contains("requires Content-Length"));
@@ -1018,7 +1027,7 @@ fn relay_framing_regressions() {
             ("LAC_ROUTER_STREAM_BUDGET_SECS", "1"),
             ("LAC_ROUTER_HEADER_BUDGET_SECS", "1"),
             ("LAC_ROUTER_BODY_IDLE_SECS", "1"),
-            ("LAC_ROUTER_MAX_BUFFERED_BODY", "131072"),
+            ("LAC_ROUTER_MAX_BUFFERED_BODY", "98304"),
         ],
     );
     let budget_port = budget_router.port;
@@ -1053,11 +1062,14 @@ fn relay_framing_regressions() {
     // it will hold at once. One byte past the aggregate budget is refused as
     // busy, not as too large. The follow-up is nearly as large, so it can
     // only be served if the refused request's share was actually returned.
-    let over_budget = probe_declared_over_budget(budget_port, 131_072);
+    let over_budget = probe_declared_over_budget(budget_port, 98_304);
     let over_budget_text = String::from_utf8_lossy(&over_budget).to_string();
     assert!(
-        over_budget_text.starts_with("HTTP/1.1 503") && over_budget_text.contains("buffering"),
-        "aggregate body budget refused the upload: {over_budget_text}"
+        over_budget_text.starts_with("HTTP/1.1 503")
+            && over_budget_text.contains("buffering")
+            && over_budget_text.contains("\"type\":\"lac_router_body_budget\"")
+            && over_budget_text.contains("Retry-After: 5"),
+        "aggregate body budget refused the upload, retryably: {over_budget_text}"
     );
     // Two full-size requests in a row. Each one alone needs most of the
     // budget (the frame plus the sanitized copy it is forwarded as), so the
@@ -1066,7 +1078,7 @@ fn relay_framing_regressions() {
     // client already has the response, and the budget is released on that
     // return. Without a gap, ordinary cleanup latency looks identical to a
     // leaked reservation.
-    for attempt in 0..2 {
+    for attempt in 0..3 {
         let mut body = format!(
             "{{\"model\":\"qwen3.8-27b\",\"scenario\":\"hold-open\",\"pad\":\"{}",
             "c".repeat(24 * 1024)
