@@ -13,6 +13,10 @@
 //!   stay policy-ordered by default; speed never silently overrides the
 //!   operator's quality choice).
 //! - Circuit breaker: 3 consecutive failures cool a backend down for 30s.
+//!   Resets and budget expiries both count; a client that goes away does not.
+//! - Bounded work: 64 KiB headers, 16 MiB body per request, and a 256 MiB
+//!   aggregate ceiling on bodies buffered at once, so parallel uploads
+//!   cannot pin the heap.
 //! - Per-request usage log (~/.lac/router-usage.jsonl, rotated at 8MB)
 //!   with byte counts and token estimates — the honest token source that
 //!   lets kv-manage stop scraping for session numbers.
@@ -651,6 +655,74 @@ fn sanitize_upstream_request(request: &[u8]) -> Vec<u8> {
 enum BodyError {
     TooLarge,
     Invalid,
+    /// The router is already buffering as many request bodies as it will
+    /// hold. Not the client's fault, and not the per-request size limit.
+    Busy,
+}
+
+/// Aggregate ceiling on request bodies held in memory at once. One
+/// connection is already bounded by MAX_BODY, but MAX_INFLIGHT connections
+/// buffering one each is a much larger number, so the total needs its own
+/// bound: without it, a handful of parallel uploads can pin hundreds of
+/// megabytes of heap for as long as the body budget allows them to.
+const MAX_BUFFERED_BODY: usize = 256 * 1024 * 1024;
+
+/// Env-overridable so tests can drive the cap with a small body.
+fn max_buffered_body() -> usize {
+    env::var("LAC_ROUTER_MAX_BUFFERED_BODY")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|&bytes| (64 * 1024..=(1 << 30)).contains(&bytes))
+        .unwrap_or(MAX_BUFFERED_BODY)
+}
+
+#[derive(Clone)]
+struct BodyBudget {
+    held: Arc<AtomicUsize>,
+    limit: usize,
+}
+
+/// Holds this connection's share of the body budget for as long as its
+/// buffered request is alive, and gives it back on every exit path.
+struct BodyReservation {
+    budget: BodyBudget,
+    held: usize,
+}
+
+impl BodyReservation {
+    /// Claim `bytes`, or refuse. The compare-exchange keeps the cap exact
+    /// under concurrency rather than merely approximate.
+    fn try_reserve(&mut self, bytes: usize) -> bool {
+        let mut current = self.budget.held.load(Ordering::SeqCst);
+        loop {
+            let Some(next) = current.checked_add(bytes) else {
+                return false;
+            };
+            if next > self.budget.limit {
+                return false;
+            }
+            match self.budget.held.compare_exchange_weak(
+                current,
+                next,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => {
+                    self.held = self.held.saturating_add(bytes);
+                    return true;
+                }
+                Err(observed) => current = observed,
+            }
+        }
+    }
+}
+
+impl Drop for BodyReservation {
+    fn drop(&mut self) {
+        if self.held > 0 {
+            self.budget.held.fetch_sub(self.held, Ordering::SeqCst);
+        }
+    }
 }
 
 struct RequestFrame {
@@ -688,6 +760,7 @@ fn read_body_bytes(
 fn read_request_body(
     client: &TcpStream,
     initial: &[u8],
+    body_budget: &mut BodyReservation,
 ) -> Result<RequestFrame, BodyError> {
     let header_len = find_headers_end(initial).ok_or(BodyError::Invalid)?;
     let budgets = RequestBudgets {
@@ -695,6 +768,11 @@ fn read_request_body(
         idle: body_idle_timeout(),
     };
     let mut request = initial.to_vec();
+    // read_headers may have over-read into the body; it is held from here on.
+    let pre_read = request.len().saturating_sub(header_len);
+    if pre_read > 0 && !body_budget.try_reserve(pre_read) {
+        return Err(BodyError::Busy);
+    }
     let mut buffer = [0u8; 16384];
     let body_started = Instant::now();
     if let Some(content_len) =
@@ -710,6 +788,9 @@ fn read_request_body(
             let n = read_body_bytes(client, &mut buffer[..to_read], body_started, budgets)?;
             if n == 0 {
                 return Err(BodyError::Invalid);
+            }
+            if !body_budget.try_reserve(n) {
+                return Err(BodyError::Busy);
             }
             request.extend_from_slice(&buffer[..n]);
         }
@@ -747,6 +828,9 @@ fn read_request_body(
                     let n = read_body_bytes(client, &mut buffer, body_started, budgets)?;
                     if n == 0 {
                         return Err(BodyError::Invalid);
+                    }
+                    if !body_budget.try_reserve(n) {
+                        return Err(BodyError::Busy);
                     }
                     fed = request.len();
                     request.extend_from_slice(&buffer[..n]);
@@ -2126,6 +2210,7 @@ fn handle_connection(
     stats: StatsMap,
     routes: RouteMap,
     inflight: Arc<AtomicUsize>,
+    body_budget: BodyBudget,
     rid: Arc<AtomicUsize>,
     started: Instant,
     expected_token: Arc<String>,
@@ -2255,14 +2340,26 @@ fn handle_connection(
         return;
     }
 
+    // Adopt the shared body budget for as long as this connection's request
+    // is buffered; the guard returns it on every exit path below.
+    let mut body_reservation = BodyReservation {
+        budget: body_budget,
+        held: 0,
+    };
     if expect_continue(&initial[..initial_headers]) {
         let _ = client.write_all(b"HTTP/1.1 100 Continue\r\n\r\n");
     }
-    let frame = match read_request_body(&client, &initial) {
+    let frame = match read_request_body(&client, &initial, &mut body_reservation) {
         Ok(frame) => frame,
         Err(BodyError::TooLarge) => {
             let mut c = client;
             let _ = json_response(&mut c, "413 Payload Too Large", "{\"error\":{\"message\":\"request body exceeds the 16 MiB limit\"}}");
+            return;
+        }
+        Err(BodyError::Busy) => {
+            let mut c = client;
+            let _ = json_response(&mut c, "503 Service Unavailable", "{\"error\":{\"message\":\"router is already buffering request bodies up to its limit; retry shortly\",\"type\":\"lac_router_busy\",\"code\":503}}");
+            eprintln!("[lac-router rid={}] {} {} -> 503 body-budget", rid_n, method, path);
             return;
         }
         Err(BodyError::Invalid) => {
@@ -2569,6 +2666,10 @@ fn main() {
     let stats: StatsMap = Arc::new(Mutex::new(HashMap::new()));
     let routes: RouteMap = Arc::new(Mutex::new(HashMap::new()));
     let inflight = Arc::new(AtomicUsize::new(0));
+    let body_budget = BodyBudget {
+        held: Arc::new(AtomicUsize::new(0)),
+        limit: max_buffered_body(),
+    };
     let rid = Arc::new(AtomicUsize::new(1));
     let started = Instant::now();
 
@@ -2629,9 +2730,10 @@ fn main() {
                 let inflight = Arc::clone(&inflight);
                 let rid = Arc::clone(&rid);
                 let tok = Arc::clone(&expected_token);
+                let body_budget = body_budget.clone();
                 thread::spawn(move || {
                     let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        handle_connection(client, pref, hc, stats, routes, inflight, rid, started, tok);
+                        handle_connection(client, pref, hc, stats, routes, inflight, body_budget, rid, started, tok);
                     }));
                     if let Err(e) = res {
                         eprintln!("[lac-router] recovered safely from thread panic in connection handler: {:?}", e);
@@ -2685,6 +2787,39 @@ mod tests {
         }));
         assert!(text.contains("X-Trace: keep"));
         assert!(text.ends_with("\r\n\r\nauthorization-body"));
+    }
+
+    #[test]
+    fn body_budget_caps_exactly_and_releases_on_drop() {
+        let budget = BodyBudget {
+            held: Arc::new(AtomicUsize::new(0)),
+            limit: 100,
+        };
+        let mut first = BodyReservation {
+            budget: budget.clone(),
+            held: 0,
+        };
+        assert!(first.try_reserve(60));
+        let mut second = BodyReservation {
+            budget: budget.clone(),
+            held: 0,
+        };
+        // The cap is exact, not approximate: 41 does not fit in the 40 left.
+        assert!(!second.try_reserve(41));
+        assert!(second.try_reserve(40));
+        assert_eq!(budget.held.load(Ordering::SeqCst), 100);
+        // A share that ends returns its bytes, so one connection cannot
+        // starve the router for the rest of its life.
+        drop(first);
+        assert_eq!(budget.held.load(Ordering::SeqCst), 40);
+        assert!(second.try_reserve(60));
+        // Absurd sizes must refuse rather than wrap into a false success.
+        let mut third = BodyReservation {
+            budget: budget.clone(),
+            held: 0,
+        };
+        assert!(!third.try_reserve(usize::MAX));
+        assert_eq!(budget.held.load(Ordering::SeqCst), 100);
     }
 
     #[test]

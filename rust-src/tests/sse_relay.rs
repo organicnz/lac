@@ -590,6 +590,34 @@ fn count_faults(path: &str) -> usize {
         .sum()
 }
 
+/// Upload one byte past the router's aggregate body budget. The body is
+/// `budget + 1` bytes, so the reservation is refused on the final read and
+/// the router has consumed everything we sent: the 503 lands on a clean
+/// socket instead of being swallowed by a reset over unread bytes.
+fn probe_paced_over_budget(router_port: u16, budget: usize) -> Vec<u8> {
+    let body_len = budget + 1;
+    let head = format!(
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Length: {body_len}\r\nConnection: close\r\n\r\n"
+    );
+    let mut stream = TcpStream::connect_timeout(
+        &format!("127.0.0.1:{}", router_port).parse().unwrap(),
+        Duration::from_secs(5),
+    )
+    .unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+    stream.write_all(head.as_bytes()).unwrap();
+    let block = vec![b'a'; 16 * 1024];
+    let mut remaining = body_len - 1;
+    while remaining > 0 {
+        let take = block.len().min(remaining);
+        stream.write_all(&block[..take]).unwrap();
+        remaining -= take;
+    }
+    thread::sleep(Duration::from_millis(200));
+    stream.write_all(b"a").unwrap();
+    read_response(&mut stream)
+}
+
 fn wait_router(port: u16) {
     let start = Instant::now();
     while start.elapsed() < Duration::from_secs(15) {
@@ -982,6 +1010,7 @@ fn relay_framing_regressions() {
             ("LAC_ROUTER_STREAM_BUDGET_SECS", "1"),
             ("LAC_ROUTER_HEADER_BUDGET_SECS", "1"),
             ("LAC_ROUTER_BODY_IDLE_SECS", "1"),
+            ("LAC_ROUTER_MAX_BUFFERED_BODY", "65536"),
         ],
     );
     let budget_port = budget_router.port;
@@ -1011,6 +1040,29 @@ fn relay_framing_regressions() {
         String::from_utf8_lossy(&stalled)
     );
     assert!(stalled_total < 4.0, "body idle timeout bounded the wait: {stalled_total}s");
+
+    // The per-request ceiling is 16 MiB, but the router also caps the total
+    // it will hold at once. One byte past the aggregate budget is refused as
+    // busy, not as too large — and the share is handed back afterwards, so
+    // the next request is served normally.
+    let over_budget = probe_paced_over_budget(budget_port, 65_536);
+    let over_budget_text = String::from_utf8_lossy(&over_budget).to_string();
+    assert!(
+        over_budget_text.starts_with("HTTP/1.1 503") && over_budget_text.contains("buffering"),
+        "aggregate body budget refused the upload: {over_budget_text}"
+    );
+    let released_body = r#"{"model":"qwen3.8-27b","scenario":"hold-open"}"#;
+    let released_request = format!(
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        released_body.len(),
+        released_body
+    );
+    let after_release = probe_timed(budget_port, released_request.as_bytes()).0;
+    assert!(
+        String::from_utf8_lossy(&after_release).contains("hold-open ok"),
+        "the body budget is released when a request ends: {:?}",
+        String::from_utf8_lossy(&after_release)
+    );
 
     // Three streams the backend never finishes. Each is cut by the budget,
     // and silence for the whole budget IS the backend's fault: three of
