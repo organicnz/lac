@@ -15,8 +15,8 @@
 //! - Circuit breaker: 3 consecutive failures cool a backend down for 30s.
 //!   Resets and budget expiries both count; a client that goes away does not.
 //! - Bounded work: 64 KiB headers, 16 MiB body per request, and a 256 MiB
-//!   aggregate ceiling on bodies buffered at once, so parallel uploads
-//!   cannot pin the heap.
+//!   ceiling on body memory held at once (allocated capacity, not bytes
+//!   consumed), so parallel uploads cannot pin the heap.
 //! - Per-request usage log (~/.lac/router-usage.jsonl, rotated at 8MB)
 //!   with byte counts and token estimates — the honest token source that
 //!   lets kv-manage stop scraping for session numbers.
@@ -660,14 +660,25 @@ enum BodyError {
     Busy,
 }
 
-/// Aggregate ceiling on request bodies held in memory at once. One
+/// Aggregate ceiling on the request bodies held in memory at once. One
 /// connection is already bounded by MAX_BODY, but MAX_INFLIGHT connections
 /// buffering one each is a much larger number, so the total needs its own
-/// bound: without it, a handful of parallel uploads can pin hundreds of
-/// megabytes of heap for as long as the body budget allows them to.
+/// bound: without it, a handful of parallel uploads can pin a gigabyte of
+/// heap for as long as the body budget lets them dribble.
+///
+/// Charged against allocated capacity, not bytes consumed, so this number
+/// is the memory actually held. Per-connection fixed costs (the header
+/// buffer and one 16 KiB read buffer, well under 256 KiB) sit outside the
+/// budget, which is why the true worst case is this plus MAX_INFLIGHT of
+/// those.
 const MAX_BUFFERED_BODY: usize = 256 * 1024 * 1024;
 
-/// Env-overridable so tests can drive the cap with a small body.
+/// Retryable "the router is full", distinct from the 503 raised when there
+/// is no backend: both are retryable, but only one means try another port.
+const BODY_BUDGET_BUSY: &str = "{\"error\":{\"message\":\"router is already buffering request bodies up to its limit; retry shortly\",\"type\":\"lac_router_busy\",\"code\":503}}";
+
+/// Env-overridable so tests can drive the cap with a small body. An
+/// out-of-range value is ignored (the startup banner shows what applied).
 fn max_buffered_body() -> usize {
     env::var("LAC_ROUTER_MAX_BUFFERED_BODY")
         .ok()
@@ -715,11 +726,37 @@ impl BodyReservation {
             }
         }
     }
+
+    /// Whether `bytes` could fit right now. A peek, not a claim: use it to
+    /// fail fast on a declared length, and let try_reserve do the accounting.
+    fn fits(&self, bytes: usize) -> bool {
+        self.budget
+            .held
+            .load(Ordering::SeqCst)
+            .checked_add(bytes)
+            .is_some_and(|next| next <= self.budget.limit)
+    }
+
+    /// Hand bytes back when the allocation they were charged for is gone.
+    fn release(&mut self, bytes: usize) {
+        let give = bytes.min(self.held);
+        self.held -= give;
+        self.budget.held.fetch_sub(give, Ordering::SeqCst);
+    }
 }
 
 impl Drop for BodyReservation {
     fn drop(&mut self) {
         if self.held > 0 {
+            // A wrap here would silently pin the counter near usize::MAX and
+            // 503 every later request for the life of the process, so make a
+            // broken invariant a loud test failure instead.
+            debug_assert!(
+                self.held <= self.budget.held.load(Ordering::SeqCst),
+                "body budget underflow: releasing {} of {}",
+                self.held,
+                self.budget.held.load(Ordering::SeqCst)
+            );
             self.budget.held.fetch_sub(self.held, Ordering::SeqCst);
         }
     }
@@ -768,9 +805,24 @@ fn read_request_body(
         idle: body_idle_timeout(),
     };
     let mut request = initial.to_vec();
-    // read_headers may have over-read into the body; it is held from here on.
-    let pre_read = request.len().saturating_sub(header_len);
-    if pre_read > 0 && !body_budget.try_reserve(pre_read) {
+    // A declared Content-Length is known before a single body byte is read,
+    // so an upload that cannot fit is refused up front rather than after
+    // pulling the whole thing into memory first. This only peeks: the real
+    // charge happens as the buffer's capacity grows below, so the body is
+    // not counted twice.
+    if let Some(declared) =
+        parse_content_length_strict(&initial[..header_len]).map_err(|_| BodyError::Invalid)?
+    {
+        if !body_budget.fits(declared) {
+            return Err(BodyError::Busy);
+        }
+    }
+    // Charge allocated capacity, not consumed bytes: Vec grows by doubling,
+    // so N bytes of body can cost up to 2N, and a size chosen just past a
+    // doubling boundary gets that slack for free. What is over-read into
+    // the header buffer is part of this allocation too.
+    let mut charged = request.capacity();
+    if charged > 0 && !body_budget.try_reserve(charged) {
         return Err(BodyError::Busy);
     }
     let mut buffer = [0u8; 16384];
@@ -789,10 +841,14 @@ fn read_request_body(
             if n == 0 {
                 return Err(BodyError::Invalid);
             }
-            if !body_budget.try_reserve(n) {
-                return Err(BodyError::Busy);
-            }
             request.extend_from_slice(&buffer[..n]);
+            let capacity = request.capacity();
+            if capacity > charged {
+                if !body_budget.try_reserve(capacity - charged) {
+                    return Err(BodyError::Busy);
+                }
+                charged = capacity;
+            }
         }
         let mut has_following = request.len() > target;
         if !has_following {
@@ -819,21 +875,30 @@ fn read_request_body(
                     if !has_following {
                         has_following = has_queued_bytes(client);
                     }
-                    return Ok(RequestFrame {
-                        wire: request[..end].to_vec(),
-                        has_following,
-                    });
+                    let wire = request[..end].to_vec();
+                    // The doubling-grown buffer dies here and only the
+                    // exact-size copy survives, so hand its charge back and
+                    // take the copy's.
+                    body_budget.release(charged);
+                    if !body_budget.try_reserve(wire.capacity()) {
+                        return Err(BodyError::Busy);
+                    }
+                    return Ok(RequestFrame { wire, has_following });
                 }
                 ChunkProgress::NeedMore => {
                     let n = read_body_bytes(client, &mut buffer, body_started, budgets)?;
                     if n == 0 {
                         return Err(BodyError::Invalid);
                     }
-                    if !body_budget.try_reserve(n) {
-                        return Err(BodyError::Busy);
-                    }
                     fed = request.len();
                     request.extend_from_slice(&buffer[..n]);
+                    let capacity = request.capacity();
+                    if capacity > charged {
+                        if !body_budget.try_reserve(capacity - charged) {
+                            return Err(BodyError::Busy);
+                        }
+                        charged = capacity;
+                    }
                     if request.len() > max_request {
                         return Err(BodyError::TooLarge);
                     }
@@ -2358,7 +2423,7 @@ fn handle_connection(
         }
         Err(BodyError::Busy) => {
             let mut c = client;
-            let _ = json_response(&mut c, "503 Service Unavailable", "{\"error\":{\"message\":\"router is already buffering request bodies up to its limit; retry shortly\",\"type\":\"lac_router_busy\",\"code\":503}}");
+            let _ = json_response(&mut c, "503 Service Unavailable", BODY_BUDGET_BUSY);
             eprintln!("[lac-router rid={}] {} {} -> 503 body-budget", rid_n, method, path);
             return;
         }
@@ -2398,7 +2463,17 @@ fn handle_connection(
         None
     };
 
-    let initial = sanitize_upstream_request(&frame.wire);
+    // This copy is held alongside the original for the whole relay (the
+    // shadowed binding drops last), so it costs a second body's worth of
+    // memory and has to be charged as such.
+    let sanitized = sanitize_upstream_request(&frame.wire);
+    if !body_reservation.try_reserve(sanitized.capacity()) {
+        let mut c = client;
+        let _ = json_response(&mut c, "503 Service Unavailable", BODY_BUDGET_BUSY);
+        eprintln!("[lac-router rid={}] {} {} -> 503 body-budget (relay)", rid_n, method, path);
+        return;
+    }
+    let initial = sanitized;
 
     let candidates = pick_backends(pref, &hc, &stats, model_hint);
     if candidates.is_empty() {
@@ -2692,6 +2767,13 @@ fn main() {
         port_llama(),
         port_ollama()
     );
+    // Print the effective limit: it is env-tunable and silently clamped, and
+    // an operator sizing RAM against it needs to see what actually applies.
+    eprintln!(
+        "  Request bodies: {} KiB per request, {} MiB buffered in total",
+        MAX_BODY / 1024,
+        body_budget.limit / (1024 * 1024)
+    );
     eprintln!(
         "  Preferred backend: {} (LAC_BACKEND env > ~/.lac/router-backend)",
         backend_name(preferred.load(Ordering::SeqCst))
@@ -2820,6 +2902,77 @@ mod tests {
         };
         assert!(!third.try_reserve(usize::MAX));
         assert_eq!(budget.held.load(Ordering::SeqCst), 100);
+    }
+
+    #[test]
+    fn body_budget_holds_its_invariants_under_contention() {
+        // Drives the concurrent path and checks the two invariants that
+        // matter: the counter never passes the cap, and every claim comes
+        // back. Note this does NOT by itself distinguish the compare-exchange
+        // from a naive check-then-add — the window for that race is too
+        // narrow to sample reliably, and a widened one still passed. The CAS
+        // is justified by construction; this test guards against gross
+        // breakage of the accounting, such as a lost or duplicated claim.
+        const LIMIT: usize = 1_000_000;
+        const CLAIMS: usize = 4000;
+        let budget = BodyBudget {
+            held: Arc::new(AtomicUsize::new(0)),
+            limit: LIMIT,
+        };
+        let peak = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicUsize::new(0));
+        let watcher = {
+            let (held, peak, stop) = (
+                Arc::clone(&budget.held),
+                Arc::clone(&peak),
+                Arc::clone(&stop),
+            );
+            thread::spawn(move || {
+                while stop.load(Ordering::SeqCst) == 0 {
+                    let now = held.load(Ordering::SeqCst);
+                    peak.fetch_max(now, Ordering::SeqCst);
+                    thread::yield_now();
+                }
+                peak.fetch_max(held.load(Ordering::SeqCst), Ordering::SeqCst);
+            })
+        };
+        let mut workers = Vec::new();
+        for _ in 0..8 {
+            let (budget, peak) = (budget.clone(), Arc::clone(&peak));
+            workers.push(thread::spawn(move || {
+                for _ in 0..CLAIMS {
+                    let mut reservation = BodyReservation {
+                        budget: budget.clone(),
+                        held: 0,
+                    };
+                    // Half the claims are 64 KiB (fits), half are 1 MiB
+                    // (never fits): the cap must hold either way.
+                    if reservation.try_reserve(64 * 1024) {
+                        // Sample the global counter right here, at the only
+                        // moment an over-count can exist. A watcher thread
+                        // can miss a brief overshoot; the thread that just
+                        // committed its add cannot miss its own effect.
+                        peak.fetch_max(budget.held.load(Ordering::SeqCst), Ordering::SeqCst);
+                        assert!(!reservation.try_reserve(1024 * 1024));
+                    }
+                }
+            }));
+        }
+        for worker in workers {
+            worker.join().expect("worker finished");
+        }
+        stop.store(1, Ordering::SeqCst);
+        watcher.join().expect("watcher finished");
+        assert!(
+            peak.load(Ordering::SeqCst) <= LIMIT,
+            "cap exceeded: peak {} > {LIMIT}",
+            peak.load(Ordering::SeqCst)
+        );
+        assert_eq!(
+            budget.held.load(Ordering::SeqCst),
+            0,
+            "every reservation was returned"
+        );
     }
 
     #[test]
