@@ -56,6 +56,29 @@ fn request_status(port: u16, authorization: Option<&str>, forwarded: bool) -> Op
         .ok()
 }
 
+/// Send a request whose auth-relevant headers are supplied verbatim, so the
+/// odd shapes (wrong scheme, trailing junk, duplicates, other header names)
+/// can be exercised end to end rather than only in unit tests.
+fn request_with_headers(port: u16, extra: &str) -> Option<u16> {
+    let addr = format!("127.0.0.1:{}", port).parse().ok()?;
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(500)).ok()?;
+    stream.set_read_timeout(Some(Duration::from_millis(800))).ok()?;
+    let request = format!(
+        "GET /lac/status HTTP/1.1\r\nHost: x\r\n{}Connection: close\r\n\r\n",
+        extra
+    );
+    stream.write_all(request.as_bytes()).ok()?;
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).ok()?;
+    String::from_utf8_lossy(&response)
+        .lines()
+        .next()?
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()
+}
+
 #[test]
 fn remote_auth_fail_closed_and_loopback_open() {
     let _port_lock = support::PortLock::acquire();
@@ -123,6 +146,47 @@ fn remote_auth_fail_closed_and_loopback_open() {
     assert_eq!(request_status(token_port, Some("test-secret"), false), Some(200));
     assert_eq!(request_status(token_port, Some("test-secret"), true), Some(200));
     assert_eq!(request_status(token_port, None, true), Some(401));
+
+    // Odd header shapes, end to end. A valid token presented the wrong way
+    // must not open the gate, and must not be accepted as a prefix.
+    assert_eq!(
+        request_with_headers(token_port, "Authorization: Basic test-secret\r\n"),
+        Some(401),
+        "only Bearer may carry the token"
+    );
+    assert_eq!(
+        request_with_headers(token_port, "Authorization: Bearer test-secret extra\r\n"),
+        Some(401),
+        "the token is taken whole, not as a prefix"
+    );
+    assert_eq!(
+        request_with_headers(token_port, "Authorization: Bearer \r\n"),
+        Some(401),
+        "an empty bearer is not a token"
+    );
+    assert_eq!(
+        request_with_headers(token_port, "Proxy-Authorization: Bearer test-secret\r\n"),
+        Some(401),
+        "Proxy-Authorization must not authenticate"
+    );
+    assert_eq!(
+        request_with_headers(
+            token_port,
+            "Authorization: Bearer wrong\r\nAuthorization: Bearer test-secret\r\n"
+        ),
+        Some(401),
+        "a wrong first credential must not fall through to a later right one"
+    );
+    assert_eq!(
+        request_with_headers(token_port, "authorization: Bearer test-secret\r\n"),
+        Some(200),
+        "the field name is case-insensitive"
+    );
+    assert_eq!(
+        request_with_headers(token_port, "AUTHORIZATION: BEARER test-secret\r\n"),
+        Some(200),
+        "so is the scheme"
+    );
     let remote_router = support::spawn_router(
         router_bin,
         &[

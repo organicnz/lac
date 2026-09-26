@@ -2994,6 +2994,24 @@ mod tests {
         assert_eq!(bearer_from(noauth), None);
         let bad = b"GET /x HTTP/1.1\r\nAuthorization: Basic abc\r\n\r\n";
         assert_eq!(bearer_from(bad), None);
+        // Only the Authorization header counts, and only its first
+        // occurrence: a Proxy-Authorization must not stand in for it.
+        let proxy_only = b"GET /x HTTP/1.1\r\nProxy-Authorization: Bearer sekrit\r\n\r\n";
+        assert_eq!(bearer_from(proxy_only), None);
+        // A token is taken whole, never as a prefix.
+        let trailing = b"GET /x HTTP/1.1\r\nAuthorization: Bearer sekrit extra\r\n\r\n";
+        assert_eq!(bearer_from(trailing).as_deref(), Some("sekrit extra"));
+        let empty = b"GET /x HTTP/1.1\r\nAuthorization: Bearer \r\n\r\n";
+        assert_eq!(bearer_from(empty), None);
+        let no_token = b"GET /x HTTP/1.1\r\nAuthorization: Bearer\r\n\r\n";
+        assert_eq!(bearer_from(no_token), None);
+        // Lowercase field name is still the field.
+        let lower = b"GET /v1/models HTTP/1.1\r\nauthorization: Bearer sekrit\r\n\r\n";
+        assert_eq!(bearer_from(lower).as_deref(), Some("sekrit"));
+        // Duplicate headers: the first decides, and a wrong one does not
+        // fall through to a later correct one.
+        let dup_wrong_first = b"GET /x HTTP/1.1\r\nAuthorization: Bearer wrong\r\nAuthorization: Bearer sekrit\r\n\r\n";
+        assert_eq!(bearer_from(dup_wrong_first).as_deref(), Some("wrong"));
         let forwarded = b"GET /v1/models HTTP/1.1\r\nX-Forwarded-For: 100.64.0.5\r\n\r\n";
         assert!(forwarded_request(forwarded));
         let peer_lo: SocketAddr = "127.0.0.1:8000".parse().unwrap();
