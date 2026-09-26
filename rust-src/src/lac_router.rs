@@ -82,10 +82,35 @@ fn backend_id_for_port(port: u16) -> usize {
 const MAX_HEADERS: usize = 65536;
 const MAX_BODY: usize = 16 * 1024 * 1024;
 const MAX_INFLIGHT: usize = 128;
-const STREAM_BUDGET: Duration = Duration::from_secs(600);
-const HEADER_READ_BUDGET: Duration = Duration::from_secs(10);
-const BODY_READ_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_INTERIM_RESPONSES: usize = 8;
+
+/// Wall-clock budgets are env-overridable so tests can shrink them
+/// (`LAC_ROUTER_STREAM_BUDGET_SECS=1`); out-of-range values fall back to
+/// the production default rather than disabling a budget.
+fn budget_secs(name: &str, default_secs: u64) -> Duration {
+    Duration::from_secs(
+        env::var(name)
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .filter(|&secs| (1..=86_400).contains(&secs))
+            .unwrap_or(default_secs),
+    )
+}
+
+/// Total wall clock one forward may occupy, across headers and body.
+fn stream_budget() -> Duration {
+    budget_secs("LAC_ROUTER_STREAM_BUDGET_SECS", 600)
+}
+
+/// How long a client may take to finish sending request headers.
+fn header_budget() -> Duration {
+    budget_secs("LAC_ROUTER_HEADER_BUDGET_SECS", 10)
+}
+
+/// Idle gap tolerated between request-body reads (slow-upload backstop).
+fn body_idle_timeout() -> Duration {
+    budget_secs("LAC_ROUTER_BODY_IDLE_SECS", 30)
+}
 
 fn backend_name(id: usize) -> &'static str {
     match id {
@@ -314,7 +339,7 @@ fn read_headers(client: &TcpStream) -> io::Result<Vec<u8>> {
     // Owned handle: bytes consumed here are the client's already-sent
     // headers; the caller forwards them explicitly and streams the rest.
     let mut stream = client.try_clone()?;
-    let deadline = Instant::now() + HEADER_READ_BUDGET;
+    let deadline = Instant::now() + header_budget();
     let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
     let mut buf: Vec<u8> = Vec::with_capacity(8192);
     let mut chunk = [0u8; 8192];
@@ -362,6 +387,11 @@ fn read_headers(client: &TcpStream) -> io::Result<Vec<u8>> {
     Ok(buf)
 }
 
+/// Best-effort pipelining check: drain whatever the client has *already*
+/// queued behind the request we just framed. A second request that arrives
+/// after this drain is not detected — the forwarded bytes are still cut at
+/// the first request's framing, so the trailing request is never relayed
+/// upstream (no smuggling), it is simply dropped when the connection ends.
 fn has_queued_bytes(mut client: &TcpStream) -> bool {
     if client.set_nonblocking(true).is_err() {
         return false;
@@ -556,11 +586,17 @@ fn plain_chunked_transfer_encoding(headers: &[u8]) -> Result<Option<bool>, ()> {
     ))
 }
 
+/// Strip hop-by-hop credentials and normalize framing before forwarding:
+/// gateway `Authorization` never reaches an inference backend, the
+/// `100-continue` expectation is dropped because we already answered it
+/// ourselves, and `Content-Length` is rewritten once in canonical decimal
+/// so a duplicate pair can never reach a strict backend as-is.
 fn sanitize_upstream_request(request: &[u8]) -> Vec<u8> {
     let Some(header_len) = find_headers_end(request) else {
         return request.to_vec();
     };
     let mut sanitized = Vec::with_capacity(request.len());
+    let mut content_length_seen = false;
     for line in request[..header_len].split_inclusive(|byte| *byte == b'\n') {
         let trimmed = line.strip_suffix(b"\n").unwrap_or(line);
         let trimmed = trimmed.strip_suffix(b"\r").unwrap_or(trimmed);
@@ -568,19 +604,38 @@ fn sanitize_upstream_request(request: &[u8]) -> Vec<u8> {
             sanitized.extend_from_slice(b"\r\n");
             continue;
         }
-        let sensitive = trimmed
-            .iter()
-            .position(|byte| *byte == b':')
-            .map(|colon| {
-                let name = String::from_utf8_lossy(&trimmed[..colon]);
-                let name = name.trim();
-                name.eq_ignore_ascii_case("authorization")
-                    || name.eq_ignore_ascii_case("proxy-authorization")
-            })
-            .unwrap_or(false);
-        if !sensitive {
-            sanitized.extend_from_slice(line);
+        if let Some(colon) = trimmed.iter().position(|byte| *byte == b':') {
+            let name = String::from_utf8_lossy(&trimmed[..colon]);
+            let name = name.trim();
+            if name.eq_ignore_ascii_case("authorization")
+                || name.eq_ignore_ascii_case("proxy-authorization")
+            {
+                continue;
+            }
+            let value = String::from_utf8_lossy(&trimmed[colon + 1..]);
+            if name.eq_ignore_ascii_case("expect")
+                && value
+                    .trim_matches(|character| matches!(character, ' ' | '\t'))
+                    .eq_ignore_ascii_case("100-continue")
+            {
+                continue;
+            }
+            if name.eq_ignore_ascii_case("content-length") {
+                if let Ok(parsed) = value
+                    .trim_matches(|character| matches!(character, ' ' | '\t'))
+                    .parse::<usize>()
+                {
+                    if content_length_seen {
+                        continue;
+                    }
+                    content_length_seen = true;
+                    let canonical = format!("Content-Length: {parsed}\r\n");
+                    sanitized.extend_from_slice(canonical.as_bytes());
+                    continue;
+                }
+            }
         }
+        sanitized.extend_from_slice(line);
     }
     sanitized.extend_from_slice(&request[header_len..]);
     sanitized
@@ -596,14 +651,24 @@ struct RequestFrame {
     has_following: bool,
 }
 
+/// Body-read budgets, resolved once per request so a 16 MiB upload does
+/// not re-read the environment on every 16 KiB read.
+#[derive(Clone, Copy)]
+struct RequestBudgets {
+    stream: Duration,
+    idle: Duration,
+}
+
 fn read_body_bytes(
     mut client: &TcpStream,
     buffer: &mut [u8],
     started: Instant,
+    budgets: RequestBudgets,
 ) -> Result<usize, BodyError> {
-    let remaining = STREAM_BUDGET
+    let remaining = budgets
+        .stream
         .saturating_sub(started.elapsed())
-        .min(BODY_READ_IDLE_TIMEOUT);
+        .min(budgets.idle);
     if remaining.is_zero() {
         return Err(BodyError::Invalid);
     }
@@ -618,6 +683,10 @@ fn read_request_body(
     initial: &[u8],
 ) -> Result<RequestFrame, BodyError> {
     let header_len = find_headers_end(initial).ok_or(BodyError::Invalid)?;
+    let budgets = RequestBudgets {
+        stream: stream_budget(),
+        idle: body_idle_timeout(),
+    };
     let mut request = initial.to_vec();
     let mut buffer = [0u8; 16384];
     let body_started = Instant::now();
@@ -631,7 +700,7 @@ fn read_request_body(
         while request.len() < target {
             let remaining = target - request.len();
             let to_read = buffer.len().min(remaining);
-            let n = read_body_bytes(client, &mut buffer[..to_read], body_started)?;
+            let n = read_body_bytes(client, &mut buffer[..to_read], body_started, budgets)?;
             if n == 0 {
                 return Err(BodyError::Invalid);
             }
@@ -668,7 +737,7 @@ fn read_request_body(
                     });
                 }
                 ChunkProgress::NeedMore => {
-                    let n = read_body_bytes(client, &mut buffer, body_started)?;
+                    let n = read_body_bytes(client, &mut buffer, body_started, budgets)?;
                     if n == 0 {
                         return Err(BodyError::Invalid);
                     }
@@ -1110,6 +1179,11 @@ enum ForwardError {
     HttpStatus(u16),
     /// Stream broke mid-proxy: the response is already partial, do not retry.
     Stream { down: u64, ttfb: Option<f64> },
+    /// An EOF-delimited response (no Content-Length, no chunking) stopped
+    /// early — a reset or an expired stream budget. Nothing was truncated
+    /// *within* a frame the backend promised, so this is not a backend
+    /// fault: do not trip the breaker, and do not fail over.
+    StreamCut { down: u64, ttfb: Option<f64> },
     BadResponse { down: u64, ttfb: Option<f64> },
     ClientGone { down: u64, ttfb: Option<f64> },
     /// Backend requested a protocol upgrade that this HTTP relay does not support.
@@ -1768,6 +1842,7 @@ fn try_forward(
     head_request: bool,
 ) -> Result<(u64, u64, Option<f64>), ForwardError> {
     let t_start = Instant::now();
+    let budget = stream_budget();
     let target_addr: SocketAddr = format!("127.0.0.1:{}", target_port)
         .parse()
         .map_err(|_| ForwardError::Connect)?;
@@ -1784,7 +1859,7 @@ fn try_forward(
 
     let _ = client.set_nodelay(true);
     let _ = server.set_nodelay(true);
-    let _ = client.set_read_timeout(Some(STREAM_BUDGET));
+    let _ = client.set_read_timeout(Some(budget));
     let ka = keepalive_secs();
     let _ = server.set_read_timeout(Some(Duration::from_secs(ka)));
     let _ = client.set_write_timeout(Some(Duration::from_secs(60)));
@@ -1926,7 +2001,7 @@ fn try_forward(
             Err(e)
                 if (e.kind() == io::ErrorKind::TimedOut
                     || e.kind() == io::ErrorKind::WouldBlock)
-                    && t_start.elapsed() < STREAM_BUDGET =>
+                    && t_start.elapsed() < budget =>
             {
                 if headers_done && resp_sse {
                     if resp_chunked {
@@ -1963,7 +2038,7 @@ fn try_forward(
         return Err(ForwardError::BadResponse { down: down_total, ttfb });
     }
     if stream_error && resp_cl.is_none() && !resp_chunked {
-        return Err(ForwardError::Stream { down: down_total, ttfb });
+        return Err(ForwardError::StreamCut { down: down_total, ttfb });
     }
     if let Some(len) = resp_cl {
         if resp_body < len {
@@ -1986,6 +2061,20 @@ impl Drop for InflightGuard {
     fn drop(&mut self) {
         self.count.fetch_sub(1, Ordering::SeqCst);
     }
+}
+
+/// Uniform 503 for "nothing is serving". Used twice: once before the body
+/// is read (fail fast) and once after (a model hint may have reordered
+/// the candidates and emptied the list). Same body, same status, either way.
+fn no_backend_503(client: &mut TcpStream, rid_n: usize, method: &str, path: &str) {
+    let err_body = format!(
+        "{{\"error\":{{\"message\":\"No LAC inference backend is serving (MLX :{}, llama :{}, Ollama :{} all down or breaker-tripped). Start one with `lac serve mlx`.\",\"type\":\"lac_router_error\",\"code\":503}}}}",
+        port_mlx(),
+        port_llama(),
+        port_ollama()
+    );
+    let _ = json_response(client, "503 Service Unavailable", &err_body);
+    eprintln!("[lac-router rid={}] {} {} -> 503 no-backend", rid_n, method, path);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2024,6 +2113,10 @@ fn handle_connection(
         return;
     }
     if method == "OPTIONS" {
+        // Answered before the auth gate on purpose: a CORS preflight never
+        // carries credentials, so demanding one would just break browsers.
+        // The reply is a static 204 with a wildcard CORS header and no
+        // backend contact, so it leaks nothing about this deployment.
         let _ = handle_options(client);
         return;
     }
@@ -2117,15 +2210,7 @@ fn handle_connection(
 
     let pref = preferred.load(Ordering::SeqCst);
     if pick_backends(pref, &hc, &stats, None).is_empty() {
-        let err_body = format!(
-            "{{\"error\":{{\"message\":\"No LAC inference backend is serving (MLX :{}, llama :{}, Ollama :{} all down or breaker-tripped). Start one with `lac serve mlx`.\",\"type\":\"lac_router_error\",\"code\":503}}}}",
-            port_mlx(),
-            port_llama(),
-            port_ollama()
-        );
-        let mut c = client;
-        let _ = json_response(&mut c, "503 Service Unavailable", &err_body);
-        eprintln!("[lac-router rid={}] {} {} -> 503 no-backend", rid_n, method, path);
+        no_backend_503(&mut client, rid_n, &method, &path);
         return;
     }
 
@@ -2179,15 +2264,7 @@ fn handle_connection(
 
     let candidates = pick_backends(pref, &hc, &stats, model_hint);
     if candidates.is_empty() {
-        let err_body = format!(
-            "{{\"error\":{{\"message\":\"No LAC inference backend is serving (MLX :{}, llama :{}, Ollama :{} all down or breaker-tripped). Start one with `lac serve mlx`.\",\"type\":\"lac_router_error\",\"code\":503}}}}",
-            port_mlx(),
-            port_llama(),
-            port_ollama()
-        );
-        let mut c = client;
-        let _ = json_response(&mut c, "503 Service Unavailable", &err_body);
-        eprintln!("[lac-router rid={}] {} {} -> 503 no-backend", rid_n, method, path);
+        no_backend_503(&mut client, rid_n, &method, &path);
         return;
     }
 
@@ -2311,6 +2388,35 @@ fn handle_connection(
                     est,
                     ttfb,
                     "client-gone",
+                );
+                return;
+            }
+            Err(ForwardError::StreamCut { down, ttfb }) => {
+                // No note_error: a reset or an expired budget on an
+                // EOF-delimited response is not the backend misbehaving,
+                // and three such cuts must never open the breaker.
+                let up_body = initial.len().saturating_sub(header_len) as u64;
+                let est = (up_body + down) / 4;
+                log_usage(
+                    rid_n,
+                    backend_name(bid),
+                    port,
+                    &model,
+                    up_body,
+                    down,
+                    est,
+                    ttfb,
+                    "stream-cut",
+                );
+                eprintln!(
+                    "[lac-router rid={}] {} {} -> :{} stream-cut (up={} down={} {:.1}s)",
+                    rid_n,
+                    method,
+                    path,
+                    port,
+                    up_body,
+                    down,
+                    t0.elapsed().as_secs_f64()
                 );
                 return;
             }
@@ -2535,6 +2641,29 @@ mod tests {
         }));
         assert!(text.contains("X-Trace: keep"));
         assert!(text.ends_with("\r\n\r\nauthorization-body"));
+    }
+
+    #[test]
+    fn sanitize_canonicalizes_content_length() {
+        let duplicated = b"POST /v1/chat HTTP/1.1\r\nContent-Length: 4\r\nContent-Length: 4\r\n\r\nbody";
+        let text = String::from_utf8(sanitize_upstream_request(duplicated)).expect("utf-8");
+        assert_eq!(text.matches("Content-Length:").count(), 1, "{text}");
+        assert!(text.contains("Content-Length: 4\r\n"), "{text}");
+
+        let padded = b"POST /v1/chat HTTP/1.1\r\nContent-Length: 0004\r\n\r\nbody";
+        let text = String::from_utf8(sanitize_upstream_request(padded)).expect("utf-8");
+        assert!(text.contains("Content-Length: 4\r\n"), "{text}");
+        assert!(!text.contains("0004"), "{text}");
+
+        let expect = b"POST /v1/chat HTTP/1.1\r\nExpect: 100-continue\r\nContent-Length: 4\r\n\r\nbody";
+        let text = String::from_utf8(sanitize_upstream_request(expect)).expect("utf-8");
+        assert!(!text.contains("Expect"), "{text}");
+        assert!(text.ends_with("\r\n\r\nbody"), "{text}");
+
+        // Anything else named Expect is the client's own contract: keep it.
+        let other = b"POST /v1/chat HTTP/1.1\r\nExpect: something-else\r\nContent-Length: 4\r\n\r\nbody";
+        let text = String::from_utf8(sanitize_upstream_request(other)).expect("utf-8");
+        assert!(text.contains("Expect: something-else"), "{text}");
     }
 
     #[test]

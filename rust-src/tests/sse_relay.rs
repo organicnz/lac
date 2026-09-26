@@ -177,6 +177,8 @@ fn spawn_backend() -> u16 {
                     "sse-split"
                 } else if text.contains("hold-open") {
                     "hold-open"
+                } else if text.contains("eof-json") {
+                    "eof-json"
                 } else if text.contains("sse-slow") {
                     "sse-slow"
                 } else {
@@ -326,6 +328,14 @@ fn spawn_backend() -> u16 {
                         ).as_bytes());
                         thread::sleep(Duration::from_secs(4));
                     }
+                    "eof-json" => {
+                        // EOF-delimited (HTTP/1.0, no Content-Length, not
+                        // chunked) and closed immediately: a clean cut at a
+                        // message boundary, not a truncated frame.
+                        let _ = s.write_all(
+                            b"HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n\r\n{\"eof\":\"ok\"}",
+                        );
+                    }
                     "sse-slow" => {
                         let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n");
                         thread::sleep(Duration::from_secs(3));
@@ -376,6 +386,17 @@ fn probe(router_port: u16, scenario: &str) -> (Vec<u8>, Vec<(f64, usize)>, f64) 
     (raw, times, total)
 }
 
+/// Read the answer to EOF, tolerating a reset. When the router rejects a
+/// request it can close while our bytes are still queued, and the kernel
+/// answers that with an RST instead of a FIN — whatever the router already
+/// sent is still the answer, so the caller's status assertion stays the
+/// real check and a lost response fails there, not here.
+fn read_response(stream: &mut TcpStream) -> Vec<u8> {
+    let mut response = Vec::new();
+    let _ = stream.read_to_end(&mut response);
+    response
+}
+
 fn probe_raw(router_port: u16, request: &[u8]) -> Vec<u8> {
     let mut stream = TcpStream::connect_timeout(
         &format!("127.0.0.1:{}", router_port).parse().unwrap(),
@@ -384,9 +405,7 @@ fn probe_raw(router_port: u16, request: &[u8]) -> Vec<u8> {
     .unwrap();
     stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
     stream.write_all(request).unwrap();
-    let mut response = Vec::new();
-    stream.read_to_end(&mut response).unwrap();
-    response
+    read_response(&mut stream)
 }
 
 fn probe_raw_parts(router_port: u16, first: &[u8], second: &[u8]) -> Vec<u8> {
@@ -399,9 +418,7 @@ fn probe_raw_parts(router_port: u16, first: &[u8], second: &[u8]) -> Vec<u8> {
     stream.write_all(first).unwrap();
     thread::sleep(Duration::from_millis(50));
     stream.write_all(second).unwrap();
-    let mut response = Vec::new();
-    stream.read_to_end(&mut response).unwrap();
-    response
+    read_response(&mut stream)
 }
 
 fn probe_header_only(router_port: u16, request: &[u8]) -> Vec<u8> {
@@ -412,9 +429,7 @@ fn probe_header_only(router_port: u16, request: &[u8]) -> Vec<u8> {
     .unwrap();
     stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
     stream.write_all(request).unwrap();
-    let mut response = Vec::new();
-    stream.read_to_end(&mut response).unwrap();
-    response
+    read_response(&mut stream)
 }
 
 fn probe_client_gone(router_port: u16, request: &[u8]) {
@@ -426,6 +441,84 @@ fn probe_client_gone(router_port: u16, request: &[u8]) {
     stream.write_all(request).unwrap();
     let _ = stream.shutdown(std::net::Shutdown::Both);
     drop(stream);
+}
+
+fn probe_timed(router_port: u16, request: &[u8]) -> (Vec<u8>, f64) {
+    let mut stream = TcpStream::connect_timeout(
+        &format!("127.0.0.1:{}", router_port).parse().unwrap(),
+        Duration::from_secs(5),
+    )
+    .unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(15))).unwrap();
+    let t0 = Instant::now();
+    stream.write_all(request).unwrap();
+    let response = read_response(&mut stream);
+    (response, t0.elapsed().as_secs_f64())
+}
+
+/// `Expect: 100-continue`: the router must answer the expectation itself,
+/// then relay the body that follows it.
+fn probe_expect_continue(router_port: u16) -> Vec<u8> {
+    let body = r#"{"model":"qwen3.8-27b"}"#;
+    let head = format!(
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nExpect: 100-continue\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    let mut stream = TcpStream::connect_timeout(
+        &format!("127.0.0.1:{}", router_port).parse().unwrap(),
+        Duration::from_secs(5),
+    )
+    .unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    stream.write_all(head.as_bytes()).unwrap();
+    let mut interim = Vec::new();
+    let mut chunk = [0u8; 256];
+    while !interim.windows(4).any(|w| w == b"\r\n\r\n") {
+        let n = stream
+            .read(&mut chunk)
+            .expect("router answers 100-continue before the body");
+        assert!(n > 0, "router closed instead of sending 100 Continue");
+        interim.extend_from_slice(&chunk[..n]);
+    }
+    assert!(
+        String::from_utf8_lossy(&interim).starts_with("HTTP/1.1 100 Continue"),
+        "expected interim response, got: {:?}",
+        String::from_utf8_lossy(&interim)
+    );
+    stream.write_all(body.as_bytes()).unwrap();
+    read_response(&mut stream)
+}
+
+/// Chunked upload one byte past the 16 MiB + 64 KiB request ceiling. The
+/// last byte is sent on its own after a pause so the router has drained
+/// everything else first: it can then answer 413 on a clean socket instead
+/// of a reset that would swallow the response.
+fn probe_paced_oversized_chunked(router_port: u16) -> Vec<u8> {
+    let head = b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
+    // MAX_BODY (16 MiB) + MAX_HEADERS: the router buffers the request up to
+    // header_len + this, and rejects on the first byte beyond it.
+    let ceiling = 16 * 1024 * 1024 + 65_536;
+    // Declare a chunk far bigger than we send, so the framing never
+    // completes and only the byte ceiling can trip.
+    let size_line = b"2000000\r\n";
+    let mut stream = TcpStream::connect_timeout(
+        &format!("127.0.0.1:{}", router_port).parse().unwrap(),
+        Duration::from_secs(5),
+    )
+    .unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+    stream.write_all(head).unwrap();
+    stream.write_all(size_line).unwrap();
+    let block = vec![b'a'; 64 * 1024];
+    let mut remaining = ceiling - size_line.len();
+    while remaining > 0 {
+        let take = block.len().min(remaining);
+        stream.write_all(&block[..take]).unwrap();
+        remaining -= take;
+    }
+    thread::sleep(Duration::from_millis(200));
+    stream.write_all(b"a").unwrap();
+    read_response(&mut stream)
 }
 
 fn wait_router(port: u16) {
@@ -688,6 +781,70 @@ fn relay_framing_regressions() {
     let (short_chunk, _, _) = probe(router_port, "short-chunk");
     assert!(String::from_utf8_lossy(&short_chunk).contains("ab"));
 
+    // EOF-delimited response cut cleanly at a message boundary: relayed in
+    // full, counted as a success — never as a broken stream.
+    let (eof_json, _, _) = probe(router_port, "eof-json");
+    assert!(
+        String::from_utf8_lossy(&eof_json).contains("{\"eof\":\"ok\"}"),
+        "EOF-delimited body relayed: {:?}",
+        String::from_utf8_lossy(&eof_json)
+    );
+
+    // Strict request-line/header grammar: bare LF, obs-fold, oversized.
+    let bare_lf = b"GET /v1/models HTTP/1.1\r\nHost: x\nX-Extra: y\r\n\r\n";
+    assert!(probe_raw(router_port, bare_lf).starts_with(b"HTTP/1.1 400"));
+    let obs_fold = b"GET /v1/models HTTP/1.1\r\nHost: x\r\nX-Trace:\r\n continued\r\nConnection: close\r\n\r\n";
+    assert!(probe_raw(router_port, obs_fold).starts_with(b"HTTP/1.1 400"));
+    let mut oversized_headers = b"GET /v1/models HTTP/1.1\r\nHost: x\r\nX-Pad: ".to_vec();
+    oversized_headers.extend(std::iter::repeat_n(b'a', 70_000));
+    oversized_headers.extend_from_slice(b"\r\n\r\n");
+    assert!(probe_raw(router_port, &oversized_headers).starts_with(b"HTTP/1.1 400"));
+
+    // Both framing headers at once is rejected, not silently resolved.
+    let ambiguous = b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\nhi";
+    assert!(String::from_utf8_lossy(&probe_raw(router_port, ambiguous))
+        .contains("ambiguous request framing"));
+
+    // Expect: 100-continue is answered by the router, then relayed.
+    let expect_response = probe_expect_continue(router_port);
+    assert!(
+        String::from_utf8_lossy(&expect_response).contains("slow-json-ok"),
+        "body after 100 Continue relayed: {:?}",
+        String::from_utf8_lossy(&expect_response)
+    );
+
+    // HEAD: headers (with Content-Length) and no body, without waiting for
+    // a payload the backend only sends after its delay.
+    let (head_response, head_total) =
+        probe_timed(router_port, b"HEAD /v1/models HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+    assert!(head_response.starts_with(b"HTTP/1.1 200"));
+    let head_end = head_response
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|p| p + 4)
+        .unwrap_or(head_response.len());
+    assert!(
+        String::from_utf8_lossy(&head_response).to_lowercase().contains("content-length:"),
+        "HEAD keeps the declared length: {:?}",
+        String::from_utf8_lossy(&head_response)
+    );
+    assert!(
+        head_response[head_end..].is_empty(),
+        "HEAD must carry no body: {:?}",
+        &head_response[head_end..]
+    );
+    assert!(head_total < 2.0, "HEAD must not await the payload: {head_total}s");
+
+    // Chunked upload past the byte ceiling: 413, not a dropped connection.
+    let paced_413 = probe_paced_oversized_chunked(router_port);
+    assert!(
+        String::from_utf8_lossy(&paced_413).starts_with("HTTP/1.1 413"),
+        "oversized chunked upload rejected: {:?}",
+        &String::from_utf8_lossy(&paced_413)[..String::from_utf8_lossy(&paced_413)
+            .len()
+            .min(120)]
+    );
+
     let gone_body = r#"{"model":"qwen3.8-27b","scenario":"client-gone"}"#;
     let gone_request = format!(
         "POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -703,7 +860,90 @@ fn relay_framing_regressions() {
     assert_eq!(usage.matches("\"outcome\":\"unsupported-upgrade\"").count(), 1);
     assert_eq!(usage.matches("\"outcome\":\"bad-response\"").count(), 3);
     assert_eq!(usage.matches("\"outcome\":\"client-gone\"").count(), 1);
+    assert!(usage.matches("\"outcome\":\"proxied\"").count() >= 1);
 
+    // Budgets are env-tunable, so a second router with 1s budgets can prove
+    // the timeouts actually fire — and that an EOF-delimited stream cut by
+    // the budget is NOT charged as a backend fault.
+    let budget_home = std::env::temp_dir().join(format!("lac-test-relay-budget-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&budget_home);
+    let _ = std::fs::create_dir_all(&budget_home);
+    let budget_home_env = budget_home.to_string_lossy().into_owned();
+    let budget_router = support::spawn_router(
+        router_bin,
+        &[
+            ("HOME", &budget_home_env),
+            ("LAC_BIND_ADDR", "127.0.0.1"),
+            ("MLX_PORT", &dead_env),
+            ("LAC_LLAMA_PORT", &llama_env),
+            ("LAC_OLLAMA_PORT", &dead_env),
+            ("LAC_BACKEND", "auto"),
+            ("LAC_ROUTER_KEEPALIVE_SECS", "1"),
+            ("LAC_ROUTER_STREAM_BUDGET_SECS", "1"),
+            ("LAC_ROUTER_HEADER_BUDGET_SECS", "1"),
+            ("LAC_ROUTER_BODY_IDLE_SECS", "1"),
+        ],
+    );
+    let budget_port = budget_router.port;
+    wait_router(budget_port);
+
+    let (slow_headers, slow_headers_total) = probe_timed(
+        budget_port,
+        b"GET /v1/models HTTP/1.1\r\nHost: x\r\n",
+    );
+    assert!(
+        String::from_utf8_lossy(&slow_headers).starts_with("HTTP/1.1 400"),
+        "stalled headers rejected: {:?}",
+        String::from_utf8_lossy(&slow_headers)
+    );
+    assert!(
+        slow_headers_total < 4.0,
+        "header budget bounded the wait: {slow_headers_total}s"
+    );
+
+    let body = b"{\"partial\":true}";
+    let mut stalled_body = b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\nConnection: close\r\n\r\n".to_vec();
+    stalled_body.extend_from_slice(body);
+    let (stalled, stalled_total) = probe_timed(budget_port, &stalled_body);
+    assert!(
+        String::from_utf8_lossy(&stalled).starts_with("HTTP/1.1 400"),
+        "stalled body rejected: {:?}",
+        String::from_utf8_lossy(&stalled)
+    );
+    assert!(stalled_total < 4.0, "body idle timeout bounded the wait: {stalled_total}s");
+
+    // Three EOF-delimited streams cut by the budget. Must stay under the
+    // breaker's error threshold, so the backend keeps serving afterwards.
+    let mut cuts_total = 0.0;
+    for _ in 0..3 {
+        let (raw, _, total) = probe(budget_port, "sse-slow");
+        cuts_total += total;
+        assert!(
+            String::from_utf8_lossy(&raw).starts_with("HTTP/1.1 200"),
+            "stream cut after headers: {:?}",
+            String::from_utf8_lossy(&raw)
+        );
+        assert!(
+            !String::from_utf8_lossy(&raw).contains("slow-event"),
+            "budget cut the stream before the backend's late event"
+        );
+        assert!(total < 4.0, "stream budget bounded the wait: {total}s");
+    }
+    assert!(cuts_total < 12.0, "budget cuts stay prompt: {cuts_total}s");
+
+    let (after_cuts, _, _) = probe(budget_port, "hold-open");
+    assert!(
+        String::from_utf8_lossy(&after_cuts).contains("hold-open ok"),
+        "backend still serving after budget cuts (breaker must not open)"
+    );
+
+    let budget_usage = std::fs::read_to_string(format!("{}/.lac/router-usage.jsonl", budget_home.display()))
+        .expect("budget usage log exists");
+    assert_eq!(budget_usage.matches("\"outcome\":\"stream-cut\"").count(), 3);
+    assert_eq!(budget_usage.matches("\"outcome\":\"stream-broke\"").count(), 0);
+
+    drop(budget_router);
     drop(router);
+    let _ = std::fs::remove_dir_all(&budget_home);
     let _ = std::fs::remove_dir_all(&tmp_home);
 }
