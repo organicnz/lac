@@ -98,7 +98,10 @@ fn spawn_backend() -> u16 {
                 }
                 // Start with over-read body bytes, then drain the rest up
                 // to Content-Length (bounded). Fixes body_len=0 misroute
-                // where sse-chunked fell through to json-slow.
+                // where sse-chunked fell through to json-slow. Note the 8
+                // KiB clamp: a larger declared Content-Length leaves bytes
+                // queued, so closing the socket below emits RST rather than
+                // FIN and the router logs stream-cut.
                 let mut body: Vec<u8> = raw[head_end..].to_vec();
                 let want = req_content_length(head_bytes).min(8192);
                 let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
@@ -343,13 +346,15 @@ fn spawn_backend() -> u16 {
                         // dispatch above, so its body is still queued when
                         // we close: the kernel sends RST, not FIN. Pause
                         // before the write so the router has finished
-                        // sending, and after it so the router reads the
-                        // response before the reset lands.
+                        // sending, and generously after it: a reset purges
+                        // the peer's receive buffer, so the router has to
+                        // read the response first or it reports
+                        // bad-response instead of stream-cut.
                         thread::sleep(Duration::from_millis(100));
                         let _ = s.write_all(
                             b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\ndata: rst",
                         );
-                        thread::sleep(Duration::from_millis(150));
+                        thread::sleep(Duration::from_millis(1000));
                     }
                     "sse-slow" => {
                         let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n");
@@ -408,7 +413,13 @@ fn probe(router_port: u16, scenario: &str) -> (Vec<u8>, Vec<(f64, usize)>, f64) 
 /// real check and a lost response fails there, not here.
 fn read_response(stream: &mut TcpStream) -> Vec<u8> {
     let mut response = Vec::new();
-    let _ = stream.read_to_end(&mut response);
+    if let Err(error) = stream.read_to_end(&mut response) {
+        // Keep the bytes the router did send, but make a truncated read
+        // visible: a timeout here is not the same event as a reset.
+        if std::env::var("SSE_RELAY_DEBUG").is_ok() {
+            eprintln!("[probe] read ended with {error:?} after {} bytes", response.len());
+        }
+    }
     response
 }
 
@@ -540,7 +551,8 @@ fn probe_paced_oversized_chunked(router_port: u16) -> Vec<u8> {
 /// Drive the `rst-cut` scenario. The request is chunked, so the fake
 /// backend never drains its body: when the backend closes, unread bytes
 /// are queued and the kernel resets the connection instead of finishing
-/// it. That is a reset, which the router must not charge to the backend.
+/// it. The router must charge that — the upstream hop is loopback, so a
+/// reset is the backend process going away.
 fn probe_chunked_reset(router_port: u16) -> (Vec<u8>, f64) {
     let mut body =
         "{\"model\":\"qwen3.8-27b\",\"scenario\":\"rst-cut\",\"pad\":\"".to_string();
@@ -561,6 +573,21 @@ fn probe_chunked_reset(router_port: u16) -> (Vec<u8>, f64) {
     stream.write_all(request.as_bytes()).unwrap();
     let response = read_response(&mut stream);
     (response, t0.elapsed().as_secs_f64())
+}
+
+fn count_outcome(path: &str, outcome: &str) -> usize {
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .matches(&format!("\"outcome\":\"{outcome}\""))
+        .count()
+}
+
+/// Every outcome that counts against a backend.
+fn count_faults(path: &str) -> usize {
+    ["stream-broke", "stream-cut", "bad-response", "http-error", "client-gone"]
+        .iter()
+        .map(|outcome| count_outcome(path, outcome))
+        .sum()
 }
 
 fn wait_router(port: u16) {
@@ -824,24 +851,28 @@ fn relay_framing_regressions() {
     assert!(String::from_utf8_lossy(&short_chunk).contains("ab"));
 
     // EOF-delimited response cut cleanly at a message boundary: relayed in
-    // full, counted as a success — never as a broken stream.
+    // full and counted as a success. The body arriving is not the point —
+    // a clean FIN never reaches the stream-error arms — so assert the log
+    // gained exactly one proxied line and no stream-* line.
+    let usage_path = format!("{}/.lac/router-usage.jsonl", tmp_home.display());
+    let proxied_before = count_outcome(&usage_path, "proxied");
+    let faults_before = count_faults(&usage_path);
     let (eof_json, _, _) = probe(router_port, "eof-json");
     assert!(
         String::from_utf8_lossy(&eof_json).contains("{\"eof\":\"ok\"}"),
         "EOF-delimited body relayed: {:?}",
         String::from_utf8_lossy(&eof_json)
     );
-
-    // A reset mid-stream is the network's doing, not a backend fault:
-    // three in a row must leave the backend in rotation.
-    for _ in 0..3 {
-        let (_reset, reset_total) = probe_chunked_reset(router_port);
-        assert!(reset_total < 5.0, "reset must not stall the relay: {reset_total}s");
-    }
-    let (after_resets, _, _) = probe(router_port, "hold-open");
-    assert!(
-        String::from_utf8_lossy(&after_resets).contains("hold-open ok"),
-        "resets must not open the breaker"
+    assert_eq!(
+        count_outcome(&usage_path, "proxied") - proxied_before,
+        1,
+        "clean EOF is one success"
+    );
+    assert_eq!(
+        count_faults(&usage_path) - faults_before,
+        0,
+        "clean EOF is not a fault: {:?}",
+        std::fs::read_to_string(&usage_path).unwrap_or_default()
     );
 
     // Strict request-line/header grammar: bare LF, obs-fold, oversized.
@@ -907,6 +938,20 @@ fn relay_framing_regressions() {
     );
     probe_client_gone(router_port, gone_request.as_bytes());
     thread::sleep(Duration::from_secs(3));
+
+    // A reset mid-response is charged, and the upstream is loopback, so a
+    // reset means the backend process went away. Three in a row must take
+    // it out of rotation. Runs last: the breaker is open afterwards.
+    for _ in 0..3 {
+        let (_reset, reset_total) = probe_chunked_reset(router_port);
+        assert!(reset_total < 5.0, "reset must not stall the relay: {reset_total}s");
+    }
+    let (after_resets, _, _) = probe(router_port, "hold-open");
+    let after_resets_text = String::from_utf8_lossy(&after_resets).to_string();
+    assert!(
+        after_resets_text.contains("healthy-failover") && !after_resets_text.contains("hold-open ok"),
+        "the reset backend must be ejected, with traffic failing over: {after_resets_text}"
+    );
 
     let usage = std::fs::read_to_string(format!("{}/.lac/router-usage.jsonl", tmp_home.display()))
         .expect("usage log exists");

@@ -84,6 +84,11 @@ const MAX_BODY: usize = 16 * 1024 * 1024;
 const MAX_INFLIGHT: usize = 128;
 const MAX_INTERIM_RESPONSES: usize = 8;
 
+/// Keep-alive comments the router injects into a stalled SSE stream. Counted
+/// in the bytes we forward so the usage log reflects what the client got.
+const KEEPALIVE_CHUNK: &[u8] = b"E\r\n: keep-alive\n\n\r\n";
+const KEEPALIVE_PLAIN: &[u8] = b": keep-alive\n\n";
+
 /// Wall-clock budgets are env-overridable so tests can shrink them
 /// (`LAC_ROUTER_STREAM_BUDGET_SECS=1`); out-of-range values fall back to
 /// the production default rather than disabling a budget.
@@ -97,7 +102,10 @@ fn budget_secs(name: &str, default_secs: u64) -> Duration {
     )
 }
 
-/// Total wall clock one forward may occupy, across headers and body.
+/// Wall clock one relayed response may take from the moment its request
+/// was written. Note this is not a whole-connection budget: headers, the
+/// request body and the response each get their own window, so one stalled
+/// client connection can hold an inflight slot for several of these.
 fn stream_budget() -> Duration {
     budget_secs("LAC_ROUTER_STREAM_BUDGET_SECS", 600)
 }
@@ -340,7 +348,6 @@ fn read_headers(client: &TcpStream) -> io::Result<Vec<u8>> {
     // headers; the caller forwards them explicitly and streams the rest.
     let mut stream = client.try_clone()?;
     let deadline = Instant::now() + header_budget();
-    let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
     let mut buf: Vec<u8> = Vec::with_capacity(8192);
     let mut chunk = [0u8; 8192];
     loop {
@@ -1176,12 +1183,13 @@ enum ForwardError {
     /// TCP connect (or initial write) failed: safe to try the next backend.
     Connect,
     /// Backend returned a retryable HTTP response before headers were forwarded.
-    HttpStatus(u16),
+    HttpStatus { status: u16, ttfb: Option<f64> },
     /// Stream broke mid-proxy: the response is already partial, do not retry.
     Stream { down: u64, ttfb: Option<f64> },
     /// An EOF-delimited response (no Content-Length, no chunking) was cut
-    /// short by a connection reset: a network event, not proof that this
-    /// backend is unhealthy, so it is neither charged nor failed over.
+    /// short by a connection reset. No promised frame was violated, so it
+    /// is reported separately from a truncated frame — but the upstream is
+    /// loopback, so the peer process went away and this is charged.
     StreamCut { down: u64, ttfb: Option<f64> },
     BadResponse { down: u64, ttfb: Option<f64> },
     ClientGone { down: u64, ttfb: Option<f64> },
@@ -1189,16 +1197,17 @@ enum ForwardError {
     UnsupportedUpgrade { up: u64, ttfb: Option<f64> },
 }
 
-/// Why a response stopped delivering bytes.
+/// How a response that was cut short is reported. Both are charged: the
+/// upstream hop is always loopback, so a reset is the backend process
+/// going away mid-request — not a network event — and it predicts the next
+/// request exactly as a hang does. The split is kept for the usage log,
+/// where "ended at a boundary the backend never delimited" and "truncated
+/// inside a frame it did promise" are different bugs to chase.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum StreamEnd {
-    /// The peer went away mid-body. Networks reset connections; the next
-    /// request on this backend may well succeed, so do not charge it.
+    /// Connection reset mid-body: the peer process went away.
     Reset,
-    /// Silent until the stream budget ran out. The backend is not talking
-    /// and the next request will hang exactly the same way, so this is
-    /// charged — that is what stops traffic piling onto a hung backend
-    /// until every inflight slot is spent.
+    /// Silent until the stream budget ran out: the backend is not talking.
     Hung,
 }
 
@@ -1237,9 +1246,9 @@ fn pick_backends(
                 .partial_cmp(&ewma_of(stats, b.1))
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
-        // A mapped model still goes first: fastest-among-blind is no
-        // excuse for 404ing on a backend that advertised the model
-        // (forwarding treats 404 bodies as success — no failover saves it).
+        // A mapped model still goes first: a backend that 404s on a model it
+        // never advertised is a routing miss, and a miss we can retry
+        // somewhere else rather than answer the caller with.
         if let Some(mp) = model_hint {
             if let Some(i) = c.iter().position(|(_, p)| *p == mp) {
                 let h = c.remove(i);
@@ -1956,7 +1965,7 @@ fn try_forward(
                             continue;
                         }
                         if status == 404 || status >= 500 {
-                            return Err(ForwardError::HttpStatus(status));
+                            return Err(ForwardError::HttpStatus { status, ttfb });
                         }
                         let bodyless_status = matches!(status, 204 | 205 | 304);
                         if (matches!(status, 204 | 205 | 304) && chunked)
@@ -2028,19 +2037,21 @@ fn try_forward(
                     if resp_chunked {
                         if chunk_detector.can_inject_keepalive()
                             && chunk_detector.payload_at_sse_boundary()
-                            && client_write
-                                .write_all(b"E\r\n: keep-alive\n\n\r\n")
-                                .is_err()
                         {
-                            write_failed = true;
-                            break;
+                            if client_write.write_all(KEEPALIVE_CHUNK).is_err() {
+                                write_failed = true;
+                                break;
+                            }
+                            down_total += KEEPALIVE_CHUNK.len() as u64;
                         }
                     } else if resp_cl.is_none()
                         && payload_at_boundary(&sse_tail, sse_tail_len)
-                        && client_write.write_all(b": keep-alive\n\n").is_err()
                     {
-                        write_failed = true;
-                        break;
+                        if client_write.write_all(KEEPALIVE_PLAIN).is_err() {
+                            write_failed = true;
+                            break;
+                        }
+                        down_total += KEEPALIVE_PLAIN.len() as u64;
                     }
                 }
                 continue;
@@ -2059,8 +2070,9 @@ fn try_forward(
         return Err(ForwardError::BadResponse { down: down_total, ttfb });
     }
     // Nothing was truncated *inside* a frame the backend promised, so the
-    // only question left is who ended it. A reset is the network's doing;
-    // silence until the budget expired is the backend's.
+    // only distinction left is why it stopped — which is what the usage
+    // log records. Both causes are the backend's: the hop is loopback, so
+    // a reset means the peer process went away mid-request.
     if resp_cl.is_none() && !resp_chunked {
         if let Some(end) = stream_end {
             return Err(match end {
@@ -2261,10 +2273,10 @@ fn handle_connection(
     };
     if frame.has_following {
         let mut c = client;
-        if request_content_length.is_some()
-            || chunked_request
-            || initial.len() == initial_headers
-        {
+        // A body-less method cannot be carrying a body we failed to frame,
+        // so trailing bytes can only be a second request.
+        let bodyless_method = matches!(method.as_str(), "GET" | "HEAD" | "OPTIONS");
+        if bodyless_method || request_content_length.is_some() || chunked_request {
             let _ = json_response(&mut c, "400 Bad Request", "{\"error\":{\"message\":\"pipelined requests are not supported\"}}");
         } else {
             let _ = json_response(&mut c, "400 Bad Request", "{\"error\":{\"message\":\"request body requires Content-Length or chunked framing\"}}");
@@ -2338,7 +2350,7 @@ fn handle_connection(
                 tried.push(port);
                 continue;
             }
-            Err(ForwardError::HttpStatus(status)) => {
+            Err(ForwardError::HttpStatus { status, ttfb }) => {
                 note_error(&stats, port);
                 tried.push(port);
                 let up_body = initial.len().saturating_sub(header_len) as u64;
@@ -2351,7 +2363,7 @@ fn handle_connection(
                     up_body,
                     0,
                     est,
-                    None,
+                    ttfb,
                     "http-error",
                 );
                 eprintln!(
@@ -2421,8 +2433,12 @@ fn handle_connection(
                 return;
             }
             Err(ForwardError::StreamCut { down, ttfb }) => {
-                // No note_error: a reset is the network's doing, and three
-                // of them must never open the breaker.
+                // Charged: the upstream hop is loopback, so a reset is the
+                // backend process going away, not a network event. A
+                // backend that dies after the headers must not keep
+                // receiving traffic just because it still accepts
+                // connections.
+                note_error(&stats, port);
                 let up_body = initial.len().saturating_sub(header_len) as u64;
                 let est = (up_body + down) / 4;
                 log_usage(
@@ -2673,21 +2689,20 @@ mod tests {
 
     #[test]
     fn read_errors_split_reset_from_hung() {
-        // Resets are the network's doing: never charged to the backend.
-        assert_eq!(
-            classify_read_error(io::ErrorKind::ConnectionReset),
-            StreamEnd::Reset
-        );
-        assert_eq!(
-            classify_read_error(io::ErrorKind::ConnectionAborted),
-            StreamEnd::Reset
-        );
-        assert_eq!(
-            classify_read_error(io::ErrorKind::BrokenPipe),
-            StreamEnd::Reset
-        );
-        // A timeout past the budget means the backend stopped talking:
-        // charged, so a hung backend leaves rotation.
+        // Everything that is not a lapsed budget reports as a reset: the
+        // upstream is loopback, so the peer process went away.
+        for kind in [
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::ConnectionAborted,
+            io::ErrorKind::NotConnected,
+            io::ErrorKind::UnexpectedEof,
+            io::ErrorKind::BrokenPipe,
+            io::ErrorKind::InvalidData,
+            io::ErrorKind::Other,
+        ] {
+            assert_eq!(classify_read_error(kind), StreamEnd::Reset, "{kind:?}");
+        }
+        // A timeout reaching this point has already outlived the budget.
         assert_eq!(
             classify_read_error(io::ErrorKind::TimedOut),
             StreamEnd::Hung
